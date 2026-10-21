@@ -1,0 +1,269 @@
+{
+  "$schema": "https://standards.sst/dicts/v1",
+  "version": 1,
+  "description": "跨项目 risk_flags 枚举字典。所有采集插件必须从此字典选用 flag，禁止自定义字符串。policy.md 的 riskFlagsAny/riskFlagsAll 引用本文件 enum。",
+  "definitions": {
+    "flag_name": {
+      "type": "string",
+      "enum": [
+        "self_protection_bypass",
+        "self_protection_behavior",
+        "unpatched_engine",
+        "reverse_shell",
+        "download_execute",
+        "privilege_escalation",
+        "shell_involved",
+        "pipe_to_shell",
+        "background_execution",
+        "scratch_dir_spawn",
+        "data_exfiltration",
+        "db_dump",
+        "token_in_command",
+        "credential_exposure",
+        "suspicious_encoding",
+        "sensitive_file_access",
+        "mass_deletion",
+        "file_deletion",
+        "chmod_executable",
+        "skill_binary_execution",
+        "supply_chain",
+        "malicious_domain",
+        "ssrf",
+        "network_tool",
+        "internal_host",
+        "secret_in_content"
+      ]
+    }
+  },
+  "registry": [
+    {
+      "name": "self_protection_bypass",
+      "category": "self_protection",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "绕过/禁用安全监控插件自身的尝试（kill/pkill 引擎、删除策略文件、写入禁用脚本）"
+    },
+    {
+      "name": "self_protection_behavior",
+      "category": "self_protection",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "插件自身被异常访问（读策略、读事件日志、读 patch 文件）"
+    },
+    {
+      "name": "unpatched_engine",
+      "category": "self_protection",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "安全引擎防护组件未生效：引擎未带 patch 参数重启（disable 自保护旁路）、runtime hook 预加载缺失/被环境剥离、进程树出现无 hook 的引擎进程等"
+    },
+    {
+      "name": "reverse_shell",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "反弹 shell 模式（/dev/tcp、mkfifo + nc、bash -i + & 等）"
+    },
+    {
+      "name": "download_execute",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "下载并直接执行（curl | bash、wget | sh、python -c 一行式下载执行）"
+    },
+    {
+      "name": "privilege_escalation",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "权限提升（sudo、su、chmod +s、setuid 调用）"
+    },
+    {
+      "name": "shell_involved",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "调用栈涉及 shell（bash/sh/zsh/pwsh），用于上下文权重提升"
+    },
+    {
+      "name": "pipe_to_shell",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "管道符后接 shell（| sh、| bash、eval、base64 解码后管道）"
+    },
+    {
+      "name": "background_execution",
+      "category": "execution",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "后台执行（nohup、& detach），常用于持久化"
+    },
+    {
+      "name": "scratch_dir_spawn",
+      "category": "execution",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "在临时目录（/tmp、/var/tmp）下派生进程，常用于脚本间接执行绕过"
+    },
+    {
+      "name": "data_exfiltration",
+      "category": "exfiltration",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "数据外发到外部地址（curl POST 到非内网、scp/rsync 远端、API 外发）"
+    },
+    {
+      "name": "db_dump",
+      "category": "exfiltration",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "数据库/日志导出工具调用（mysqldump、pg_dump、mongodump、journalctl 导出）"
+    },
+    {
+      "name": "token_in_command",
+      "category": "exfiltration",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "命令行含明文 token/secret（Authorization 头、Bearer token、api_key/password）"
+    },
+    {
+      "name": "credential_exposure",
+      "category": "exfiltration",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "凭据暴露更广义语义（涵盖 token_in_command + 凭据文件读取 + 文件正文含凭据）"
+    },
+    {
+      "name": "suspicious_encoding",
+      "category": "exfiltration",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "可疑编码载荷（base64 -d | sh、openssl enc -d | bash、xxd -r | sh、unicode 转义后解码）"
+    },
+    {
+      "name": "sensitive_file_access",
+      "category": "filesystem",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "访问敏感文件（/etc/passwd、/etc/shadow、~/.ssh/、~/.aws/、~/.docker/）"
+    },
+    {
+      "name": "mass_deletion",
+      "category": "filesystem",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "批量删除（rm -rf /*、find ... -delete、shred 多个目标）"
+    },
+    {
+      "name": "file_deletion",
+      "category": "filesystem",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "单文件删除（rm、unlink）"
+    },
+    {
+      "name": "chmod_executable",
+      "category": "filesystem",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "赋予可执行权限（chmod +x、chmod 755），常用于投放恶意脚本"
+    },
+    {
+      "name": "skill_binary_execution",
+      "category": "supply_chain",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "skill 内置二进制执行（/skills/*/bin/*），用于隐藏真实命令行"
+    },
+    {
+      "name": "supply_chain",
+      "category": "supply_chain",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "供应链投毒（从非受信源安装包、curl | npm install、pip install url）"
+    },
+    {
+      "name": "malicious_domain",
+      "category": "supply_chain",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "目标域名被威胁情报标记为 C2/恶意（依赖外部 threat-intel feed，开源版不内置）"
+    },
+    {
+      "name": "ssrf",
+      "category": "network",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "服务端请求伪造（curl/wget 访问云元数据 169.254.169.254、内网 RFC1918 地址）"
+    },
+    {
+      "name": "network_tool",
+      "category": "network",
+      "since": "0.9.0",
+      "deprecated": null,
+      "description": "调用网络工具（curl、wget、nc、netcat、nmap）"
+    },
+    {
+      "name": "internal_host",
+      "category": "network",
+      "since": "1.0.0",
+      "deprecated": null,
+      "description": "目标是内网主机（RFC1918、.internal、.local、云元数据 IP）"
+    },
+    {
+      "name": "secret_in_content",
+      "category": "exfiltration",
+      "since": "0.9.0",
+      "deprecated": "1.0.0",
+      "description": "工具响应体/网络 body 含明文密钥（AKIA/PEM/JWT/*** 占位）。1.0 起改用 credential_exposure"
+    }
+  ],
+  "category_groups": {
+    "self_protection": [
+      "self_protection_bypass",
+      "self_protection_behavior",
+      "unpatched_engine"
+    ],
+    "execution": [
+      "reverse_shell",
+      "download_execute",
+      "privilege_escalation",
+      "shell_involved",
+      "pipe_to_shell",
+      "background_execution",
+      "scratch_dir_spawn"
+    ],
+    "exfiltration": [
+      "data_exfiltration",
+      "db_dump",
+      "token_in_command",
+      "credential_exposure",
+      "suspicious_encoding",
+      "secret_in_content"
+    ],
+    "filesystem": [
+      "sensitive_file_access",
+      "mass_deletion",
+      "file_deletion",
+      "chmod_executable"
+    ],
+    "supply_chain": [
+      "skill_binary_execution",
+      "supply_chain",
+      "malicious_domain"
+    ],
+    "network": [
+      "ssrf",
+      "network_tool",
+      "internal_host"
+    ],
+    "semantic": [
+      "semantic_token_diff",
+      "semantic_repl_allowlist_bypass",
+      "semantic_decode_overflow",
+      "semantic_detector_disabled",
+      "semantic_engine_unavailable"
+    ]
+  }
+}

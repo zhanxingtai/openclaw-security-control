@@ -1,0 +1,220 @@
+{
+  "flags": {
+    "network_tool": [
+      {
+        "pattern": "\\bcurl\\b|\\bwget\\b|\\bnc\\b|\\bnetcat\\b|\\bnmap\\b"
+      }
+    ],
+    "pipe_to_shell": [
+      {
+        "pattern": "\\|[^|]*\\bsh\\b|\\|[^|]*\\bbash\\b|\\beval\\b|\\bbase64\\b"
+      }
+    ],
+    "mass_deletion": [
+      {
+        "pattern": "rm\\s+-[a-zA-Z]*\\s+/($|\\s)"
+      },
+      {
+        "pattern": "rm\\s+-[a-zA-Z]*\\s+/\\*"
+      },
+      {
+        "pattern": "rm\\s+-rf\\s+/(\\s|$)"
+      },
+      {
+        "pattern": "rm\\s+-rf\\s+/\\*"
+      },
+      {
+        "pattern": "rm\\s+-rf\\s+--no-preserve-root"
+      },
+      {
+        "pattern": "rm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/root/"
+      },
+      {
+        "pattern": "rm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/home/[^/\\s]+/?\\s*$"
+      },
+      {
+        "pattern": "dd\\s+if=\\S+\\s+of=/dev/[sh]da"
+      },
+      {
+        "pattern": "mkfs\\.\\w+\\s+/dev/[sh]da"
+      }
+    ],
+    "file_deletion": [
+      {
+        "pattern": "\\brm\\b"
+      }
+    ],
+    "sensitive_file_access": [
+      {
+        "pattern": "(?:^|\\s|[\\\"'<>])(?:/etc/(?:passwd|shadow|gshadow|sudoers|hosts|ssh/\\S*)|/root/\\S*|/proc/self/environ|(?:.*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|config))\\b"
+      },
+      {
+        "pattern": "\\bgetent\\s+(passwd|shadow|group)\\b"
+      }
+    ],
+    "privilege_escalation": [
+      {
+        "pattern": "sudo\\s+.*chmod\\s*[\\w]*\\+s"
+      },
+      {
+        "pattern": "sudo\\s+.*chown\\s+root"
+      },
+      {
+        "pattern": "sudo\\s+.*visudo"
+      },
+      {
+        "pattern": "su\\s+-\\s*root"
+      },
+      {
+        "pattern": "su\\s+root"
+      },
+      {
+        "pattern": "pkexec\\s+"
+      },
+      {
+        "pattern": "setuid\\s*\\("
+      }
+    ],
+    "token_in_command": [
+      {
+        "pattern": "Authorization\\s*[:=]|Bearer\\s+[A-Za-z0-9_\\-\\.~+\\/=]{12,}|api[_-]?key\\s*[:=]\\s*\\S+|access[_-]?token\\s*[:=]\\s*\\S+|secret\\s*[:=]\\s*\\S+|password\\s*[:=]\\s*\\S+",
+        "flags": "i",
+        "input": "raw"
+      }
+    ],
+    "background_execution": [
+      {
+        "pattern": "nohup\\b|&\\s*$|\\bdetach\\b"
+      }
+    ],
+    "reverse_shell": [
+      {
+        "pattern": "bash\\s+-i\\s+.*(/dev/tcp|/dev/udp)"
+      },
+      {
+        "pattern": "/dev/tcp/\\d+/\\d+"
+      },
+      {
+        "pattern": "/dev/udp/\\d+/\\d+"
+      },
+      {
+        "pattern": "\\bnc\\b.*\\s+-e\\s+\\S+"
+      },
+      {
+        "pattern": "\\bncat\\b.*\\s+--?exec\\s+\\S+|\\bncat\\b.*\\s+-e\\s+\\S+"
+      },
+      {
+        "pattern": "mkfifo\\s+\\S+.*\\|\\s*(?:\\S*/)?(nc|ncat)\\b"
+      },
+      {
+        "pattern": "(nc|ncat)\\s+\\S+\\s+\\d+.*\\|\\s*(?:\\S*/)?(sh|bash|zsh|dash|ash)\\s+-i"
+      },
+      {
+        "pattern": "cat\\s+[^|;&]*\\|\\s*(?:\\S*/)?(sh|bash|zsh|dash|ash)\\s+-i.*\\|\\s*(?:\\S*/)?(nc|ncat)\\b"
+      },
+      {
+        "pattern": "python[23]?\\s+.*socket.*connect"
+      },
+      {
+        "pattern": "python[23]?\\s+-c\\s+.*subprocess"
+      },
+      {
+        "pattern": "ruby\\s+-rsocket"
+      },
+      {
+        "pattern": "socat\\s+.*tcp-listen"
+      },
+      {
+        "pattern": "socat\\s+.*tcp:[^,]*\\s+exec:"
+      }
+    ],
+    "download_execute": [
+      {
+        "pattern": "(?:curl|wget|fetch).*\\|.*\\b(?:sh|bash|zsh)\\b"
+      },
+      {
+        "pattern": "(curl|wget|fetch)\\s+.*\\|\\s*(bash|sh|zsh|python|perl|ruby)"
+      },
+      {
+        "pattern": "(curl|wget|fetch)(?:\\s+\\S+)*\\s+-[oo]\\s+\\S+\\s+\\S+\\s*(?:&&|;|\\|\\|)\\s*(?:bash|sh|zsh)\\s+\\S"
+      },
+      {
+        "pattern": "(?:bash|sh|zsh)\\s+<\\s*<\\s*\\(\\s*(?:curl|wget|fetch)\\b"
+      },
+      {
+        "pattern": "(?:curl|wget|fetch)\\b.*(?:\\.|source)\\s+/tmp/\\S+\\.(?:sh|bash)\\b"
+      }
+    ],
+    "chmod_executable": [
+      {
+        "pattern": "\\bchmod\\b.*\\+x"
+      }
+    ],
+    "suspicious_encoding": [
+      {
+        "pattern": "\\bbase64\\b.*\\|.*\\b(?:sh|bash|zsh)\\b|\\becho\\b.*\\|.*\\bbase64\\b"
+      }
+    ],
+    "data_exfiltration": [
+      {
+        "pattern": "\\bscp\\b|\\brsync\\b|\\bsftp\\b|\\btar\\b.*\\b-c\\b|\\bzip\\b.*\\b-r\\b"
+      },
+      {
+        "pattern": "\\bcurl\\b[^|;&]*(?:-t\\b|--upload-file\\b)"
+      },
+      {
+        "pattern": "\\bcurl\\b[^|;&]*(?:-d\\b|--data(?:-raw|-binary|-ascii|-urlencode)?\\b)[^|;&]*https?:\\/\\/"
+      },
+      {
+        "pattern": "\\bwget\\b[^|;&]*--post-(?:file|data)\\b"
+      },
+      {
+        "pattern": "\\brclone\\b[^|;&]*\\b(?:copy|move|sync)\\b"
+      },
+      {
+        "pattern": "\\bgit\\b[^|;&]*\\bpush\\b"
+      },
+      {
+        "pattern": "\\b(?:nc|ncat|socat)\\b[^|;&]*<"
+      }
+    ],
+    "db_dump": [
+      {
+        "pattern": "\\b(?:mysqldump|pg_dump|pg_dumpall|mongoexport|mongodump|bcp)\\b"
+      },
+      {
+        "pattern": "\\bredis-cli\\b[^|;&]*--rdb\\b"
+      },
+      {
+        "pattern": "\\bsqlite3\\b[^|;&]*\\.dump\\b"
+      },
+      {
+        "pattern": "\\bselect\\b[^|;&]*\\binto\\s+outfile\\b",
+        "flags": "i",
+        "input": "raw"
+      }
+    ],
+    "credential_exposure": [
+      {
+        "pattern": "AKIA[0-9A-Z]{16}",
+        "input": "raw"
+      },
+      {
+        "pattern": "-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        "input": "raw"
+      },
+      {
+        "pattern": "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",
+        "input": "raw"
+      }
+    ]
+  },
+  "blockedFlags": [
+    "reverse_shell",
+    "download_execute",
+    "mass_deletion",
+    "privilege_escalation",
+    "token_in_command",
+    "skill_binary_execution"
+  ]
+}

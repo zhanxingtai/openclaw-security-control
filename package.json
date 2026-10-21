@@ -1,0 +1,73 @@
+{
+  "name": "@zhanxing/sst-security-control-openclaw",
+  "version": "1.0.0",
+  "description": "面向 OpenClaw 的开源运行安全插件，提供本地风险检测、安全事件记录及高风险操作策略控制。",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "hooks",
+    "policies",
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:ci": "node scripts/build.js",
+    "build:prod": "node scripts/build.js --no-test",
+    "pack": "node scripts/build.js --no-test",
+    "dev": "tsc --watch",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "stress:spl": "node scripts/stress-spl-interactive.mjs"
+  },
+  "keywords": [
+    "openclaw",
+    "agent",
+    "security",
+    "monitoring",
+    "observability"
+  ],
+  "author": "瞻星科技",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhanxingtai/openclaw-security-control"
+  },
+  "bugs": {
+    "url": "https://github.com/zhanxingtai/openclaw-security-control/issues"
+  },
+  "homepage": "https://github.com/zhanxingtai/openclaw-security-control#readme",
+  "peerDependencies": {
+    "openclaw": ">=2026.9.4"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "dependencies": {
+    "js-yaml": "^5.4.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "flags": "i",
+  "groups": {
+    "protected_paths": [
+      "(^|/)\\.openclaw[/\\\\]",
+      "(^|/)\\.openclaw[/\\\\]openclaw\\.json$",
+      "(^|/)\\.openclaw[/\\\\]security-policy\\.ya?ml$",
+      "(^|/)\\.openclaw[/\\\\]security-events\\.jsonl$",
+      "(^|/)\\.openclaw[/\\\\]security-events-runtime\\.jsonl$",
+      "(^|/)\\.openclaw[/\\\\]guidance-templates[/\\\\]",
+      "(^|/)\\.openclaw[/\\\\]extensions[/\\\\](sst-security-control-openclaw|openclaw-security-monitor)",
+      "(^|/)node_modules[/\\\\]sst-security-control-openclaw",
+      "(^|/)node_modules[/\\\\]@zhanxing[/\\\\]sst-security-control-openclaw",
+      "(^|/)\\.openclaw[/\\\\]npm[/\\\\]projects[/\\\\]sst-security-control-openclaw"
+    ],
+    "gateway_config_self_harm": [
+      "(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor).*\\benabled\\b\\s*[:=]\\s*false",
+      "(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor).*\\bdisabl",
+      "(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\s*[:=]\\s*(null|undefined)",
+      "openclaw\\.json.*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor).*openclaw\\.json",
+      "plugins?\\.entries\\.(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)"
+    ],
+    "self_harm_commands": [
+      "\\bsetup-openclaw\\.(js|mjs|cjs).*--(cleanup|uninstall)\\b",
+      "\\b(npm|yarn|pnpm)\\s+(uninstall|remove|rm)\\b.*(openclaw-security-monitor|sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|@zhanxing/openclaw-security-monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\\.9\\.1)",
+      "\\bopenclaw\\s+(plugins?|extensions?)\\s+(uninstall|remove|disable|delete)\\b.*(openclaw-security-monitor|sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|security-monitor)",
+      "\\bopenclaw\\s+(plugins?|extensions?)\\s+(uninstall|remove|disable|delete)\\b.*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "\\bopenclaw\\s+plugins?\\s+set-?enabled\\b.*\\b(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b",
+      "\\bopenclaw\\s+plugins?\\s+\\brm\\b.*\\b(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b",
+      "plugins?\\.deny\\s*.*\\b(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b",
+      "\\b(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b.*plugins?\\.deny",
+      "\\brm\\s+(-[a-zA-Z]*\\s+)?\\S*\\.openclaw(\\s|$)",
+      "\\brm\\s+(-[a-zA-Z]*\\s+)?\\S*(openclaw-security-monitor|sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1)(\\s|$)",
+      "\\brmdir\\s+\\S*(openclaw-security-monitor|sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1)",
+      "\\b(mv|chmod|chown)\\s+.*(openclaw-security-monitor|sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1)",
+      "openclaw\\.json.*\\\"enabled\\\"\\s*:\\s*false",
+      "plugins\\.entries\\s*\\[\\s*['\\\"]sst-security-control-openclaw['\\\"]\\s*\\]\\s*=\\s*(null|undefined)",
+      "plugins\\.allow\\s*=\\s*plugins\\.allow\\.filter\\s*\\(\\s*id\\s*=>\\s*id\\s*!==\\s*['\\\"]sst-security-control-openclaw['\\\"]"
+    ],
+    "self_harm_messages": [
+      "卸载\\s*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "卸载\\s*安全\\s*监[控告]",
+      "关闭\\s*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "关闭\\s*安全\\s*监[控告]",
+      "禁用\\s*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "禁用\\s*安全\\s*监[控告]",
+      "移除\\s*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "删除\\s*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "\\b(uninstall|remove|disable|turn off|shut down|delete)\\s+(the\\s+)?(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\s+(plugin\\s+)?",
+      "\\b(uninstall|remove|disable|turn off|shut down|delete)\\s+(the\\s+)?security\\s+monitor\\s+(plugin\\s+)?",
+      "\\bstop\\s+(the\\s+)?(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b",
+      "\\bstop\\s+(the\\s+)?security\\s+monitor\\b",
+      "\\bsetup-openclaw\\.(js|mjs|cjs).*--(cleanup|uninstall)\\b",
+      "\\bnpm\\s+(uninstall|remove|rm)\\s+.*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "\\bopenclaw\\s+plugins?\\s+(uninstall|remove|disable)\\s+.*(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)",
+      "plugins?\\.deny.*\\b(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor)\\b"
+    ]
+  },
+  "structural": {
+    "inline_interpreter": "\\b(python|python3|python2|node|nodejs|deno|bun|ruby|perl|php|lua|jruby)\\s+(?:-[ce]|--[a-z]+)\\b",
+    "indirect_deletion": "\\bos\\.(remove|unlink|rmdir|system|rmtree)\\b|\\bshutil\\.(rmtree|rm)\\b|\\bfs\\.(rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\\b|\\b(?:Path\\.)?unlink\\s*\\(|\\b(?:remove|unlink|rmtree|rmdir|truncate)\\s*\\(|\\b(?:rmSync|unlinkSync|rmdirSync)\\s*\\(|require\\s*\\(\\s*['\\\"](?:node:)?fs['\\\"]\\s*\\)\\s*\\.\\s*(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync|rmtree)\\b|\\b(?:Remove-Item|ri|rm|del)\\s+",
+    "protected_file_basenames": "\\bsecurity-(?:events|events-runtime|events-debug)\\.jsonl\\b|\\bsecurity-policy\\.(?:ya?ml|json)\\b|\\bsecurity-monitor-shim\\b",
+    "shell_overwrite_verbs": "\\b(?:truncate|tee)\\b|\\b(?:cp|install)\\s+\\/?dev\\/null\\b|\\bfind\\b[^\\n]*-delete\\b|\\bdd\\b[^\\n]*\\bof=|\\bsed\\b[^\\n]*-i\\b|\\bos\\.(?:rename|replace)\\b|\\bshutil\\.(?:copy2?|copyfile|move)\\b|\\bPath\\.write_text\\b|\\b\\.write\\s*\\(|\\bopen\\s*\\(\\s*[\\\"'][^\\\"']*[\\\"']\\s*,\\s*[\\\"']w"
+  }
+}

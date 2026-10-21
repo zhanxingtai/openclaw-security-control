@@ -1,0 +1,11 @@
+{
+  "name": "@zhanxing/sst-security-control-openclaw-node-runtime-hook",
+  "version": "1.0.0",
+  "description": "Node.js runtime hook for OpenClaw security monitor",
+  "main": "runtime.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "Apache-2.0"
+}

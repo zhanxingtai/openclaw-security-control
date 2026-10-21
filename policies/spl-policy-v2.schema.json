@@ -1,0 +1,1335 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.security/schemas/spl-policy-v2.schema.json",
+  "title": "OpenClaw SPL Security Policy (security.use/v2)",
+  "description": "SPL 策略文件格式（apiVersion: security.use/v2）。对应的 v2 合同。v1 兼容期已结束，loader 对 v1（security.use/v1）策略直接抛 `unsupported SPL apiVersion`，不再读取并 WARN。与 policies/security-policy.spl.yaml 实际结构一致；行为语义以策略文件内各 rules 的 notes 与 match/params 定义为准。",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "metadata",
+    "rules"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "security.use/v2"
+    },
+    "kind": {
+      "const": "Policy"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "author": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "enum": [
+            "builtin",
+            "template",
+            "custom",
+            "auto",
+            "intel",
+            "derived"
+          ]
+        },
+        "sourceRef": {
+          "type": "string"
+        },
+        "ttl": {
+          "type": "string"
+        },
+        "flagRegistry": {
+          "description": "risk flag 注册表（单源化）：三套默认处置名单的唯一数据源，构建期由 scripts/generate-detection-patterns.mjs 分发给 runtime hook（本地阻断）、process monitor（autokill 默认）与引擎（fail_open_high_risk_only 高危回退）。flag 名必须 ⊆ 治理字典 risk-flags.json enum（构建期校验）。",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hookBlockedFlags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "monitorAutoKillFlags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "engineHighRiskFlags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tenants": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workflows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "mode": {
+      "enum": [
+        "audit",
+        "enforce"
+      ]
+    },
+    "failStrategy": {
+      "enum": [
+        "fail_open",
+        "fail_closed",
+        "fail_open_high_risk_only"
+      ]
+    },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "enum": [
+            "percentage",
+            "agent_filter",
+            "canary",
+            "schedule",
+            "manual",
+            "all"
+          ]
+        },
+        "percentage": {
+          "type": "number"
+        },
+        "startAt": {
+          "type": "string"
+        },
+        "endAt": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "agentTags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "promptTemplates": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "redactPolicies": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "replacement": {
+                "type": "string"
+              },
+              "patterns": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "pattern",
+                    "replacement"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    },
+                    "replacement": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "hookPatterns": {
+      "description": "顶层采集层模式区：runtime hook 层 cmdline 检测正则（flag → 条目列表）。引擎不评估，仅供构建期收集分发到 hooks/generated-patterns.json。",
+      "$ref": "#/$defs/layeredPatternMap"
+    },
+    "monitorPatterns": {
+      "description": "顶层采集层模式区：process monitor 层 cmdline 检测正则。仅供构建期收集分发到 monitor/generated-patterns.json。",
+      "$ref": "#/$defs/layeredPatternMap"
+    },
+    "x-openclaw-selfProtection": {
+      "description": "项目扩展区段（openclaw 自用，V2 批次 1）：构建期生成 self-protection-patterns.generated.json 供 SelfProtection.ts 加载（缺失时回退内置常量）。与早期 v1 兼容期 legacy `selfProtection` 顶层键互斥，v2 策略必须使用本字段。",
+      "type": "object",
+      "required": [
+        "groups",
+        "structural"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "flags": {
+          "type": "string",
+          "pattern": "^[ims]*$"
+        },
+        "groups": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        },
+        "structural": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "actionTypeValue": {
+      "description": "SPL 规范触发点。前 11 项为 canonical 值（新策略必须用），其余为历史 alias（加载期展开为 canonical 并 WARN；未知值导致该规则被跳过并告警，单规则隔离，不拖垮整策略）。'*' 表示全部触发点。",
+      "enum": [
+        "agent_start",
+        "agent_stop",
+        "agent_session_start",
+        "agent_session_end",
+        "agent_message",
+        "agent_tool_call",
+        "agent_tool_result",
+        "process_start",
+        "process_exit",
+        "process_change",
+        "network_http",
+        "network_connect",
+        "network_dns",
+        "file_read",
+        "file_write",
+        "file_delete",
+        "file_privilege",
+        "asset_add",
+        "asset_change",
+        "asset_remove",
+        "security_audit",
+        "tool_call",
+        "http_request",
+        "message_write",
+        "pre_llm_call",
+        "post_llm_call",
+        "pre_api_request",
+        "post_api_request",
+        "pre_tool_call",
+        "post_tool_call",
+        "transform_tool_result",
+        "transform_terminal_output",
+        "transform_llm_output",
+        "command_execution",
+        "*"
+      ]
+    },
+    "regexList": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/$defs/flaggedPattern"
+          }
+        ]
+      }
+    },
+    "flaggedPattern": {
+      "description": "带标志的正则条目：flags 取代 PCRE 内联 (?i:...) 写法；仅允许 JS/Python 公共子集 i/m/s（禁 g/y，避免 stateful lastIndex 交替命中）。",
+      "type": "object",
+      "required": [
+        "pattern"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "flags": {
+          "type": "string",
+          "pattern": "^[ims]*$"
+        }
+      }
+    },
+    "layeredPattern": {
+      "description": "分层检测正则条目：input 仅 hook 层有意义——lowercased（默认，匹配小写化后的 redacted 命令行）或 raw（原始大小写 redacted，用于 AKIA/JWT 等大小写敏感模式）。",
+      "type": "object",
+      "required": [
+        "pattern"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "flags": {
+          "type": "string",
+          "pattern": "^[ims]*$"
+        },
+        "input": {
+          "enum": [
+            "lowercased",
+            "raw"
+          ]
+        }
+      }
+    },
+    "layeredPatternMap": {
+      "description": "flag 名 → 该 flag 的分层检测正则列表。flag 名必须 ⊆ 治理字典 risk-flags.json enum（构建期校验）。",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/layeredPattern"
+            }
+          ]
+        }
+      }
+    },
+    "patternGroup": {
+      "type": "object",
+      "required": [
+        "patterns"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "flags": {
+          "type": "string",
+          "pattern": "^[ims]*$"
+        },
+        "patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "selfProtectionPatterns": {
+      "description": "顶层 selfProtection 区：flags 为整区编译标志（当前 'i'）；groups 为组名 → 正则列表（protected_paths / gateway_config_self_harm / self_harm_commands / self_harm_messages）；structural 为结构检测名单 → 单条正则（inline_interpreter / indirect_deletion / protected_file_basenames / shell_overwrite_verbs）。",
+      "type": "object",
+      "required": [
+        "groups",
+        "structural"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "flags": {
+          "type": "string",
+          "pattern": "^[ims]*$"
+        },
+        "groups": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        },
+        "structural": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "chainLink": {
+      "description": "链节：match 子集。显式维度（pathRegex/urlRegex/bodyRegex）与 paramsRegex 简写（command→内容扫描）同义；不支持 riskFlags。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "actionType": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "action_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "toolName": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "action": {
+          "type": "string"
+        },
+        "actionName": {
+          "type": "string"
+        },
+        "action_name": {
+          "type": "string"
+        },
+        "pathRegex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "path_regex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "urlRegex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "url_regex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "bodyRegex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "body_regex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "paramsRegex": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/regexList"
+          }
+        }
+      }
+    },
+    "decision": {
+      "description": "核心四值 + 扩展二值；删除值 guide/context_adjust/substitute/degrade/approve 不再接受。",
+      "enum": [
+        "allow",
+        "warn",
+        "block",
+        "modify",
+        "audit",
+        "escalate"
+      ]
+    },
+    "blockPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "blockReason": {
+          "type": "string"
+        },
+        "blockCode": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*_[A-Z][A-Z0-9_]*_[0-9]{3}$",
+          "description": "三段制 <CATEGORY 大写>_<威胁>_<NNN>；第一段必须等于 category.uppercase()，中段威胁名以 [A-Z] 开头，禁止数字开头（如 SELF_PROTECTION_015 不合法，应为 SELF_PROTECTION_*_015）"
+        },
+        "remediationHint": {
+          "type": "string"
+        },
+        "appealable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "guidancePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "templateRef": {
+          "type": "string"
+        },
+        "template_ref": {
+          "type": "string"
+        },
+        "templateParams": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "template_params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "nonOverridable": {
+          "type": "boolean"
+        },
+        "non_overridable": {
+          "type": "boolean"
+        },
+        "maxAttempts": {
+          "type": "number"
+        },
+        "max_attempts": {
+          "type": "number"
+        },
+        "budgetThreshold": {
+          "type": "number"
+        },
+        "budget_threshold": {
+          "type": "number"
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "enabled",
+        "priority",
+        "category",
+        "match",
+        "action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "enabled": {
+          "description": "仅严格 boolean 生效。缺省 true；字符串等非 boolean 值加载期告警并按禁用处理（Boolean('no')===true 的静默启用是缺陷）。",
+          "type": "boolean"
+        },
+        "priority": {
+          "type": "number"
+        },
+        "severity": {
+          "description": "唯一风险定级字段；decision ∈ {block, warn} 时必填（由 allOf 兜底），其他决策挂值无意义但允许。",
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical",
+            "extreme"
+          ]
+        },
+        "category": {
+          "description": "8 值枚举；仅用于组织与统计，不参与匹配与裁决。",
+          "type": "string",
+          "enum": [
+            "self_protection",
+            "intrusion_defense",
+            "data_leak_monitoring",
+            "sensitive_data_access",
+            "supply_chain",
+            "ssrf",
+            "behavior_guidance",
+            "data_desensitization"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        },
+        "regClause": {
+          "description": "顶层合规条款引用：v1 `evaluate.reg_clause` 已上移顶层；区段 evaluate 在 v2 仅做兼容期回落，新策略必须直接放顶层。",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "flags": {
+          "description": "规则级正则标志：作为本规则 match 全部正则维度及 hookPatterns/monitorPatterns 条目的默认 flags（条目级 flags 优先）。仅允许 i/m/s。",
+          "type": "string",
+          "pattern": "^[ims]*$"
+        },
+        "hookPatterns": {
+          "description": "runtime hook 层（hooks/runtime.js）cmdline 检测正则，按 flag 分组（构建期收集分发到 hooks/generated-patterns.json，引擎不评估本字段，与规则 enabled 无关）。",
+          "$ref": "#/$defs/layeredPatternMap"
+        },
+        "monitorPatterns": {
+          "description": "process monitor 层（monitor/process_monitor.py）cmdline 检测正则，按 flag 分组（构建期收集分发到 monitor/generated-patterns.json，引擎不评估本字段）。",
+          "$ref": "#/$defs/layeredPatternMap"
+        },
+        "selfProtectionPatterns": {
+          "description": "SelfProtection 层模式组（构建期收集分发到 src/intervention/self-protection-patterns.generated.json，引擎不评估本字段）。组名固定为 protectedPaths / gatewayConfigSelfHarm / selfHarmCommands / selfHarmMessages / inlineInterpreter / indirectDeletion / protectedFileBasenames / shellOverwriteVerbs。",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protectedPaths": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "gatewayConfigSelfHarm": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "selfHarmCommands": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "selfHarmMessages": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "inlineInterpreter": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "indirectDeletion": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "protectedFileBasenames": {
+              "$ref": "#/$defs/patternGroup"
+            },
+            "shellOverwriteVerbs": {
+              "$ref": "#/$defs/patternGroup"
+            }
+          }
+        },
+        "match": {
+          "$ref": "#/$defs/match"
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "testCases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/testCase"
+          }
+        },
+        "test_cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/testCase"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "severity 条件必填：decision ∈ {block, warn} 时 severity 必填（V2 批次 1）；其他决策挂值无意义但允许缺省。",
+          "if": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "decision": { "enum": ["block", "warn"] }
+                },
+                "required": ["decision"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "required": ["severity"],
+            "properties": {
+              "severity": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "description": "命中不可交付决策组合（block/modify/escalate on process_start/network_http/agent_tool_result）的规则必须顶层 notes——说明为何不可交付仍要 block + 替代留痕机制；其他规则 notes 可选。HOST_DELIVERABLE_DECISIONS（store.ts）仅支持 agent_tool_call / agent_message 入口下发非 RECORD_ONLY 决策，其他入口由 store.ts warnDecisionNotDeliverable 留痕，loader 层亦必须先告警。",
+          "if": {
+            "properties": {
+              "match": {
+                "properties": {
+                  "actionType": {
+                    "type": "array",
+                    "anyOf": [
+                      { "contains": { "const": "process_start" } },
+                      { "contains": { "const": "network_http" } },
+                      { "contains": { "const": "agent_tool_result" } }
+                    ]
+                  }
+                }
+              },
+              "action": {
+                "properties": {
+                  "decision": {
+                    "enum": ["block", "modify", "escalate"]
+                  }
+                }
+              }
+            },
+            "required": ["match", "action"]
+          },
+          "then": {
+            "required": ["notes"],
+            "properties": {
+              "notes": {
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "description": "block 决策必须同时具备 blockCode 与 blockReason；缺一校验期阻断（loader 期 throw + 单规则隔离）。",
+          "if": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "decision": { "const": "block" }
+                },
+                "required": ["decision"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "action": {
+                    "required": ["block", "blockCode"],
+                    "properties": {
+                      "block": {
+                        "required": ["blockCode"],
+                        "properties": {
+                          "blockCode": { "type": "string", "minLength": 1 }
+                        }
+                      },
+                      "blockCode": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                }
+              },
+              {
+                "required": ["blockCode", "blockReason"],
+                "properties": {
+                  "blockCode": { "type": "string", "minLength": 1 },
+                  "blockReason": { "type": "string", "minLength": 1 }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "description": "modify 决策必须至少定义 redactFields|substitutePatterns|whitelistConstraint 之一；空 modify 校验期阻断。",
+          "if": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "decision": { "const": "modify" }
+                },
+                "required": ["decision"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "modify": {
+                    "anyOf": [
+                      { "required": ["redactFields"], "properties": { "redactFields": { "type": "array", "minItems": 1 } } },
+                      { "required": ["substitutePatterns"], "properties": { "substitutePatterns": { "type": "array", "minItems": 1 } } },
+                      { "required": ["whitelistConstraint"] }
+                    ]
+                  }
+                },
+                "required": ["modify"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "同一 key 多模式为 OR；不同 key 之间为 AND；paramsNotRegex 任一命中即否决整条规则。",
+      "properties": {
+        "actionType": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/actionTypeValue"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/actionTypeValue"
+              }
+            }
+          ]
+        },
+        "action_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/actionTypeValue"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/actionTypeValue"
+              }
+            }
+          ]
+        },
+        "actionName": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "action_name": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "toolName": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tool_name": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "paramsRegex": {
+          "type": "object",
+          "description": "参数值正则：递归提取嵌套对象/数组中的字符串逐值匹配（任一候选命中即该 key 命中）；path 形态值附加归一化候选（点段解析/斜杠统一）。",
+          "additionalProperties": {
+            "$ref": "#/$defs/regexList"
+          }
+        },
+        "paramsNotRegex": {
+          "type": "object",
+          "description": "豁免：任一字符串值（含归一化候选）命中即否决该规则。",
+          "additionalProperties": {
+            "$ref": "#/$defs/regexList"
+          }
+        },
+        "bodyRegex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "body_regex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "riskFlagsAny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risk_flags_any": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "riskFlagsAll": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risk_flags_all": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sessionRegex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "session_regex": {
+          "$ref": "#/$defs/regexList"
+        },
+        "fieldEquals": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "field_equals": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "fieldIn": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": true
+          }
+        },
+        "field_in": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": true
+          }
+        },
+        "chain": {
+          "description": "两形态：数组形态（链节为 match 子集，无窗口参数，按全历史回退）或对象形态 withinSteps + prior（窗口语义）。",
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/chainLink"
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "prior"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "withinSteps": {
+                  "type": "number"
+                },
+                "within_steps": {
+                  "type": "number"
+                },
+                "prior": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/chainLink"
+                  }
+                },
+                "priors": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/chainLink"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "params": {
+          "description": "紧凑简写块（可与顶层 paramsRegex 并存合并）：path_regex/path_not_regex/command_not_regex/url_regex/body_regex/field_equals/field_in/paramsRegex。",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path_regex": {
+              "$ref": "#/$defs/regexList"
+            },
+            "path_not_regex": {
+              "$ref": "#/$defs/regexList"
+            },
+            "command_not_regex": {
+              "$ref": "#/$defs/regexList"
+            },
+            "url_regex": {
+              "$ref": "#/$defs/regexList"
+            },
+            "body_regex": {
+              "$ref": "#/$defs/regexList"
+            },
+            "field_equals": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "field_in": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": true
+              }
+            },
+            "paramsRegex": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/regexList"
+              }
+            }
+          }
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "决策载荷。decision / decisionChain / conditionalDecisions 三选一（chain/conditional 优先于单决策）；未显式声明决策时告警并回落 allow。",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "decisionChain": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/decisionChainItem"
+          }
+        },
+        "decision_chain": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/decisionChainItem"
+          }
+        },
+        "conditionalDecisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conditionalDecision"
+          }
+        },
+        "conditional_decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conditionalDecision"
+          }
+        },
+        "block": {
+          "$ref": "#/$defs/blockPayload"
+        },
+        "blockReason": {
+          "type": "string"
+        },
+        "blockCode": {
+          "type": "string"
+        },
+        "block_code": {
+          "type": "string"
+        },
+        "appealable": {
+          "type": "boolean"
+        },
+        "message": {
+          "description": "warn 决策的展示文案（与既有规则兼容字段）",
+          "type": "string"
+        },
+        "modify": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "redactFields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "redactPolicyRef": {
+              "type": "string"
+            },
+            "substitutePatterns": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "pattern",
+                  "replacement"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  },
+                  "flags": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "whitelistConstraint": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "substitute": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "toolName": {
+              "type": "string"
+            },
+            "tool_name": {
+              "type": "string"
+            },
+            "paramMapping": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "param_mapping": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "guidance": {
+          "$ref": "#/$defs/guidancePayload"
+        },
+        "degrade": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "readonly",
+                "sandbox",
+                "limited_tools"
+              ]
+            },
+            "removedTools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "removed_tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "retryLimit": {
+          "type": "number"
+        },
+        "retry_limit": {
+          "type": "number"
+        }
+      }
+    },
+    "decisionChainItem": {
+      "type": "object",
+      "required": [
+        "decision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "when": {
+          "description": "激活条件：first / repeat / budget_exhausted / budget_available / high_risk / attempts<N 数值比较；缺省恒真。",
+          "type": "string"
+        },
+        "maxAttempts": {
+          "type": "number"
+        },
+        "max_attempts": {
+          "type": "number"
+        },
+        "guidance": {
+          "$ref": "#/$defs/guidancePayload"
+        },
+        "modify": {
+          "type": "object"
+        },
+        "substitute": {
+          "type": "object"
+        },
+        "block": {
+          "$ref": "#/$defs/blockPayload"
+        },
+        "degrade": {
+          "type": "object"
+        }
+      }
+    },
+    "conditionalDecision": {
+      "type": "object",
+      "required": [
+        "condition",
+        "decision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "condition": {
+          "description": "首个命中条件生效：true/false/high_risk；未知表达式恒真。risk_level==<level> 已移除（无运行时 risk 信号来源，原为恒 false 死分支），残留声明按未知表达式恒真处理并在加载期告警。",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "guidance": {
+          "$ref": "#/$defs/guidancePayload"
+        },
+        "modify": {
+          "type": "object"
+        },
+        "substitute": {
+          "type": "object"
+        },
+        "block": {
+          "$ref": "#/$defs/blockPayload"
+        },
+        "degrade": {
+          "type": "object"
+        }
+      }
+    },
+    "testCase": {
+      "description": "声明式用例：input 必须是 InterventionContext 实例字段（actionType 缺省 tool_call）；由 tests/intervention/policy-testcases.test.ts 统一执行。",
+      "type": "object",
+      "required": [
+        "input"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "expectedDecision": {
+          "$ref": "#/$defs/decision"
+        },
+        "expectedModified": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "expectedGuidanceContains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

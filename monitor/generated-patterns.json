@@ -1,0 +1,222 @@
+{
+  "patterns": [
+    {
+      "flag": "reverse_shell",
+      "pattern": "bash\\s+-i\\s+.*(/dev/tcp|/dev/udp)",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "/dev/tcp/\\d+/\\d+",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "/dev/udp/\\d+/\\d+",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "\\bnc\\b.*\\s+-e\\s+\\S+",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "\\bncat\\b.*\\s+--?exec\\s+\\S+|\\bncat\\b.*\\s+-e\\s+\\S+",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "mkfifo\\s+\\S+.*\\|\\s*(?:\\S*/)?(nc|ncat)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "(nc|ncat)\\s+\\S+\\s+\\d+.*\\|\\s*(?:\\S*/)?(sh|bash|zsh|dash|ash)\\s+-i",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "cat\\s+[^|;&]*\\|\\s*(?:\\S*/)?(sh|bash|zsh|dash|ash)\\s+-i.*\\|\\s*(?:\\S*/)?(nc|ncat)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "python[23]?\\s+.*socket.*connect",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "python[23]?\\s+-c\\s+.*subprocess",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "ruby\\s+-rsocket",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "socat\\s+.*tcp-listen",
+      "flags": "i"
+    },
+    {
+      "flag": "reverse_shell",
+      "pattern": "socat\\s+.*tcp:[^,]*\\s+exec:",
+      "flags": "i"
+    },
+    {
+      "flag": "download_execute",
+      "pattern": "(?:curl|wget|fetch).*\\|.*\\b(?:sh|bash|zsh)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "download_execute",
+      "pattern": "(curl|wget|fetch)\\s+.*\\|\\s*(bash|sh|zsh|python|perl|ruby)",
+      "flags": "i"
+    },
+    {
+      "flag": "download_execute",
+      "pattern": "(curl|wget|fetch)(?:\\s+\\S+)*\\s+-[oo]\\s+\\S+\\s+\\S+\\s*(?:&&|;|\\|\\|)\\s*(?:bash|sh|zsh)\\s+\\S",
+      "flags": "i"
+    },
+    {
+      "flag": "download_execute",
+      "pattern": "(?:bash|sh|zsh)\\s+<\\s*<\\s*\\(\\s*(?:curl|wget|fetch)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "download_execute",
+      "pattern": "(?:curl|wget|fetch)\\b.*(?:\\.|source)\\s+/tmp/\\S+\\.(?:sh|bash)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-[a-zA-Z]*\\s+/($|\\s)",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-[a-zA-Z]*\\s+/\\*",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-rf\\s+/(\\s|$)",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-rf\\s+/\\*",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-rf\\s+--no-preserve-root",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/root/",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "rm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/home/[^/\\s]+/?\\s*$",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "dd\\s+if=\\S+\\s+of=/dev/[sh]da",
+      "flags": "i"
+    },
+    {
+      "flag": "mass_deletion",
+      "pattern": "mkfs\\.\\w+\\s+/dev/[sh]da",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "sudo\\s+.*chmod\\s*[\\w]*\\+s",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "sudo\\s+.*chown\\s+root",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "sudo\\s+.*visudo",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "su\\s+-\\s*root",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "su\\s+root",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "pkexec\\s+",
+      "flags": "i"
+    },
+    {
+      "flag": "privilege_escalation",
+      "pattern": "setuid\\s*\\(",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\bscp\\b|\\brsync\\b|\\bsftp\\b|\\btar\\b.*\\b-c\\b|\\bzip\\b.*\\b-r\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\bcurl\\b[^|;&]*(?:-t\\b|--upload-file\\b)",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\bcurl\\b[^|;&]*(?:-d\\b|--data(?:-raw|-binary|-ascii|-urlencode)?\\b)[^|;&]*https?:\\/\\/",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\bwget\\b[^|;&]*--post-(?:file|data)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\brclone\\b[^|;&]*\\b(?:copy|move|sync)\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\bgit\\b[^|;&]*\\bpush\\b",
+      "flags": "i"
+    },
+    {
+      "flag": "data_exfiltration",
+      "pattern": "\\b(?:nc|ncat|socat)\\b[^|;&]*<",
+      "flags": "i"
+    },
+    {
+      "flag": "token_in_command",
+      "pattern": "(?:Authorization\\s*[:=]\\s*|Bearer\\s+[A-Za-z0-9_\\-\\.~+/=]{12,}|(?:api[_-]?key|access[_-]?token|secret|password)\\s*[:=]\\s*\\S+)",
+      "flags": "i"
+    },
+    {
+      "flag": "sensitive_file_access",
+      "pattern": "(?:^|\\s|[\\\"'<>])(?:/etc/(?:passwd|shadow|gshadow|sudoers|hosts|ssh/\\S*)|/root/\\S*|/proc/self/environ|(?:.*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|config))\\b|\\bgetent\\s+(?:passwd|shadow|group)\\b",
+      "flags": "i"
+    }
+  ],
+  "autoKillFlags": [
+    "reverse_shell"
+  ]
+}
