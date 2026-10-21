@@ -66,3 +66,37 @@ tar -tzf install/sst-security-control-openclaw-1.0.0.tgz | grep -E "changed/file
 | `npm run build:ci` | 编译 + 跑全量测试 + 打包 | ✅ |
 | `npm run test` | 仅运行测试 | ❌ |
 | `npm run lint` | 仅 ESLint 检查 | ❌ |
+
+## 5. OSS 分支维护（github-main，强制）
+
+GitHub 公开仓库（remote `github`）走独立孤儿分支 `github-main`，与内网分支（默认 `initiative/open-source-compliance`）双轨维护。
+
+### 5.1 红线
+
+- **禁止在 `github-main` 上直接 commit**（含 amend/rebase/cherry-pick）。该分支上的 commit 只允许由 `scripts/oss-sync.sh` 产出。
+- OSS commit 身份固定为 `hixss <17995374+hixss@users.noreply.github.com>`，**绝不使用**全局 git 配置里的内部身份（`support@zhihuizhanxing.com`）。
+- **绝不执行 `git push --mirror`** 到 `github` remote——会绕过所有防护把内网全量历史推到公网。
+- 不在 `github` remote 上创建 HTTPS 地址；推送只走已配置的 SSH 通道。
+
+### 5.2 标准发版同步
+
+```bash
+bash scripts/oss-sync.sh "release: v1.1.0 说明"
+```
+
+脚本自动完成：squash 内网增量到 `github-main`（noreply 身份）→ 内网分支打 `-s ours` 锚点并推送 origin → 推送 GitHub main。打 tag 需手动：
+
+```bash
+git tag -a v1.1.0 -m "release v1.1.0"
+git push github v1.1.0
+```
+
+若 squash 出现冲突（常见于 OSS 分支历史被重写后的 add/add），脚本会中止；解决后手动完成剩余步骤（`git checkout --theirs <file>` → `git add` → 带 noreply 身份 `git commit` → 重跑脚本或手动打锚点推送）。
+
+### 5.3 身份兜底
+
+`scripts/git-hooks/pre-commit` 会拒绝在 `github-main` 上使用非 noreply 身份的提交。每个克隆点执行一次启用：
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
