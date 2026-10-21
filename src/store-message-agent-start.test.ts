@@ -136,7 +136,9 @@ describe('message_write / agent_start 决策落地', () => {
 
   afterEach(async () => {
     await store.shutdown();
-    rmSync(tmpDir, { recursive: true, force: true });
+    // Windows 下异步写句柄可能在 shutdown 返回后仍在 flush，
+    // 直接 rm 会撞 ENOTEMPTY；maxRetries 是 Node 为这类瞬态错误内置的重试。
+    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     vi.restoreAllMocks();
   });
 

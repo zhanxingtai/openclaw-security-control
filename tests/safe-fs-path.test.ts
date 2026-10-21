@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync, realpathSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { safeFsPath } from "../src/utils/safeFsPath.js";
@@ -11,7 +11,12 @@ import { safeFsPath } from "../src/utils/safeFsPath.js";
  * - 符号链接逃逸（根内链接指向根外真实文件）→ undefined；
  * - ELOOP（符号链接成环）→ undefined；
  * - ENOENT（文件尚不存在）→ 返回绝对路径，让下游报"文件不存在"。
+ *
+ * 断言一律以 realpathSync.native 的实际输出为基准：macOS 的 /var 是
+ * /private/var 的符号链接、GitHub Actions Windows 的 TEMP 是 8.3 短名
+ * （RUNNER~1），这些平台下 tmpdir 的词法形式 ≠ 文件系统形式。
  */
+const real = (p: string) => (realpathSync.native ?? realpathSync)(p);
 
 let root: string;
 let outside: string;
@@ -31,7 +36,7 @@ describe("safeFsPath 安全分支", () => {
     const file = path.join(root, "sub", "policy.yaml");
     mkdirSync(path.dirname(file));
     writeFileSync(file, "x");
-    expect(safeFsPath(file, [root])).toBe(file);
+    expect(safeFsPath(file, [root])).toBe(real(file));
   });
 
   it("词法逃逸（..）拒绝", () => {
@@ -64,7 +69,7 @@ describe("safeFsPath 安全分支", () => {
 
   it("ENOENT 放行绝对路径（下游报「文件不存在」而非误判越界）", () => {
     const missing = path.join(root, "not-yet", "file.yaml");
-    expect(safeFsPath(missing, [root])).toBe(path.resolve(missing));
+    expect(safeFsPath(missing, [root])).toBe(path.join(real(root), "not-yet", "file.yaml"));
   });
 
   it("~ 展开到 homedir 后按根校验（不在根内则拒绝）", () => {
@@ -89,7 +94,7 @@ describe("safeFsPath 根路径自身含符号链接/别名（CI 回归）", () =
     writeFileSync(file, "x");
     const linkRoot = path.join(root, "link-root");
     symlinkSync(realRoot, linkRoot, "dir");
-    expect(safeFsPath(path.join(linkRoot, "policy.yaml"), [linkRoot])).toBe(file);
+    expect(safeFsPath(path.join(linkRoot, "policy.yaml"), [linkRoot])).toBe(real(file));
   });
 
   it("根内符号链接逃逸仍拒绝（根 unwound 不削弱逃逸检测）", () => {
@@ -110,7 +115,7 @@ describe("safeFsPath 根路径自身含符号链接/别名（CI 回归）", () =
     const linkRoot = path.join(root, "link-root");
     symlinkSync(realRoot, linkRoot, "dir");
     const missing = path.join(linkRoot, "not-yet", "file.yaml");
-    expect(safeFsPath(missing, [linkRoot])).toBe(path.join(realRoot, "not-yet", "file.yaml"));
+    expect(safeFsPath(missing, [linkRoot])).toBe(path.join(real(realRoot), "not-yet", "file.yaml"));
   });
 
   it("不存在的根（ENOENT）不拓宽到已存在祖先", () => {
