@@ -11,11 +11,60 @@
  * (typically `~/.openclaw/`). It returns the resolved path on success or
  * `undefined` if the path escapes the sandbox. Callers MUST treat
  * `undefined` as "reject the input" — never fall through to the raw value.
+ *
+ * Both the candidate path AND the roots are unwound through realpath before
+ * comparison: a root whose textual form differs from its filesystem form —
+ * macOS `/var` → `/private/var`, or the Windows 8.3 short-name temp dirs
+ * GitHub Actions uses (`C:\Users\RUNNER~1\...`) — would otherwise make every
+ * legitimate path under it look like an escape.
  */
 
 import { realpathSync } from 'fs';
 import { homedir } from 'os';
 import path from 'path';
+
+const realpath = (p: string): string => (realpathSync.native ?? realpathSync)(p);
+
+/**
+ * realpath a path; when it does not exist yet (ENOENT), walk up to the
+ * nearest existing ancestor, realpath that, and re-append the literal tail.
+ * The tail consists of single path components collected on the way up, so a
+ * `..` segment can never be reintroduced. Other errors (EACCES, ELOOP)
+ * propagate — they can hide symlink races the operator cannot audit.
+ */
+function unwindSymlinks(absolute: string): string {
+  try {
+    return realpath(absolute);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    let tail = '';
+    let dir = absolute;
+    for (;;) {
+      const parent = path.dirname(dir);
+      if (parent === dir) return absolute; // filesystem root missing: unreachable in practice
+      tail = tail ? path.join(path.basename(dir), tail) : path.basename(dir);
+      dir = parent;
+      try {
+        return path.join(realpath(dir), tail);
+      } catch (err2) {
+        if ((err2 as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err2;
+      }
+    }
+  }
+}
+
+/**
+ * realpath an allowed root. A root that does not exist yet (e.g. a fresh
+ * user's `~/.openclaw`) keeps its lexical form — walking up to an existing
+ * ancestor here would silently widen the sandbox to that ancestor.
+ */
+function unwindRoot(root: string): string {
+  try {
+    return realpath(root);
+  } catch {
+    return root;
+  }
+}
 
 export function safeFsPath(
   value: string | undefined,
@@ -30,41 +79,22 @@ export function safeFsPath(
       : value;
   const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(expanded);
 
-  // Verify the path is under at least one allowed root. Use path.relative to
-  // detect escapes (`..` results in a leading `..` segment).
   for (const root of allowedRoots) {
-    const resolvedRoot = path.resolve(root);
-    const rel = path.relative(resolvedRoot, absolute);
+    const resolvedRoot = unwindRoot(path.resolve(root));
+    let resolved: string;
+    try {
+      resolved = unwindSymlinks(absolute);
+    } catch {
+      // EACCES / ELOOP / other: refuse — these can hide symlink races.
+      return undefined;
+    }
+    // Containment on resolved-vs-resolved: a symlink inside the root that
+    // points at a real file outside it (e.g. ~/.openclaw/link -> /etc/shadow)
+    // is unwound to its true location and fails the check exactly like the
+    // /etc/shadow class of paths this gate exists to stop.
+    const rel = path.relative(resolvedRoot, resolved);
     if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-      // Resolve symlinks for a tight check. We previously returned the
-      // un-resolved absolute path on realpathSync failure which let a
-      // hostile filesystem that already had a dangling symlink under
-      // ~/.openclaw sneak through. Distinguish:
-      //   - ENOENT (file genuinely does not exist yet): return the absolute
-      //     path so callers downstream can surface "file not found" instead
-      //     of a misleading "outside sandbox" error.
-      //   - EACCES / ELOOP / other: refuse — these can hide symlink
-      //     races the operator cannot audit.
-      try {
-        const fn = realpathSync.native ?? realpathSync;
-        const resolved = fn(absolute);
-        // Re-verify containment AFTER unwinding symlinks: a symlink inside
-        // the root that points at a real file outside it (e.g. ~/.openclaw/
-        // link -> /etc/shadow) lexically passes the check above, and the old
-        // code returned the out-of-root realpath — the gate leaked exactly
-        // the /etc/shadow class of paths it exists to stop.
-        const resolvedRel = path.relative(resolvedRoot, resolved);
-        if (resolvedRel === '' || (!resolvedRel.startsWith('..') && !path.isAbsolute(resolvedRel))) {
-          return resolved;
-        }
-        return undefined;
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException)?.code;
-        if (code === 'ENOENT') {
-          return absolute;
-        }
-        return undefined;
-      }
+      return resolved;
     }
   }
   return undefined;
