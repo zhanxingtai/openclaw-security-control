@@ -87,6 +87,22 @@ function wait(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * 尽力删除临时目录：Windows 上异步写句柄可能在 shutdown 返回后仍在
+ * flush，rmSync 内置重试经常不够用。轮询重试若干次后仍失败则放弃
+ * （进程退出时由 OS 回收系统临时目录），绝不能因为清理失败把用例判红。
+ */
+async function rmTreeBestEffort(dir: string, attempts = 10, delayMs = 200) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await wait(delayMs);
+    }
+  }
+}
+
 /** 轮询 NDJSON，直到谓词命中或超时；返回匹配的事件列表。 */
 async function waitForEvents(
   ndjsonPath: string,
@@ -136,9 +152,7 @@ describe('message_write / agent_start 决策落地', () => {
 
   afterEach(async () => {
     await store.shutdown();
-    // Windows 下异步写句柄可能在 shutdown 返回后仍在 flush，
-    // 直接 rm 会撞 ENOTEMPTY；maxRetries 是 Node 为这类瞬态错误内置的重试。
-    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    await rmTreeBestEffort(tmpDir);
     vi.restoreAllMocks();
   });
 
