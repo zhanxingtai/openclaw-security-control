@@ -54,6 +54,15 @@ const CHMOD_DONE_PATHS = new Set<string>();
 
 class EventBridgeCollector {
   constructor(private readonly cfg: SecurityMonitorConfig['collector']) {}
+
+  /**
+   * In-flight appends. Hook handlers call report() fire-and-forget, so a
+   * shutdown/reset must drain these before the caller tears down the
+   * surrounding directory — otherwise a late append recreates files mid-cleanup
+   * (observed on Windows CI as rmSync ENOTEMPTY).
+   */
+  private readonly pendingWrites = new Set<Promise<void>>();
+
   async report(event: SecurityEvent): Promise<void> {
     const path = this.cfg?.ndjsonPath;
     if (!path) return;
@@ -132,26 +141,34 @@ class EventBridgeCollector {
       }
     }
 
-    try {
-      await appendFile(path, line, 'utf8');
-      // NDJSON may carry credential plaintext / prompts. Default umask (022)
-      // leaves the file world-readable; tighten to owner-only once per path —
-      // the first append creates the file under the current umask, after which
-      // the mode persists across appends.
-      if (!CHMOD_DONE_PATHS.has(path)) {
-        try {
-          await chmod(path, 0o600);
-          CHMOD_DONE_PATHS.add(path);
-        } catch (err) {
-          // permission tightening best-effort, but keep visibility
-          this.logWriteIssue(`chmod ${path} 0o600 failed: ${err instanceof Error ? err.message : String(err)}`);
+    const write = (async () => {
+      try {
+        await appendFile(path, line, 'utf8');
+        // NDJSON may carry credential plaintext / prompts. Default umask (022)
+        // leaves the file world-readable; tighten to owner-only once per path —
+        // the first append creates the file under the current umask, after which
+        // the mode persists across appends.
+        if (!CHMOD_DONE_PATHS.has(path)) {
+          try {
+            await chmod(path, 0o600);
+            CHMOD_DONE_PATHS.add(path);
+          } catch (err) {
+            // permission tightening best-effort, but keep visibility
+            this.logWriteIssue(`chmod ${path} 0o600 failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
+      } catch (err) {
+        // best-effort: do not break hook handlers — but count and surface the
+        // failure instead of swallowing it silently.
+        this.writeErrorCount += 1;
+        this.logWriteIssue(`append ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-    } catch (err) {
-      // best-effort: do not break hook handlers — but count and surface the
-      // failure instead of swallowing it silently.
-      this.writeErrorCount += 1;
-      this.logWriteIssue(`append ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
+    })();
+    this.pendingWrites.add(write);
+    try {
+      await write;
+    } finally {
+      this.pendingWrites.delete(write);
     }
   }
 
@@ -172,7 +189,12 @@ class EventBridgeCollector {
   }
 
   async initialize(): Promise<void> { /* no-op */ }
-  async shutdown(): Promise<void> { /* no-op */ }
+  async shutdown(): Promise<void> {
+    // Drain fire-and-forget appends so plugin unload / store reset does not
+    // orphan in-flight writes (Windows CI: late append recreated files while
+    // the test's rmSync was deleting the temp dir → ENOTEMPTY).
+    await Promise.allSettled([...this.pendingWrites]);
+  }
   /** Polling/ack handled by SDK sidecar; this stub is a no-op. */
   async flush(): Promise<void> { /* no-op */ }
   /** Stats exposed via bridge route; this stub returns zeros. */
