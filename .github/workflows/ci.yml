@@ -60,9 +60,9 @@ jobs:
       - run: npm test
       - run: npm run build:prod
   # 插件 tgz 跨平台（纯 JS + vendored Python monitor），任一 OS 打包产物一致，
-  # 由 linux job 产物发布到 GitHub Releases。仅在推送 v* tag 时触发。
+  # 由 linux job 产物发布到 GitHub Releases。仅在推送 tag 时触发（不限前缀）。
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [linux-package, windows-installer, macos-installer]
     runs-on: ubuntu-latest
     permissions:
