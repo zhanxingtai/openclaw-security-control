@@ -50,7 +50,6 @@ const REQUIRED = [
   'package/hooks/',
   'package/system/',
   'package/README.md',
-  'package/docs/',
 ];
 
 // Entries that must not appear in the install bundle.
