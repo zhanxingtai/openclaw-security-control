@@ -79,7 +79,9 @@ jobs:
       - name: Rename tarball with tag
         run: |
           src=$(ls install/sst-security-control-openclaw-*.tgz)
-          mv "$src" "install/sst-security-control-openclaw-${GITHUB_REF_NAME}.tgz"
+          dst="install/sst-security-control-openclaw-${GITHUB_REF_NAME}.tgz"
+          # 包内版本号与 tag 一致时源/目标同名，mv 会报 "same file"
+          if [ "$src" != "$dst" ]; then mv "$src" "$dst"; fi
       - uses: softprops/action-gh-release@v2
         with:
           files: install/sst-security-control-openclaw-*.tgz
