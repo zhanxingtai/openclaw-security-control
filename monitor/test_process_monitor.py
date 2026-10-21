@@ -195,10 +195,20 @@ class TestProcessMonitorSnapshot(unittest.TestCase):
         proc.pid = self.monitor.own_pid
         self.assertTrue(self.monitor.should_exclude_process(proc))
 
-    def test_should_exclude_by_command_line(self):
+    def test_should_exclude_own_executable(self):
+        # H10 哨兵：仅当 cmdline 首词是监视器自身可执行路径时才排除
+        own = "/opt/monitor/process_monitor.py"
+        self.monitor._own_executable_cached = own
         proc = self._mock_process()
-        proc.cmdline.return_value = ["python3", "/some/path/process_monitor.py"]
+        proc.cmdline.return_value = [own]
         self.assertTrue(self.monitor.should_exclude_process(proc))
+
+    def test_should_not_exclude_argv_injected_monitor_name(self):
+        # H10：argv 里塞 "process_monitor.py" 字样不得被整体跳过
+        self.monitor._own_executable_cached = "/opt/monitor/process_monitor.py"
+        proc = self._mock_process()
+        proc.cmdline.return_value = ["bash", "-c", "evil # process_monitor.py"]
+        self.assertFalse(self.monitor.should_exclude_process(proc))
 
     def test_should_not_exclude_normal_process(self):
         proc = self._mock_process()
