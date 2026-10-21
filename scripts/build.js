@@ -480,7 +480,9 @@ function assertInstallTarballIntegrity(tarballPath, installDir) {
     if (r.status !== 0) {
       throw new Error(`tar exit ${r.status}: ${r.stderr || r.stdout || '(no output)'}`);
     }
-    entries = (r.stdout || '').split('\n').filter(Boolean);
+    // CI runner 的 tar 可能是 bsdtar（Windows 自带），输出 CRLF，
+    // 残留 \r 会让下面的路径比对全部失配——按 \r?\n 切分。
+    entries = (r.stdout || '').split(/\r?\n/).filter(Boolean);
   } catch (err) {
     log(`FAIL: cannot list tarball entries: ${err.message}`);
     process.exit(1);
