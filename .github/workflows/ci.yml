@@ -59,3 +59,27 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build:prod
+  # 插件 tgz 跨平台（纯 JS + vendored Python monitor），任一 OS 打包产物一致，
+  # 由 linux job 产物发布到 GitHub Releases。仅在推送 v* tag 时触发。
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-package, windows-installer, macos-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build:prod
+      - run: node scripts/verify-tarball.mjs
+      - name: Rename tarball with tag
+        run: |
+          src=$(ls install/sst-security-control-openclaw-*.tgz)
+          mv "$src" "install/sst-security-control-openclaw-${GITHUB_REF_NAME}.tgz"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: install/sst-security-control-openclaw-*.tgz
