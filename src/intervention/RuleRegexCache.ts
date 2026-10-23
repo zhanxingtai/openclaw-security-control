@@ -1,7 +1,7 @@
 /**
  * OpenClaw Security Monitor - Rule Regex Cache
  *
- * 策略正则预编译旁路结构（标准 3.2）。
+ * 策略正则预编译旁路结构。
  * RuleLoader 在策略加载 / 热更新时一次性编译全部正则，
  * RuleMatcher 评估热路径只读编译产物，零现场 new RegExp。
  * 非法正则：跳过该规则并记告警（返回 ok=false），不导致加载失败。
@@ -285,7 +285,7 @@ function compilePatternMap(map: Record<string, PolicyRegexEntry[]>, ruleFlags?: 
 
 /**
  * 编译单条规则的全部正则维度。任一模式非法或命中灾难性回溯签名即返回
- * ok=false，调用方据此跳过该规则（标准 3.2：跳过 + 告警，不得评估异常）。
+ * ok=false，调用方据此跳过该规则并记告警——单条规则的正则问题不得中断评估。
  */
 export function compileRuleRegexes(rule: PolicyRule): RuleRegexCompileResult {
   const match = rule.match || {};

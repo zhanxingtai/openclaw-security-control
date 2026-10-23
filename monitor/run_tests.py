@@ -19,7 +19,7 @@ Usage:  python monitor/run_tests.py
 import sys
 import unittest
 
-# Pre-existing baseline failures, verified 2026-09-29 on Windows.
+# Pre-existing baseline failures (verified on Windows).
 # Format: "TestClass.test_name". Remove entries as they are fixed; NEVER add
 # new ones without a linked issue.
 EXPECTED_FAILURES = frozenset({

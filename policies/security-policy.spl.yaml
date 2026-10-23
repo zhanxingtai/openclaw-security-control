@@ -3,8 +3,9 @@ kind: Policy
 metadata:
   id: openclaw-security-monitor
   name: OpenClaw 安全监控插件策略
-  version: 1.3.0
-  description: OpenClaw security monitoring policy for application layer intervention. v1.1.0 起补齐 category / testCases / paramsNotRegex 白名单与数据泄露监测规则（DATA_LEAK_*）；v1.2.0 新增通用攻击面规则：paste/gist 外传阻断、远端 scp/sftp/rsync 传输告警、多语言反弹 shell、capabilities 操纵、进程终止告警、procfs 凭据踪迹；v1.3.0 新增自保护面规则：env 预执行钩子传递、cron modify/payload、防火墙清空、SELinux/AppArmor 降级、ptrace 附加、审计文件篡改、插件路径引用、磁盘覆写。
+  # 1.4.0：命令正则条目补 flags: 'i'，防 `RM -rf /` 这类纯大小写变形绕过。
+  version: 1.4.0
+  description: OpenClaw security monitoring policy for application layer intervention. 覆盖数据泄露监测（DATA_LEAK_*）、通用攻击面（paste/gist 外传、远端传输、多语言反弹 shell、capabilities 操纵、进程终止、procfs 凭据踪迹）与自保护面（env 预执行钩子传递、cron 注入、防火墙清空、SELinux/AppArmor 降级、ptrace 附加、审计文件篡改、插件路径引用、磁盘覆写）。
   source: builtin
   # 三套默认处置名单唯一数据源（构建期生成 generated-flag-defaults.ts
   # 与 hooks/monitor 产物；runtime.js / process_monitor.py / types.ts 不再自维护拷贝）
@@ -82,8 +83,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      插件禁用/卸载拦截（SELF_PROTECTION_DISABLE_001）。形态包括 npm uninstall、openclaw plugins set-enabled、plugins.deny 注入、openclaw.json "enabled":false 等。
-      无合法业务场景，零误伤面；开发者本地环境由 npm link 副本运行不受影响（模式锚定 sst-security-control-openclaw 包名）。
+      卸载/禁用插件拦截。无合法业务场景，零误伤面。
     match:
       actionType:
         - agent_tool_call
@@ -101,39 +101,58 @@ rules:
         - manage_plugin
       paramsRegex:
         command:
-          - \bsetup-openclaw\.(js|mjs|cjs).*--(cleanup|uninstall)\b
-          - \b(npm|yarn|pnpm)\s+(uninstall|remove|rm|unlink)\b.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)
+          - pattern: '\bsetup-openclaw\.(js|mjs|cjs).*--(cleanup|uninstall)\b'
+            flags: 'i'
+          - pattern: '\b(npm|yarn|pnpm)\s+(uninstall|remove|rm|unlink)\b.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)'
+            flags: 'i'
           # npm 官方别名（un/del）此前不在 arm；增补
           # `npm un` / `npm del` / `npm rm` / `npm unlink` 四种官方别名形态。
-          - \b(npm|yarn|pnpm)\s+(un|del|unlink)\b[^&|;\n]{0,80}?(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)
+          - pattern: '\b(npm|yarn|pnpm)\s+(un|del|unlink)\b[^&|;\n]{0,80}?(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)'
+            flags: 'i'
           # npm pkg delete/rm/set ""：从 package.json dependencies 摘除后下次
           # `npm i --production` 即 prune，等效卸载。覆盖 set "" 清空版本号
           # 触发的依赖剪枝。
-          - \b(npm|yarn|pnpm)\s+pkg\s+(delete|rm|del|set)\b[^&|;\n]{0,200}?(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)
-          - \bopenclaw\s+(plugins?|extensions?)\s+(uninstall|remove|disable|delete)\b.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|security-monitor)
-          - \brm\s+(-[a-zA-Z]*\s+)?\S*\.openclaw(\s|$)
-          - \brm\s+(-[a-zA-Z]*\s+)?\S*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)(\s|$)
-          - \brmdir\s+\S*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)
-          - \b(mv|chmod|chown)\s+.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)
+          - pattern: '\b(npm|yarn|pnpm)\s+pkg\s+(delete|rm|del|set)\b[^&|;\n]{0,200}?(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|@zhanxing/sst-security-control-openclaw|@zhanxing/sst-security-control-openclaw-v0\.9\.1|@zhanxing/openclaw-security-monitor)'
+            flags: 'i'
+          - pattern: '\bopenclaw\s+(plugins?|extensions?)\s+(uninstall|remove|disable|delete)\b.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor|security-monitor)'
+            flags: 'i'
+          - pattern: '\brm\s+(-[a-zA-Z]*\s+)?\S*\.openclaw(\s|$)'
+            flags: 'i'
+          - pattern: '\brm\s+(-[a-zA-Z]*\s+)?\S*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)(\s|$)'
+            flags: 'i'
+          - pattern: '\brmdir\s+\S*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)'
+            flags: 'i'
+          - pattern: '\b(mv|chmod|chown)\s+.*(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw-security-monitor)'
+            flags: 'i'
           # 以下各臂从硬编码 SelfProtection 层回收入 spl（单一源头），
           # SelfProtection 的同名检测改为构建期从本规则生成，两侧不再双写漂移。
           # 8.2 CLI 变体：set-enabled / rm
-          - \bopenclaw\s+plugins?\s+set-?enabled\b.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b
-          - \bopenclaw\s+plugins?\s+\brm\b.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b
+          - pattern: '\bopenclaw\s+plugins?\s+set-?enabled\b.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b'
+            flags: 'i'
+          - pattern: '\bopenclaw\s+plugins?\s+\brm\b.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b'
+            flags: 'i'
           # plugins.deny 塞入插件 id（deny 在平台层封死，阻断再启用）
-          - plugins?\.deny\s*.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b
-          - \b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b.*plugins?\.deny
+          - pattern: 'plugins?\.deny\s*.*\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b'
+            flags: 'i'
+          - pattern: '\b(sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor)\b.*plugins?\.deny'
+            flags: 'i'
           # 编辑插件配置以禁用自身（openclaw.json 直写形态）
-          - openclaw\.json.*"enabled"\s*:\s*false
-          - plugins\.entries\s*\[\s*['"]sst-security-control-openclaw['"]\s*\]\s*=\s*(null|undefined)
-          - plugins\.allow\s*=\s*plugins\.allow\.filter\s*\(\s*id\s*=>\s*id\s*!==\s*['"]sst-security-control-openclaw['"]
+          - pattern: 'openclaw\.json.*"enabled"\s*:\s*false'
+            flags: 'i'
+          - pattern: 'plugins\.entries\s*\[\s*[''"]sst-security-control-openclaw[''"]\s*\]\s*=\s*(null|undefined)'
+            flags: 'i'
+          - pattern: 'plugins\.allow\s*=\s*plugins\.allow\.filter\s*\(\s*id\s*=>\s*id\s*!==\s*[''"]sst-security-control-openclaw[''"]'
+            flags: 'i'
           # cd+rm / find-delete 绕过形态。`cd ~/.openclaw && rm -rf .`
           # 等效卸载插件但完全绕过 `\brm\s+.*\.openclaw` 形态（rm 目标是 `.` 不是
           # 路径含 `.openclaw`）；`find ~ -name '.openclaw' -delete` 同理。
           # 新 arm 锚定 `.openclaw` 字面 + 链式 shell 语义；不重叠旧 arm。
-          - \bcd\s+\S*\.openclaw\b[^&|;\n]{0,80}?&&[^&|;\n]{0,40}?(rm|rmdir|find)\b
-          - \bfind\s+\S+\s+-name\s+['"]?\.openclaw['"]?\s+-delete\b
-          - \bfind\s+\S+\s+-name\s+['"]?\.openclaw['"]?\s+-exec\s+rm\s+(-[a-zA-Z]+\s+)*\{\}\s*\\?;
+          - pattern: '\bcd\s+\S*\.openclaw\b[^&|;\n]{0,80}?&&[^&|;\n]{0,40}?(rm|rmdir|find)\b'
+            flags: 'i'
+          - pattern: '\bfind\s+\S+\s+-name\s+[''"]?\.openclaw[''"]?\s+-delete\b'
+            flags: 'i'
+          - pattern: '\bfind\s+\S+\s+-name\s+[''"]?\.openclaw[''"]?\s+-exec\s+rm\s+(-[a-zA-Z]+\s+)*\{\}\s*\\?;'
+            flags: 'i'
     action:
       decision: block
       blockReason: 该操作会禁用或卸载安全监控插件，已被安全策略阻断
@@ -172,8 +191,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      插件配置/数据篡改拦截（SELF_PROTECTION_TAMPER_001）。写入 .openclaw/extensions / .openclaw/guidance-state.json / .openclaw/guidance-templates/ 与 node_modules/@zhanxing/sst-security-control-openclaw 路径。
-      合法开发者在自身项目目录编辑不受影响（路径前缀锚定）。
+      篡改插件配置/数据目录。路径前缀锚定，开发者编辑自身项目不受影响。
     match:
       actionType:
         - agent_tool_call
@@ -254,11 +272,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      restart/reload/reboot 不在本规则拦截面：良性网关重启（应用配置变更等）
-      是正常运维动作，意图判别由硬编码 SelfProtection 层完成
-      （isGatewayRestartWithUninstallIntent：仅当重启与卸载/移除安全监控插件
-      的意图同时出现才阻断，SelfProtection.test.ts 有良性重启放行的锚点用例）。
-      本规则只管"配置写操作指向插件禁用/移除"的明确形态。
+      网关配置写指向插件禁用/移除。良性重启不在拦截面，重启的意图判别由 SelfProtection 层完成。
     match:
       actionType:
         - agent_tool_call
@@ -371,13 +385,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      收窄：action 枚举只收写操作/禁用移除操作。原 `^config\.` /
-      `^plugin` / `^extension` 前缀形态会把 config.get、plugin.list 等只读操作
-      一并 block（critical + appealable:false 的只读误报）；restart 类动作已从
-      本规则与 self-protection-block-gateway-config-self-harm 中移除，意图判别
-      交由 SelfProtection 硬编码层（良性重启放行，卸载意图重启才阻断）。
-      不在枚举内的 action（status.get / config.get / plugin.list / plugin.enable
-      / restart 等）一律放行。
+      只看 action 不看 path：任何 config 写都会被 block（critical 不可申诉），故只收显式禁用/卸载轴。config 写轴移交 self-protection-block-gateway-config-write。
     match:
       actionType:
         - agent_tool_call
@@ -394,7 +402,6 @@ rules:
         - manage_plugin
       paramsRegex:
         action:
-          - ^config\.(patch|set|update|put|write|delete|remove|unset|replace|merge|edit)$
           - ^plugins?\.(remove|uninstall|disable|patch|update)$
           - ^extensions?\.(remove|uninstall|disable|patch|update)$
     action:
@@ -409,12 +416,24 @@ rules:
           toolName: gateway
           params: { action: "plugin.uninstall" }
         expectedDecision: block
-      - name: gateway 配置写动作被阻断
+      - name: gateway 禁用插件动作被阻断（目标写在 value 时硬编码层判不出意图，本规则为唯一防线）
         input:
           actionType: agent_tool_call
           toolName: gateway
-          params: { action: "config.patch", path: "plugins.allow" }
+          params: { action: "plugin.disable", value: "openclaw-security_monitor" }
         expectedDecision: block
+      - name: extension_manager 卸载扩展被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: extension_manager
+          params: { action: "extension.uninstall" }
+        expectedDecision: block
+      - name: 良性配置写 logging.level 不命中（config 写轴由 self-protection-block-gateway-config-write 承载，见该规则负例）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "logging.level", value: "debug" }
+        expectedDecision: allow
       - name: gateway 状态查询动作不命中（负向）
         input:
           actionType: agent_tool_call
@@ -440,6 +459,80 @@ rules:
           params: { action: "restart" }
         expectedDecision: allow
 
+  - id: self-protection-block-gateway-config-write
+    name: 阻止通过 gateway 写操作改写插件准入/自身配置路径
+    enabled: true
+    priority: 1100
+    category: self_protection
+    severity: critical
+    notes: |
+      config 写轴收敛到危险 path（plugins / extensions / openclaw.json），其余配置写放行。paramsRegex 是跨 key AND，需 target 轴的场景必须拆规则。
+    match:
+      actionType:
+        - agent_tool_call
+      toolName:
+        - gateway
+        - Gateway
+        - config_manager
+        - plugin_manager
+        - extension_manager
+        - openclaw_gateway
+        - core.gateway
+        - plugin_uninstall
+        - extension_uninstall
+        - manage_plugin
+      paramsRegex:
+        action:
+          - ^config\.(patch|set|update|put|write|delete|remove|unset|replace|merge|edit)$
+        path:
+          - plugins?\.allow
+          - plugins?\.entries\.openclaw[-_]?security[-_]?monitor
+          - plugins?\.entries\.sst-security-control-openclaw
+          - extensions?\.entries\.(?:openclaw[-_]?security[-_]?monitor|sst-security-control-openclaw)
+          - \.openclaw[/\\]openclaw\.json$
+    action:
+      decision: block
+      blockReason: 通过 gateway 接口改写插件准入/自身配置路径被安全策略阻断
+      blockCode: SELF_PROTECTION_GATEWAY_CONFIG_WRITE_001
+      appealable: false
+    testCases:
+      - name: config.patch 改 plugins.allow 被阻断（无 value 也拦——准入路径本身不可放行）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.patch", path: "plugins.allow" }
+        expectedDecision: block
+      - name: config.set 关插件条目被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "plugins.entries.openclaw-security_monitor" }
+        expectedDecision: block
+      - name: config.unset 摘插件条目被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: config_manager
+          params: { action: "config.unset", path: "plugins.entries.openclaw-security_monitor" }
+        expectedDecision: block
+      - name: 良性配置写 logging.level 不命中（目标路径不在危险集合）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "logging.level", value: "debug" }
+        expectedDecision: allow
+      - name: 良性配置写 server.timeoutMs 不命中（目标路径不在危险集合）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.patch", path: "server.timeoutMs", value: "30000" }
+        expectedDecision: allow
+      - name: 良性配置 unset 无关项不命中（目标路径不在危险集合）
+        input:
+          actionType: agent_tool_call
+          toolName: config_manager
+          params: { action: "config.unset", path: "experimental.flag" }
+        expectedDecision: allow
+
   - id: self-protection-block-uninstall-message
     name: 阻止用户要求卸载或禁用安全监控插件
     enabled: true
@@ -447,8 +540,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      Gateway 配置接口禁用插件拦截（SELF_PROTECTION_GATEWAY_DISABLE_001）。走 openclaw gateway config.patch 路径触发。
-      其他 config.patch 写入不受影响（路径 + 参数双锚定）。
+      网关 config.patch 禁用插件。路径 + 参数双锚定，其他 config.patch 写入不受影响。
     match:
       actionType:
         - agent_message
@@ -492,8 +584,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      解码后执行拦截（SELF_PROTECTION_DECODE_001）。base64 / hex / url 解码后立即 exec。
-      无合法业务场景，零误伤面。
+      解码后立即执行。无合法业务场景，零误伤面。
     match:
       actionType:
         - agent_tool_call
@@ -550,11 +641,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      scratch 脚本执行拦截（SELF_PROTECTION_SCRATCH_001）— 收窄（双轨制）。
-      原规则匹配 `/tmp/var/tmp/root/home/~` 全宽，开发者在 /tmp 跑一次性脚本常态误伤。
-      现仅 block 确凿绕过信号路径：`/dev/shm/`（共享内存区，正常开发不会用）与 `/tmp/`
-      下隐藏文件名（`.evil.sh` 等，正常脚本不会以 `.` 开头）。其他路径下的脚本执行
-      改走 `self-protection-warn-scratch-script`（warn 副轨）留痕。
+      临时目录脚本执行，仅拦 /dev/shm/ 与 /tmp 下隐藏文件名（/tmp 跑一次性脚本是开发常态）；其余走 warn 副轨留痕。
     match:
       actionType:
         - agent_tool_call
@@ -569,9 +656,11 @@ rules:
       paramsRegex:
         command:
           # /dev/shm 下脚本（共享内存区，正常开发不会用）
-          - \b(bash|sh|zsh|pwsh)\s+/dev/shm/[^&|;\s\n]+\.(sh|bash|zsh|ps1)\b
+          - pattern: '\b(bash|sh|zsh|pwsh)\s+/dev/shm/[^&|;\s\n]+\.(sh|bash|zsh|ps1)\b'
+            flags: 'i'
           # /tmp 下隐藏文件名（.evil.sh 等，正常脚本不会以 . 开头）
-          - \b(bash|sh|zsh|pwsh)\s+/tmp/\.[^/]*\.(sh|bash|zsh|ps1)\b
+          - pattern: '\b(bash|sh|zsh|pwsh)\s+/tmp/\.[^/]*\.(sh|bash|zsh|ps1)\b'
+            flags: 'i'
     action:
       decision: block
       blockReason: 拒绝执行位于 /dev/shm 或 /tmp 隐藏文件名下的脚本文件：内容不可见且路径异常，是已知的绕过禁用拦截手段，已被安全策略阻断
@@ -610,8 +699,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      unshare 命名空间隔离拦截（SELF_PROTECTION_UNSHARE_001）。绕过 PID / 网络 / mount 命名空间隔离。
-      合法运维场景（容器调试）建议走宿主机直连 + 受控 namespace，不通过 agent 工具链。
+      unshare 绕过 PID / 网络 / mount 命名空间隔离。
     match:
       actionType:
         - agent_tool_call
@@ -625,13 +713,20 @@ rules:
         - sh
       paramsRegex:
         command:
-          - \bunshare\b\s+(-[a-zA-Z]*\s+)*-(p|(\s*--pid\b))
-          - \bunshare\b\s+(-[a-zA-Z]*\s+)*--pid\b
-          - \bunshare\s+--mount\b[\s\S]{0,80}?-(p|\s*--pid\b)
-          - \bunshare\s+(-[a-zA-Z]+|--[a-z-]+)\s+-[a-zA-Z]*p[a-zA-Z]*\b
-          - \bunshare\s+-[a-zA-Z]*p[a-zA-Z]*\b
-          - \bunshare\b[\s\S]{0,40}?["']?-p["']?\b
-          - \bunshare\b[\s\S]{0,40}?["']?--pid["']?\b
+          - pattern: '\bunshare\b\s+(-[a-zA-Z]*\s+)*-(p|(\s*--pid\b))'
+            flags: 'i'
+          - pattern: '\bunshare\b\s+(-[a-zA-Z]*\s+)*--pid\b'
+            flags: 'i'
+          - pattern: '\bunshare\s+--mount\b[\s\S]{0,80}?-(p|\s*--pid\b)'
+            flags: 'i'
+          - pattern: '\bunshare\s+(-[a-zA-Z]+|--[a-z-]+)\s+-[a-zA-Z]*p[a-zA-Z]*\b'
+            flags: 'i'
+          - pattern: '\bunshare\s+-[a-zA-Z]*p[a-zA-Z]*\b'
+            flags: 'i'
+          - pattern: '\bunshare\b[\s\S]{0,40}?["'']?-p["'']?\b'
+            flags: 'i'
+          - pattern: '\bunshare\b[\s\S]{0,40}?["'']?--pid["'']?\b'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到 unshare 创建新 PID namespace（沙箱逃逸），已被安全策略阻断
@@ -658,8 +753,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      LD_PRELOAD / LD_LIBRARY_PATH 共享库劫持拦截（SELF_PROTECTION_LDSO_001）。运行时注入恶意共享库。
-      agent 自动化场景无合法需求，零误伤面。
+      LD_PRELOAD / LD_LIBRARY_PATH 运行时注入共享库。agent 自动化无合法需求。
     match:
       actionType:
         - agent_tool_call
@@ -705,8 +799,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      BASH_ENV / ENV 子 shell 注入拦截（SELF_PROTECTION_BASHENV_001）。bash / zsh 启动时自动 source 子 shell 环境变量文件。
-      无合法业务场景，零误伤面。
+      BASH_ENV / ENV 子 shell 注入。无合法业务场景。
     match:
       actionType:
         - agent_tool_call
@@ -757,11 +850,7 @@ rules:
     category: sensitive_data_access
     severity: medium
     notes: |
-      意图：/etc/shadow /etc/passwd /etc/sudoers 等系统敏感文件读取拦截（合法运维场景建议 SSH 登录后手动 sudo，不经 agent 工具链）。
-      match 维度：actionType=agent_tool_call + toolName ∈ read/write 类 + paramsRegex.path 命中 /etc/{passwd,shadow,gshadow,hosts,sudoers}、/root/.ssh/{id_*,authorized_keys,config}、/root/.{aws,docker,bash_history,netrc,git-credentials}/、/proc/self/environ、Windows System32 等确凿系统/凭据路径。
-      误伤场景：开发者读取 /root/.npmrc / .pypirc（npm/PyPI registry 配置）属合法操作常态；本次收敛移除 .npmrc / .pypirc Tier-2 路径。
-      申诉路径：Tier-2 读取路径不在本规则面（自然 fall through 至 constrain-user-data-path modify/300 之外，本规则面无 fallback，依赖双轨优先级）；凭据/系统路径读取命中时通过 audit byDecision=block 命中回查。
-      治理依据：FP 收敛（已收窄 authorized_keys/known_hosts/config 等 Tier-2 读取走 warn 副轨，本次进一步移除 .npmrc / .pypirc Tier-2 残留）—— "宁可降低拦截，标记威胁告警"。
+      读系统与凭据文件（passwd / shadow / sudoers / 私钥）。.npmrc / .pypirc 等开发者配置已移出拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -834,8 +923,7 @@ rules:
     category: sensitive_data_access
     severity: critical
     notes: |
-      ~/.ssh/id_* 私钥读取拦截。
-      私钥不应被 agent 工具读取；合法场景（部署密钥轮转）应走密钥管理服务，不经 agent。
+      读 ~/.ssh/id_* 私钥。合法密钥轮转应走密钥管理服务，不经 agent 工具链。
     match:
       actionType:
         - agent_tool_call
@@ -887,10 +975,7 @@ rules:
     category: sensitive_data_access
     severity: medium
     notes: |
-      由原 block-read-credentials 拆分：原 block 仅保留云/编排凭据（aws/docker/kube）维持 block。
-      误报收敛降级触发（同治理姿态）：IDE 启动预热 .aws/credentials、kubectl context 切换
-      读取 ~/.kube/config、Docker Desktop 读取 ~/.docker/config.json 等是正当操作常态，不阻断。
-      其余敏感文件（.env/history/pem/npmrc 等）保持 data-leak-sensitive-file-001 的 warn 审计。
+      云 / 编排凭据（aws / docker / kube）读取。IDE 预热与 kubectl context 切换等正当操作不阻断。
     match:
       actionType:
         - agent_tool_call
@@ -938,7 +1023,7 @@ rules:
     category: sensitive_data_access
     severity: medium
     notes: |
-      .env/history/证书/包管理凭据文件属弱信号（正常开发常见），只 warn 记录；.env.example/.env.sample/.env.template 模板文件经白名单豁免。
+      .env / 证书 / 包管理凭据属弱信号，只 warn；.env.example 等模板文件豁免。
     match:
       actionType:
         - agent_tool_call
@@ -991,11 +1076,7 @@ rules:
     category: sensitive_data_access
     severity: high
     notes: |
-      敏感文件执行拦截（cat ~/.ssh/id_* | sh 等链式）。agent 主动运行敏感数据文件 = 凭据外发 + 执行复合风险。
-      零误伤面（合法开发链路不依赖管道执行私钥）。
-      2026-10-10 收敛（协同 block-process-sensitive-file）：/root/[^\s]+ 宽口径
-      （含 universal /root/\S+）收窄为仅命中确凿凭据/私钥/历史；开发者本地配置
-      （.npmrc/.pypirc/.gitconfig/.bashrc/.profile）由 data-leak-sensitive-file-001 兜底。
+      执行敏感数据文件（cat 私钥 | sh）。宽口径 /root/ 已收窄为确凿凭据，开发者本地配置由 data-leak-sensitive-file-001 兜底。
     match:
       actionType:
         - agent_tool_call
@@ -1008,9 +1089,9 @@ rules:
         - sh
       paramsRegex:
         command:
-          # 2026-10-21 哑弹修复：(?:\s+\S+)* 是 ReDoS 灾难性回溯形态，
-          # 被 RuleRegexCache 的"ambiguous repetition boundary"护栏拒收导致整条规则
-          # 静默丢弃；改为有界间隙 [\s\S]{0,80}?\s+（80 字符跨度 + 强制至少 1 空白）。
+          # (?:\s+\S+)* 是 ReDoS 灾难性回溯形态，会被 RuleRegexCache 的
+          # "ambiguous repetition boundary"护栏拒收、导致整条规则被静默丢弃；
+          # 须用有界间隙 [\s\S]{0,80}?\s+（80 字符跨度 + 强制至少 1 空白）。
           - cat[\s\S]{0,80}?\s+/etc/passwd
           - cat[\s\S]{0,80}?\s+/etc/shadow
           - cat[\s\S]{0,80}?\s+/etc/hosts
@@ -1103,8 +1184,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      反弹 shell 拦截（bash -i /dev/tcp/* 等）。
-      标准恶意模式，agent 自动化无合法场景，零误伤面。
+      反弹 shell（bash /dev/tcp 等）。标准恶意模式，零误伤面。
     match:
       actionType:
         - agent_tool_call
@@ -1119,21 +1199,34 @@ rules:
         - python3
       paramsRegex:
         command:
-          - bash\s+-i\s+.*(/dev/tcp|/dev/udp)
-          - /dev/tcp/\d+/\d+
-          - /dev/udp/\d+/\d+
-          - \bnc\b.*\s+-e\s+\S+
-          - \bncat\b.*\s+--?exec\s+\S+|\bncat\b.*\s+-e\s+\S+
+          - pattern: 'bash\s+-i\s+.*(/dev/tcp|/dev/udp)'
+            flags: 'i'
+          - pattern: '/dev/tcp/\d+/\d+'
+            flags: 'i'
+          - pattern: '/dev/udp/\d+/\d+'
+            flags: 'i'
+          - pattern: '\bnc\b.*\s+-e\s+\S+'
+            flags: 'i'
+          - pattern: '\bncat\b.*\s+--?exec\s+\S+|\bncat\b.*\s+-e\s+\S+'
+            flags: 'i'
           # mkfifo + nc 无 -e 变体（经典 fifo 反弹）
-          - mkfifo\s+\S+.*\|\s*(?:\S*/)?(nc|ncat)\b
-          - (nc|ncat)\s+\S+\s+\d+.*\|\s*(?:\S*/)?(sh|bash|zsh|dash|ash)\s+-i
-          - cat\s+[^|;&]*\|\s*(?:\S*/)?(sh|bash|zsh|dash|ash)\s+-i.*\|\s*(?:\S*/)?(nc|ncat)\b
-          - python[23]?\s+.*socket.*connect
-          - python[23]?\s+-c\s+.*subprocess
-          - ruby\s+-rsocket
-          - socat\s+.*TCP-LISTEN
+          - pattern: 'mkfifo\s+\S+.*\|\s*(?:\S*/)?(nc|ncat)\b'
+            flags: 'i'
+          - pattern: '(nc|ncat)\s+\S+\s+\d+.*\|\s*(?:\S*/)?(sh|bash|zsh|dash|ash)\s+-i'
+            flags: 'i'
+          - pattern: 'cat\s+[^|;&]*\|\s*(?:\S*/)?(sh|bash|zsh|dash|ash)\s+-i.*\|\s*(?:\S*/)?(nc|ncat)\b'
+            flags: 'i'
+          - pattern: 'python[23]?\s+.*socket.*connect'
+            flags: 'i'
+          - pattern: 'python[23]?\s+-c\s+.*subprocess'
+            flags: 'i'
+          - pattern: 'ruby\s+-rsocket'
+            flags: 'i'
+          - pattern: 'socat\s+.*TCP-LISTEN'
+            flags: 'i'
           # socat 反向连接（EXEC:cmd 在客户端、TCP 连远端）；TCP-LISTEN 只覆盖监听侧。
-          - 'socat\s+.*TCP:[^,]*\s+EXEC:'
+          - pattern: 'socat\s+.*TCP:[^,]*\s+EXEC:'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到 exec 反弹 shell 命令，已被安全策略阻断
@@ -1201,11 +1294,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      意图：下载即执行拦截（curl | bash / sh / wget | sh）。远程脚本无审计面直执行。
-      match 维度：actionType=agent_tool_call + toolName ∈ exec 类 + paramsRegex.command 命中 `(curl|wget|fetch) | bash/sh/zsh/python/perl/ruby`、`-o/-O/-Os 落盘 + &&/;/|| 串联 bash/sh/zsh 执行`、`bash <(curl ...)` 进程替换、`. /source /tmp/x.sh` 点源下载脚本。
-      误伤场景：开发者 `pip install --user/--target/--break-system-packages` 装包、`npm install --save-dev` 加开发依赖、`wget -q dev-tools-*.tar.gz` 静默下载已知开发工具是合法常态；本次加固 paramsNotRegex 豁免这三类开发态动作（参照 setcap  先例的"保留主检测面 + 加白名单"模式）。
-      申诉路径：合法开发态动作命中 audit byDecision=block 时通过白名单通道放行；`curl|bash`/`wget|bash` 主体与下载-立即执行链仍按 block 处置，确属合法运维可走"白名单通道"或临时降 severity 至 low 观察。
-      治理依据：FP 收敛（paramsNotRegex 加固 pip install / npm install --save-dev / wget dev-tools 白名单）—— "宁可降低拦截，标记威胁告警"；严格不豁免 `curl|bash`/`wget|bash` 主体——管道即执行仍是确凿威胁。
+      下载即执行（curl | bash、落盘后串联执行、进程替换、点源）。开发态（pip --user / npm --save-dev / wget dev-tools）白名单豁免，管道即执行的主体不豁免。
     match:
       actionType:
         - agent_tool_call
@@ -1218,31 +1307,38 @@ rules:
         - sh
       paramsRegex:
         command:
-          - (curl|wget|fetch)\s+.*\|\s*(bash|sh|zsh|python|perl|ruby)
+          - pattern: '(curl|wget|fetch)\s+.*\|\s*(bash|sh|zsh|python|perl|ruby)'
+            flags: 'i'
           # 下载落盘后立即执行：
           # -o / -O / 合并 flag（-so/-os）；&&/;/|| 串联解释器执行。
           # -O/-o 长 flag 的解释器清单仅保留 bash/sh/zsh——下载数据文件后
           # 用 python/analyze.py 处理的 CI 形态属合法，不在本规则拦截面。
           # （长 flag --output 的下载-执行链可由后续 AST 阶段处理；当前
           # 静态正则 arm 因嵌套量词审计无法直接覆盖而不强求。）
-          # 2026-10-21 哑弹修复：见上方 block-exec-sensitive-file 同源说明；
-          # 下界 + 有界间隙避免 ReDoS 护栏拒收。
-          - (curl|wget|fetch)[\s\S]{0,80}?\s+-[oO]\s+\S+\s+\S+\s*(?:&&|;|\|\|)\s*(?:bash|sh|zsh)\s+\S
-          - (curl|wget|fetch)[\s\S]{0,80}?\s+-[oO]s\s+\S+\s+\S+\s*(?:&&|;|\|\|)\s*(?:bash|sh|zsh)\s+\S
+          # 见上方 block-exec-sensitive-file 的同源说明；
+          - pattern: '(curl|wget|fetch)[\s\S]{0,80}?\s+-[oO]\s+\S+\s+\S+\s*(?:&&|;|\|\|)\s*(?:bash|sh|zsh)\s+\S'
+            flags: 'i'
+          - pattern: '(curl|wget|fetch)[\s\S]{0,80}?\s+-[oO]s\s+\S+\s+\S+\s*(?:&&|;|\|\|)\s*(?:bash|sh|zsh)\s+\S'
+            flags: 'i'
           # 进程替换：bash <(curl ...)、bash < <(wget ...) 等；解释器清单限定 shell 族。
-          - (?:bash|sh|zsh)\s+<\s*<\s*\(\s*(?:curl|wget|fetch)\b
+          - pattern: '(?:bash|sh|zsh)\s+<\s*<\s*\(\s*(?:curl|wget|fetch)\b'
+            flags: 'i'
           # 点源/dot-source：下载脚本 + 立即 . / source 执行，curl/wget/fetch
           # 出现在点源之前即可（顺序约束：先下载、再执行）。
-          - (?:curl|wget|fetch)\b.*(?:\.|source)\s+/tmp/\S+\.(?:sh|bash)\b
+          - pattern: '(?:curl|wget|fetch)\b.*(?:\.|source)\s+/tmp/\S+\.(?:sh|bash)\b'
+            flags: 'i'
       paramsNotRegex:
         command:
           # pip install 开发态动作（FP 收敛）
           # 严格不豁免 `curl|bash`/`wget|bash` 主体
-          - \bpip(?:3)?\s+install\s+(?:-[A-Za-z_]+\s+)*(?:--user|--break-system-packages|--target\s+\S+)
+          - pattern: '\bpip(?:3)?\s+install\s+(?:-[A-Za-z_]+\s+)*(?:--user|--break-system-packages|--target\s+\S+)'
+            flags: 'i'
           # npm install --save-dev / --save / --save-exact 是包安装常态
-          - \bnpm\s+(?:install|i|add)\s+(?:-[A-Za-z_]+\s+)*--save(?:-dev|-exact)?\b
+          - pattern: '\bnpm\s+(?:install|i|add)\s+(?:-[A-Za-z_]+\s+)*--save(?:-dev|-exact)?\b'
+            flags: 'i'
           # wget 静默下载已知开发工具包（CI 抓包，无后续执行）
-          - \bwget\s+(?:-[A-Za-z_]+\s+)*\bdev[-_]tools[-_][\w.-]+\.tar\.gz\b
+          - pattern: '\bwget\s+(?:-[A-Za-z_]+\s+)*\bdev[-_]tools[-_][\w.-]+\.tar\.gz\b'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到 exec 下载并执行命令，已被安全策略阻断
@@ -1322,8 +1418,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      根目录删除拦截（rm -rf / / rm -rf /*）。
-      严禁模式；rm 在用户 / 项目目录仍可正常执行（路径锚定 / / /etc / /boot 等）。
+      根目录删除。路径锚定 / /etc / /boot，用户与项目目录内 rm 仍可正常执行。
     match:
       actionType:
         - agent_tool_call
@@ -1336,19 +1431,28 @@ rules:
         - sh
       paramsRegex:
         command:
-          - rm\s+-[a-zA-Z]*\s+/($|\s)
-          - rm\s+-[a-zA-Z]*\s+/\*
-          - rm\s+-rf\s+/(\s|$)
-          - rm\s+-rf\s+/\*
-          - rm\s+-rf\s+--no-preserve-root
-          - rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/root/
+          - pattern: 'rm\s+-[a-zA-Z]*\s+/($|\s)'
+            flags: 'i'
+          - pattern: 'rm\s+-[a-zA-Z]*\s+/\*'
+            flags: 'i'
+          - pattern: 'rm\s+-rf\s+/(\s|$)'
+            flags: 'i'
+          - pattern: 'rm\s+-rf\s+/\*'
+            flags: 'i'
+          - pattern: 'rm\s+-rf\s+--no-preserve-root'
+            flags: 'i'
+          - pattern: 'rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/root/'
+            flags: 'i'
           # /home 臂收窄为"递归 flag + home 目录根本身"的 wipe
           # 形态（/home/<user>/ 作为删除目标），不再拦截 /home 下任意路径的
           # 带 flag 删除；测试工件路径臂（/tmp/openclaw_security_test_dir）
           # 为开发期残留，整臂删除。
-          - rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/home/[^/\s]+/?\s*$
-          - dd\s+if=\S+\s+of=/dev/[sh]da
-          - mkfs\.\w+\s+/dev/[sh]da
+          - pattern: 'rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/home/[^/\s]+/?\s*$'
+            flags: 'i'
+          - pattern: 'dd\s+if=\S+\s+of=/dev/[sh]da'
+            flags: 'i'
+          - pattern: 'mkfs\.\w+\s+/dev/[sh]da'
+            flags: 'i'
           # mass_deletion 缺口 arm 补充（不动旧 arm）。
           # 旧 arm 形态（`-[a-zA-Z]*` flag 段）覆盖有限，以下新 arm 收窄
           # 高置信度形态：递归 flag + 根目录、`--` 终止符、`sudo` 前缀。
@@ -1356,21 +1460,29 @@ rules:
           # 引入误伤），保留旧 arm 是为了不让已有配置塌方。
           # 外层量词用 `?` / `{0,3}` 而非 `*` / `+` —— 静态 ReDoS 审计口径
           # 拒绝 `(X*)+` 类嵌套量词。
-          - \brm\s+(?:-\S+\s+)?--\s+/(\s|$|;)
-          - \brm\s+(?:-\S+\s+){0,3}\s+/(\s|$|;)
-          - \bsudo\s+rm\s+(?:-\S+\s+){0,3}\s*/(\s|$|;)
-          - \bfind\s+\S+\s+-delete\b
-          - \bfind\s+\S+\s+-exec\s+rm\s+--?\s+\S+\s+\{\}\s*\\?;
+          - pattern: '\brm\s+(?:-\S+\s+)?--\s+/(\s|$|;)'
+            flags: 'i'
+          - pattern: '\brm\s+(?:-\S+\s+){0,3}\s+/(\s|$|;)'
+            flags: 'i'
+          - pattern: '\bsudo\s+rm\s+(?:-\S+\s+){0,3}\s*/(\s|$|;)'
+            flags: 'i'
+          - pattern: '\bfind\s+\S+\s+-delete\b'
+            flags: 'i'
+          - pattern: '\bfind\s+\S+\s+-exec\s+rm\s+--?\s+\S+\s+\{\}\s*\\?;'
+            flags: 'i'
           # --one-file-system 变体（短 flag -x / 长 flag 双形态；目标仍锚定根）
-          - \brm\s+(?:-\S*x[a-zA-Z]*\s+|[^|&;\n]{0,40}?--one-file-system\s+)/(\*|\s|$|;)
+          - pattern: '\brm\s+(?:-\S*x[a-zA-Z]*\s+|[^|&;\n]{0,40}?--one-file-system\s+)/(\*|\s|$|;)'
+            flags: 'i'
           # 花括号展开批量 wipe（/{bin,lib,usr} 组合删除形态）
-          - \brm\s+-\S*r[a-zA-Z]*\s+/\{[^}\n]{1,120}\}
+          - pattern: '\brm\s+-\S*r[a-zA-Z]*\s+/\{[^}\n]{1,120}\}'
+            flags: 'i'
           # python 反引用 os.system('rm -rf /') 的间接调用形态
           # （oracle essentialPositive rm-rf-via-python-c）。
           # `[\s\S]{0,200}?` 惰性匹配跨引号字符，因为 oracle 输入外层 "
           # 内层 ' 是混引号，`[^"']*` 会在第一个引号停下摸不到内层 rm。
           # char-class 不引入嵌套量词，ReDoS 安全。
-          - python[23]?\s+-c\s+["'][\s\S]{0,200}?\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/["']
+          - pattern: 'python[23]?\s+-c\s+["''][\s\S]{0,200}?\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/["'']'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到危险删除或磁盘破坏命令，已被安全策略阻断
@@ -1450,8 +1562,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      提权操作拦截（sudo / setuid / chmod u+s / setcap）。
-      agent 自动化场景无合法提权需求；合法运维走 SSH 登录后 sudo，不经 agent。
+      sudo / su / pkexec / setuid 提权。合法运维走 SSH 登录后 sudo。
     match:
       actionType:
         - agent_tool_call
@@ -1496,8 +1607,7 @@ rules:
     category: supply_chain
     severity: medium
     notes: |
-      远程包安装拦截（curl | npm/pip install）。下载即安装无审计面。
-      合法安装应先下载包到本地审查后再装。
+      远程包安装（curl | npm install）。合法安装应先下载审查再装。
     match:
       actionType:
         - agent_tool_call
@@ -1510,13 +1620,20 @@ rules:
         - sh
       paramsRegex:
         command:
-          - pip\s+install\s+.*https?://
-          - pip3\s+install\s+.*https?://
-          - npm\s+install\s+.*https?://
-          - npm\s+install\s+.*git\+
-          - yarn\s+add\s+.*https?://
-          - gem\s+install\s+.*https?://
-          - go\s+install\s+.*https?://
+          - pattern: 'pip\s+install\s+.*https?://'
+            flags: 'i'
+          - pattern: 'pip3\s+install\s+.*https?://'
+            flags: 'i'
+          - pattern: 'npm\s+install\s+.*https?://'
+            flags: 'i'
+          - pattern: 'npm\s+install\s+.*git\+'
+            flags: 'i'
+          - pattern: 'yarn\s+add\s+.*https?://'
+            flags: 'i'
+          - pattern: 'gem\s+install\s+.*https?://'
+            flags: 'i'
+          - pattern: 'go\s+install\s+.*https?://'
+            flags: 'i'
     action:
       decision: warn
       appealable: true
@@ -1540,9 +1657,7 @@ rules:
     category: sensitive_data_access
     severity: critical
     notes: |
-      命令行读凭据文件拦截（cat/head ~/.ssh/id_* 等）。
-      与 block-ssh-private-keys 同语义，命令形态；零误伤面。
-      误报收敛收窄：原 `(cat|head|tail|grep|awk|sed)` 包含 grep/awk/sed 字面检索，导致 `grep .aws/credentials somefile.log`（合规日志审计）误伤；本次收紧为 `(cat|head|tail)` 直接读取形态。
+      命令行读凭据文件。已收窄为 cat / head / tail 直接读取——grep / awk / sed 字面检索会误伤合规日志审计。
     match:
       actionType:
         - agent_tool_call
@@ -1551,13 +1666,18 @@ rules:
       paramsRegex:
         command:
           # cat/cat读取 AWS / Docker / K8s 凭据文件（误报收敛加 $ 锚定避免 grep/awk 检索形态误伤）
-          - 'cat\s+.*\.aws/credentials$'
-          - 'cat\s+.*\.aws/config$'
-          - 'cat\s+.*k8s/.*config$'
-          - 'cat\s+.*kube/config$'
+          - pattern: 'cat\s+.*\.aws/credentials$'
+            flags: 'i'
+          - pattern: 'cat\s+.*\.aws/config$'
+            flags: 'i'
+          - pattern: 'cat\s+.*k8s/.*config$'
+            flags: 'i'
+          - pattern: 'cat\s+.*kube/config$'
+            flags: 'i'
           # 其他常用凭据路径
           # 覆盖其他 exec 类读取敏感文件的方式（补齐 id_ecdsa/id_dsa；误报收敛收紧为 cat/head/tail 直接读取）
-          - '(cat|head|tail)\s+.*(id_rsa|id_ed25519|id_ecdsa|id_dsa|\.ssh/|cloud credentials|kubeconfig)'
+          - pattern: '(cat|head|tail)\s+.*(id_rsa|id_ed25519|id_ecdsa|id_dsa|\.ssh/|cloud credentials|kubeconfig)'
+            flags: 'i'
     action:
       decision: block
       blockReason: 通过 exec 类工具读取凭据文件已被安全策略阻断
@@ -1694,13 +1814,17 @@ rules:
       paramsRegex:
         command:
           # authorized_keys 读取（Tier-2 SSH 信任列表）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|cp|mv)\s+[^\s|;&]*\.ssh/authorized_keys
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|cp|mv)\s+[^\s|;&]*\.ssh/authorized_keys'
+            flags: 'i'
           # known_hosts 读取（Tier-2 SSH 信任记录）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.ssh/known_hosts
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.ssh/known_hosts'
+            flags: 'i'
           # 普通 .env 读取（Tier-2 普通业务配置）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|source|\.)\s+[^\s|;&]*\.env([^/]*)$
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|source|\.)\s+[^\s|;&]*\.env([^/]*)$'
+            flags: 'i'
           # bash_history 读取（Tier-2 历史记录）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.bash_history
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.bash_history'
+            flags: 'i'
     action:
       decision: warn
     testCases:
@@ -1790,13 +1914,17 @@ rules:
       paramsRegex:
         command:
           # authorized_keys 读取（Tier-2 SSH 信任列表）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|cp|mv)\s+[^\s|;&]*\.ssh/authorized_keys
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|cp|mv)\s+[^\s|;&]*\.ssh/authorized_keys'
+            flags: 'i'
           # known_hosts 读取（Tier-2 SSH 信任记录）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.ssh/known_hosts
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.ssh/known_hosts'
+            flags: 'i'
           # 普通 .env 读取（Tier-2 普通业务配置）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|source|\.)\s+[^\s|;&]*\.env([^/]*)$
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od|source|\.)\s+[^\s|;&]*\.env([^/]*)$'
+            flags: 'i'
           # bash_history 读取（Tier-2 历史记录）
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.bash_history
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)\s+[^\s|;&]*\.bash_history'
+            flags: 'i'
     action:
       decision: warn
     testCases:
@@ -1828,22 +1956,7 @@ rules:
     category: sensitive_data_access
     severity: medium
     notes: |
-      意图：process_start 通道敏感文件读取的告警留痕（治理补丁）。
-      match 维度：actionType=process_start + riskFlagsAny=sensitive_file_access + paramsRegex.command 命中 /etc/passwd/shadow/gshadow、/root/...、.ssh/id_* 等确凿敏感文件。
-      误伤场景：开发者本地 IDE 后台诊断 / 系统监控进程（syslog/metric-agent）常命中（Tier-2 频谱）。
-      申诉路径：通过 audit 面板 bySeverity × byDecision 命中回查，1-2 周后未发现真攻击可继续降低 severity 档。
-      治理依据：FP 收敛（从 block 降 warn@medium/850）—— "宁可降低拦截，标记威胁告警，也不要因为误拦截影响业务"；误拦即时降级豁免观察期。
-      2026-10-09 收敛：移除 /etc/hosts 读取形态。hosts 全局可读、威胁等级低于
-      passwd/shadow，而进程通道的读取多来自 syslog/metric-agent 等后台进程
-      （误报主力，无 agent 行为可归因）；agent 主动读取仍由
-      block-exec-sensitive-file（block@900）与 block-sensitive-system-files
-      （warn@880）覆盖，写入/删除仍由 block-write-sensitive-system-files /
-      block-delete-sensitive-files（block）覆盖，无检测盲区。压测依据：
-      scripts/stress-spl-interactive.mjs（cat /etc/hosts fp 样本）。
-      2026-10-10 收敛：/root/[^\s]+ 宽口径收窄为仅命中确凿凭据/私钥/历史
-      （.ssh/id_*/.bash_history/.zsh_history/.aws/credentials/.git-credentials/.netrc）；
-      开发者本地配置（.npmrc/.pypirc/.gitconfig/.bashrc/.profile）由
-      data-leak-sensitive-file-001（agent_tool_call 通道 warn）兜底。
+      进程通道读敏感文件，只 warn 留痕。IDE 后台诊断与监控进程是误报主力；agent 主动读由 block-exec-sensitive-file（block）覆盖。
     match:
       actionType:
         - process_start
@@ -1851,27 +1964,40 @@ rules:
         - sensitive_file_access
       paramsRegex:
         command:
-          # 2026-10-21 哑弹修复：见上方 block-exec-sensitive-file 同源说明
-          - cat[\s\S]{0,80}?\s+/etc/passwd
-          - cat[\s\S]{0,80}?\s+/etc/shadow
-          - cat[\s\S]{0,80}?\s+/etc/gshadow
+          # 见上方 block-exec-sensitive-file 的同源说明
+          - pattern: 'cat[\s\S]{0,80}?\s+/etc/passwd'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?\s+/etc/shadow'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?\s+/etc/gshadow'
+            flags: 'i'
           # /root/ 收窄至确凿凭据；开发者本地配置由 data-leak-sensitive-file-001 兜底
-          - cat[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b
-          - cat[\s\S]{0,80}?.*\.ssh/id_rsa
-          - cat[\s\S]{0,80}?.*\.ssh/id_ed25519
-          - cat[\s\S]{0,80}?.*\.ssh/id_ecdsa
-          - cat[\s\S]{0,80}?.*\.ssh/id_dsa
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/passwd
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/shadow
+          - pattern: 'cat[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?.*\.ssh/id_rsa'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?.*\.ssh/id_ed25519'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?.*\.ssh/id_ecdsa'
+            flags: 'i'
+          - pattern: 'cat[\s\S]{0,80}?.*\.ssh/id_dsa'
+            flags: 'i'
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/passwd'
+            flags: 'i'
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/shadow'
+            flags: 'i'
           # /root/ 收窄至确凿凭据；开发者本地配置由 data-leak-sensitive-file-001 兜底
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b
-          - getent\s+passwd
-          - getent\s+(passwd|shadow|group)
+          - pattern: '(cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b'
+            flags: 'i'
+          - pattern: 'getent\s+passwd'
+            flags: 'i'
+          - pattern: 'getent\s+(passwd|shadow|group)'
+            flags: 'i'
     action:
       decision: warn
       warnReason: 子进程读取敏感系统文件已记录审计（FP 收敛）
-      # 2026-10-21 哑弹修复：decision=warn 不应配 blockCode（spec §5.2 —
-      # blockCode 仅对 decision=block 有意义）；由 warnCode 替代（如未来需要）。
+      # decision=warn 不应配 blockCode——blockCode 仅对 decision=block 有意义；
+      # 需要时由 warnCode 替代。
       appealable: true
     testCases:
       - name: 子进程读取 /etc/shadow 被留痕（降 warn）
@@ -1886,7 +2012,7 @@ rules:
           riskFlags: [sensitive_file_access]
           params: { command: "cat /var/log/app.log" }
         expectedDecision: allow
-      - name: 子进程读取 /etc/hosts 不命中（2026-10-09 收敛：hosts 读取移出进程通道，agent 主动读取仍由 exec/tool 通道覆盖）
+      - name: 子进程读取 /etc/hosts 不命中（hosts 读取已移出进程通道，agent 主动读取仍由 exec/tool 通道覆盖）
         input:
           actionType: process_start
           riskFlags: [sensitive_file_access]
@@ -1905,11 +2031,7 @@ rules:
     category: intrusion_defense
     severity: critical
     notes: |
-      意图：关键文件删除拦截（rm /etc/* / rm .openclaw/* / rm 关键业务文件）。
-      match 维度：actionType=agent_tool_call + toolName ∈ delete 类 + paramsRegex.path 命中 /etc/{passwd,shadow,hosts,sudoers,sudoers.d/}、/root/.{ssh,aws,docker,netrc,npmrc,pypirc,git-credentials,bash_history}/、/home/<u>/.{ssh,aws,docker,netrc,npmrc,pypirc,git-credentials,bash_history}/、^.*\.ssh/、Windows System32 等确凿系统/凭据路径。
-      误伤场景：dev 缓存清理（.cache/.npm/.next 等）曾由 warn 副轨覆盖（warn 副轨已删除，现自然 fall through）；批量清理脚本若涉及 .openclaw 目录需走白名单通道。
-      申诉路径：dev 缓存清理命中 audit byDecision=block 时通过白名单通道放行；确凿凭据/系统路径删除按 block 处置。
-      治理依据：FP 收敛（验证收窄至 SSH 私钥/AWS 凭据本体生效；新增 1 负向 allow 巩固）+ 误报收敛深度收窄（移除 npmrc/pypirc 子模式——package manager 自管删除不在 agent 工具链常见场景）—— "宁可降低拦截，标记威胁告警"。
+      删除关键系统与凭据文件。路径锚定，dev 缓存清理（.cache/.npm/.next）不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -1980,7 +2102,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      process_start 事后留痕为设计意图（治理补丁）；HOST_DELIVERABLE_DECISIONS 不支持 process_start 上挂 block，本规则依靠 store.ts warnDecisionNotDeliverable 留痕。
+      process_start 上只留痕：该入口不支持 block，由 store warnDecisionNotDeliverable 记录。
     match:
       actionType:
         - agent_tool_call
@@ -2143,11 +2265,7 @@ rules:
     category: self_protection
     severity: medium
     notes: |
-      意图：系统启动项/后门路径写入的告警留痕（写入 /etc/cron.d / /etc/ld.so.preload / /etc/rc.local 等典型持久化后门落地点）。
-      match 维度：actionType=agent_tool_call + toolName ∈ write 类 + paramsRegex.path 命中 /etc/cron / /etc/profile / /etc/bash.bashrc / /etc/rc.local / /etc/init.d/ / /etc/systemd/system/ / /var/spool/cron/ / ~/.ssh/authorized_keys / ~/.ssh/config / Windows System32\Tasks / Windows Startup 等确凿后门/启动项路径。
-      误伤场景：开发者主动编辑 authorized_keys（添加新设备密钥）/ config（SSH 别名）频率高；Docker / VSCode 等桌面应用可能触碰 ~/.ssh/config；system admin 通过 agent 工具合法追加 systemd unit 罕见但存在。
-      申诉路径：通过 audit 面板 byDecision=warn 命中回查，确属合法运维可走"白名单通道"或临时降 severity 至 low 观察；面板 bySeverity × byDecision 数据回看 2-4 周后未发现真攻击可继续降低 severity 档。
-      治理依据：FP 收敛（从 block 降 warn@medium/900）—— "宁可降低拦截，标记威胁告警，也不要因为误拦截影响业务"；误拦即时降级豁免观察期。
+      写系统启动项与后门路径（cron / systemd / authorized_keys 等）。已从 block 降为 warn。
     match:
       actionType:
         - agent_tool_call
@@ -2211,11 +2329,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      意图：写入敏感系统文件的拦截（/etc/passwd / /etc/shadow 等）。只能由 root + 受控工具编辑，不经 agent。
-      match 维度：actionType=agent_tool_call + toolName ∈ write 类 + paramsRegex.path 命中 /etc/{passwd,shadow,gshadow,sudoers,hosts}、/root/.ssh/{id_*,authorized_keys,config}、/root/.{aws,docker,bash_history,netrc,git-credentials}/、Windows System32 等确凿系统/凭据路径。
-      误伤场景：开发者写入 /root/.npmrc（npm 私有 registry 配置）/`pypirc`（PyPI token）属合法操作常态（package manager 自管写入不经 agent 工具链，用户主动编辑一般在 IDE）；本次收敛移除 .npmrc / .pypirc Tier-2 路径。
-      申诉路径：Tier-2 写入路径不在本规则面；凭据/系统路径写入命中时通过 audit byDecision=block 命中回查，确属合法运维可走"白名单通道"或临时降 severity 至 low 观察。
-      治理依据：FP 收敛（收窄 pathRegex 移除 ^/root/\.npmrc 与 ^/root/\.pypirc）+ 误报收敛深度收窄（加 paramsNotRegex 豁免 ~/.ssh/config SSH 客户端配置写入——开发者正当 IDE 编辑场景：切换 GitHub 代理、加 ProxyCommand 等）+ Windows SSH 客户端配置（同语义）。
+      写系统敏感文件。.npmrc / .pypirc 写入与 ~/.ssh/config 编辑属正当开发操作，已豁免。
     match:
       actionType:
         - agent_tool_call
@@ -2301,11 +2415,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      意图：命令行写入系统敏感文件的拦截（与 block-write-sensitive-system-files 同语义，命令形态）。
-      match 维度：actionType=agent_tool_call|process_start + toolName ∈ exec 类 + paramsRegex.command 命中 `>> /etc/...`、`tee /etc/...`、`sed -i /etc/...`、`dd of=/etc/...`、`>> /root/.ssh/`、`>> /root/.aws/`、`>> /root/.docker/`、`>> /root/.netrc`、`>> /root/.git-credentials`、`>> /root/.bash_history`、`>> /var/spool/cron/` 等确凿凭据/系统路径重定向。
-      误伤场景：开发者通过 `>> ~/.bashrc` 追加环境变量、`>> ~/.zshrc` 配 alias 是合法常态；本次收敛移除 .bashrc / .bash_profile / .bash_login / .zshrc / .profile 五个 Tier-2 shell 配置写入路径。
-      申诉路径：写入 Tier-2 shell 配置不在本规则面；凭据/系统路径写入命中时通过 audit byDecision=block 命中回查，确属合法运维可走"白名单通道"或临时降 severity 至 low 观察。
-      治理依据：FP 收敛（收窄 command regex 移除 .bashrc|.bash_profile|.bash_login|.zshrc|.profile Tier-2）+ 误报收敛加 paramsNotRegex 豁免 `> ~/.bash_history`（开发者清空历史正当操作）+ `>> /etc/hosts <私网 IP>`（SRE 内网 docker 容器 IP / 内网服务映射正当操作）。
+      命令行写系统敏感文件（重定向 / tee / sed -i / dd of=）。shell 配置写入与 bash_history 清空已豁免。
     match:
       actionType:
         - agent_tool_call
@@ -2385,10 +2495,7 @@ rules:
     category: ssrf
     severity: medium
     notes: |
-      内网地址（RFC1918/localhost/::1）访问在 Agent 场景大量属正常业务（本地服务调试、
-      内网 API 调用），降为 warn 仅记录。
-      云元数据（169.254.169.254 / metadata.google.internal）属强信号，
-      由 data-leak-imds-001/002 单独 block。
+      内网地址访问在 agent 场景大量属正常业务，降为 warn。云元数据由 data-leak-imds-* 单独 block。
     match:
       actionType:
         - network_http
@@ -2452,9 +2559,11 @@ rules:
       paramsRegex:
         command:
           # shell 工具访问内网地址
-          - (curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*(\b127\.0\.0\.1\b|\blocalhost\b|\b0\.0\.0\.0\b|\b10\.\d+\.\d+\.\d+\b|\b172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+\b|\b192\.168\.\d+\.\d+\b|\b2130706433\b|\b0177\.0\.0\.1\b|\b0x7f000001\b)
+          - pattern: '(curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*(\b127\.0\.0\.1\b|\blocalhost\b|\b0\.0\.0\.0\b|\b10\.\d+\.\d+\.\d+\b|\b172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+\b|\b192\.168\.\d+\.\d+\b|\b2130706433\b|\b0177\.0\.0\.1\b|\b0x7f000001\b)'
+            flags: 'i'
           # python/ruby 一行 socket 连接
-          - (python|python3|ruby|perl|node)\s+.*(socket|urlopen|requests?\.|httparty|net/http)\s*\(.*(127\.0\.0\.1|localhost|10\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|2130706433|0177\.0\.0\.1|0x7f000001)
+          - pattern: '(python|python3|ruby|perl|node)\s+.*(socket|urlopen|requests?\.|httparty|net/http)\s*\(.*(127\.0\.0\.1|localhost|10\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|2130706433|0177\.0\.0\.1|0x7f000001)'
+            flags: 'i'
     action:
       decision: warn
       blockCode: SSRF_SSRF_CMD_001
@@ -2497,13 +2606,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      访问云元数据服务属窃取临时凭据的强信号（L1.5，ATT&CK T1552.005），
-      允许 block 并支持申诉。覆盖多云地址清单：
-      AWS 169.254.169.254 / 169.254.169.253 / fd00:ec2::254（IPv6 link-local）、
-      GCP metadata.google.internal、Azure 169.254.169.254（与 AWS 共用）、
-      阿里云 100.100.100.200 / 100.100.2.136 / 100.100.2.138、
-      腾讯云 metadata.tencentyun.com / 169.254.0.23。
-      内网 SSRF 由 block-internal-ssrf 单独 warn，互不重叠。
+      访问云元数据服务（多云地址清单），属窃取临时凭据的强信号，block 可申诉。
     match:
       actionType:
         - network_http
@@ -2530,9 +2633,10 @@ rules:
             flags: i
           - pattern: (?:metadata\.tencentyun\.com)
             flags: i
-      # 2026-10-21 契约错配修复：原 paramsNotRegex.command 在 send_http 输入
-      # 无 command 字段时整条规则被 RuleMatcher 丢弃（attack 被漏），导致 9 条
-      # IMDS 攻击 FN。豁免面移到 url 维度（云平台初始化路径不访问元数据根）：
+      # paramsNotRegex 声明的字段若在 ctx 中不存在，RuleMatcher 判定整条规则
+      # 不匹配并丢弃——豁免面必须声明在攻击形态真正出现的维度上。send_http
+      # 输入不带 command 字段，故豁免面落在 url 维度（云平台初始化路径不访问
+      # 元数据根）。
     action:
       decision: warn
       appealable: true
@@ -2607,12 +2711,7 @@ rules:
     category: data_leak_monitoring
     severity: critical
     notes: |
-      云 metadata service 凭据外发拦截。command 维度覆盖 AWS
-      （169.254.169.25[34] / fd00:ec2::254 / 十进制变形 2852035838）、
-      阿里云（100.100.100.200 / 100.100.2.136|138）、
-      腾讯云（metadata.tencentyun.com / 169.254.0.23）直访强信号；
-      GCP 维持 warn 口径（url/域名面由 data-leak-imds-001 覆盖）。
-      合法 SSRF 探测场景应走白名单主机，不经 agent 工具链。
+      云 metadata 凭据外发（command 维度，含十进制 IP 变形）。GCP 维持 warn 口径。
     match:
       actionType:
         - agent_tool_call
@@ -2732,10 +2831,7 @@ rules:
     category: intrusion_defense
     severity: medium
     notes: |
-      tool_result 是指示注入内容进入对话的主通道（工具输出不可信，攻击者可在
-      网页/文件/命令输出里埋入"忽略先前指令"类话术）。agent_tool_result 评估
-      入口由 store.afterToolCall 在事件落盘前回灌，命中后
-      audit 留痕放行——处置（丢弃/改写结果）属宿主能力，不在策略引擎范围。
+      工具输出是注入内容进入对话的主通道。策略侧只留痕，丢弃/改写属宿主能力。
     match:
       actionType:
         - agent_tool_result
@@ -2780,10 +2876,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      env/printenv/set/export -p 输出携带全部进程环境变量（凭据/令牌常见载体），
-      管道接入网络工具属弱信号（运维排查也可能这么干），仅 warn；
-      明确外发形态（数据体转发/指定外部主机）由 block-env-batch-exfil-combined
-      拦截。
+      env 输出管道接网络工具属弱信号（运维排查也这么干），仅 warn。
     match:
       actionType:
         - agent_tool_call
@@ -2797,9 +2890,12 @@ rules:
         - sh
       paramsRegex:
         command:
-          - \b(env|printenv)\b[^|;&]*\|\s*(nc|ncat|curl|wget|fetch|httpx|httpie)\b
-          - \bset\b\s*\|\s*(nc|ncat|curl|wget|httpx|httpie)\b
-          - \bexport\s+-?p\b[^|;&]*\|\s*(nc|ncat|curl|wget|httpx|httpie)\b
+          - pattern: '\b(env|printenv)\b[^|;&]*\|\s*(nc|ncat|curl|wget|fetch|httpx|httpie)\b'
+            flags: 'i'
+          - pattern: '\bset\b\s*\|\s*(nc|ncat|curl|wget|httpx|httpie)\b'
+            flags: 'i'
+          - pattern: '\bexport\s+-?p\b[^|;&]*\|\s*(nc|ncat|curl|wget|httpx|httpie)\b'
+            flags: 'i'
     action:
       decision: warn
       blockCode: DATA_LEAK_MONITORING_ENV_EXFIL_001
@@ -2837,8 +2933,7 @@ rules:
     category: data_leak_monitoring
     severity: critical
     notes: |
-      env 输出作为请求数据体/定向外部主机发送属明确外发（数据体转发、外部
-      主机:端口、/dev/tcp 重定向三形态），block；本机调试与文件落盘不在拦截面。
+      env 输出作为请求数据体或定向外部主机发送，属明确外发形态。本机调试与文件落盘不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -2852,9 +2947,12 @@ rules:
         - sh
       paramsRegex:
         command:
-          - \b(env|printenv)\b[^|;&]*\|\s*(curl|wget)[^|;&]*(-d|--data|--data-raw|--data-binary|--upload-file)\b
-          - \b(env|printenv)\b[^|;&]*\|\s*(nc|ncat)\s+\S+\s+\d+
-          - \b(env|printenv)\b[^|;&]*>\s*/dev/(tcp|udp)/
+          - pattern: '\b(env|printenv)\b[^|;&]*\|\s*(curl|wget)[^|;&]*(-d|--data|--data-raw|--data-binary|--upload-file)\b'
+            flags: 'i'
+          - pattern: '\b(env|printenv)\b[^|;&]*\|\s*(nc|ncat)\s+\S+\s+\d+'
+            flags: 'i'
+          - pattern: '\b(env|printenv)\b[^|;&]*>\s*/dev/(tcp|udp)/'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到环境变量批量外传命令，已被安全策略阻断
@@ -2893,9 +2991,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      (crontab -l; echo …) | crontab 与 echo/printf … | crontab 是定时任务
-      投毒的标准形态（保留合法任务降低警觉）；crontab -l 只读、crontab -e
-      交互编辑不在拦截面。
+      (crontab -l; echo …) | crontab 定时任务投毒。只读与交互编辑不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -2909,9 +3005,12 @@ rules:
         - sh
       paramsRegex:
         command:
-          - \bcrontab\s+-l\s*;[^|]*\|\s*crontab\b
-          - \becho\b[^|;&]*\|\s*crontab\b
-          - \bprintf\b[^|;&]*\|\s*crontab\b
+          - pattern: '\bcrontab\s+-l\s*;[^|]*\|\s*crontab\b'
+            flags: 'i'
+          - pattern: '\becho\b[^|;&]*\|\s*crontab\b'
+            flags: 'i'
+          - pattern: '\bprintf\b[^|;&]*\|\s*crontab\b'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到通过管道向 crontab 注入定时任务（持久化），已被安全策略阻断
@@ -2950,10 +3049,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      block-write-system-backdoor 覆盖 file 工具写入与 /root 重定向；本规则补
-      exec 重定向/tee 通道的非 root 形态（>> ~/.bashrc、/home/<user>/.ssh/
-      authorized_keys 等）。点文件追加大量的正常用法是包管理器/IDE 配置写入，
-      属低频高危动作，命中可申诉。
+      exec 通道重定向写 rc 文件 / authorized_keys 的非 root 形态。
     match:
       actionType:
         - agent_tool_call
@@ -3007,16 +3103,7 @@ rules:
     category: self_protection
     severity: high
     notes: |
-      block-exec-privilege-escalation 覆盖 sudo/su/pkexec 形态；本规则补
-      无 sudo 提权两通道：chmod u+s/g+s（setuid/setgid 位）与 setcap 提权类 cap。
-      chmod 数字形态（4755 等）有意不收：7xx/6xx/5xx 数字是日常权限操作，误报面过大。
-
-      setcap 白名单设计：仅 block 14 个提权/破坏类 cap
-      （setuid/setgid/sys_admin/sys_module/sys_rawio/sys_resource/sys_boot/
-      linux_immutable/mac_admin/mac_override/dac_override/kill/lease/sys_ptrace）。
-      运维类 cap（cap_net_bind_service 绑端口、cap_net_raw 给 dumpcap、
-      cap_sys_nice 给音频、cap_ipc_lock 给数据库等）默认放行——这些是正常
-      运维操作，block 会导致用户无法部署服务。
+      setuid 位与提权类 setcap。chmod 数字形态不收（误报面过大），运维类 cap（绑端口 / 抓包 / 音频等）默认放行。
     match:
       actionType:
         - agent_tool_call
@@ -3031,9 +3118,11 @@ rules:
       paramsRegex:
         command:
           # 1. chmod u+s / g+s 全口径 block（合法场景极少）
-          - \bchmod\s+(-\S+\s+)*\S*[ugs]*\+s\b
+          - pattern: '\bchmod\s+(-\S+\s+)*\S*[ugs]*\+s\b'
+            flags: 'i'
           # 2. setcap 仅 block 14 个提权/破坏类 cap（白名单）
-          - \bsetcap\b[^|;&]*\bcap_(setuid|setgid|sys_admin|sys_module|sys_rawio|sys_resource|sys_boot|linux_immutable|mac_admin|mac_override|dac_override|kill|lease|sys_ptrace)[=+]e?p\b
+          - pattern: '\bsetcap\b[^|;&]*\bcap_(setuid|setgid|sys_admin|sys_module|sys_rawio|sys_resource|sys_boot|linux_immutable|mac_admin|mac_override|dac_override|kill|lease|sys_ptrace)[=+]e?p\b'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到 setuid 提权或提权类 setcap cap，已被安全策略阻断
@@ -3102,15 +3191,7 @@ rules:
     category: intrusion_defense
     severity: critical
     notes: |
-      block-write-system-backdoor 覆盖 /etc/systemd/system/ 等系统级路径；
-      用户级 ~/.config/systemd/user/ 是免 root 的等价持久化面，本规则补齐
-      file 工具写入通道（exec 重定向与 systemctl --user enable 由
-      block-user-systemd-autostart-command 覆盖）。
-
-      收窄（双轨制）：原规则同时匹配 ~/.config/autostart/*.desktop，
-      该路径是桌面应用合法安装路径（Docker Desktop、VSCode Server 等），常态误伤面大。
-      现仅 block ~/.config/systemd/user/，autostart .desktop 写入改走
-      `warn-user-autostart-desktop`（warn 副轨）留痕。
+      用户级 systemd 持久化。autostart .desktop 写入改走 warn 副轨。
     match:
       actionType:
         - agent_tool_call
@@ -3166,11 +3247,7 @@ rules:
     category: intrusion_defense
     severity: critical
     notes: |
-      意图：exec 通道两形态拦截 — 重定向写入 ~/.config/systemd/user/ 与 systemctl --user enable 激活。后者是免 root 持久化的关键一步，Agent 场景无正常使用理由。
-      match 维度：actionType=agent_tool_call|process_start + toolName ∈ exec 类 + paramsRegex.command 命中 `>> ~/.config/systemd/user/` 或 `systemctl --user enable`。
-      误伤场景：开发者通过 `systemctl --user status/show/is-active/list-units/cat/help/list-unit-files/is-enabled/is-failed` 等查询类操作查看用户服务是合法常态；本次加固 paramsNotRegex 豁免查询类操作（参照 setcap  先例的"保留主检测面 + 加白名单"模式）。
-      申诉路径：合法 systemctl --user 查询命中 audit byDecision=block 时通过白名单通道放行；写入 systemd user unit 或 enable 命中按 block 处置，确属合法运维可走"白名单通道"或临时降 severity 至 low 观察。
-      治理依据：FP 收敛（paramsNotRegex 加固 systemctl --user 查询类白名单）—— "宁可降低拦截，标记威胁告警"；不豁免 enable|start|mask|preset（仍触发 block）；不豁免 daemon-reload（仍触发 block）。
+      systemctl --user enable 与重定向写 user unit。查询类子命令白名单豁免，enable / start / mask 仍触发。
     match:
       actionType:
         - agent_tool_call
@@ -3241,10 +3318,7 @@ rules:
     category: intrusion_defense
     severity: critical
     notes: |
-      .git/hooks/ 下脚本在 git 操作（commit/merge/rebase 等）时以用户权限
-      执行，写入即供应链持久化；hook 管理通常走 core.hooksPath 配置或
-      包管理器（husky 写 .husky/ 不在本路径），Agent 直写 .git/hooks/
-      无正常使用理由。
+      写 .git/hooks/ 脚本，在 git 操作时以用户权限执行，属供应链持久化。
     match:
       actionType:
         - agent_tool_call
@@ -3334,11 +3408,7 @@ rules:
     category: ssrf
     severity: medium
     notes: |
-      block-internal-ssrf 覆盖点分十进制/域名形态；本规则补 IP 变形：
-      十进制整数（2130706433 = 127.0.0.1）、十六进制（0x7f000001）、
-      截断形态（127.1）、IPv4-mapped IPv6（::ffff:127.0.0.1）、
-      尾点域名（localhost.）。仅 warn（本地调试常见，同 block-internal-ssrf
-      口径）；云元数据变形由 data-leak-imds-001/002 单独 block。
+      IP 变形（十进制 / 十六进制 / 截断 / IPv4-mapped / 尾点域名），仅 warn。云元数据变形另由 data-leak-imds-* block。
     match:
       actionType:
         - network_http
@@ -3414,9 +3484,12 @@ rules:
         - node
       paramsRegex:
         command:
-          - (curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*\b(2130706433|0x7f000001|127\.1|localhost\.?)(?=[/:?\s]|$)
-          - (curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*\[::ffff:127\.0\.0\.1\]
-          - (python|python3|ruby|perl|node)\s+.*(socket|urlopen|requests?\.|httparty|net/http)\s*\(.*(2130706433|0x7f000001|127\.1|::ffff:127\.0\.0\.1|localhost\.)
+          - pattern: '(curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*\b(2130706433|0x7f000001|127\.1|localhost\.?)(?=[/:?\s]|$)'
+            flags: 'i'
+          - pattern: '(curl|wget|fetch|nc|ncat|httpx|httpie)\s+[^|;&]*\[::ffff:127\.0\.0\.1\]'
+            flags: 'i'
+          - pattern: '(python|python3|ruby|perl|node)\s+.*(socket|urlopen|requests?\.|httparty|net/http)\s*\(.*(2130706433|0x7f000001|127\.1|::ffff:127\.0\.0\.1|localhost\.)'
+            flags: 'i'
     action:
       decision: warn
       blockCode: SSRF_SSRF_IP_OBFUSCATION_002
@@ -3466,16 +3539,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      规则内域名（malicious-c2-1.com 等）为 PLACEHOLDER 占位示例，
-      仅演示规则形态。以 enabled:false 随策略分发——占位 IOC 以 block 形态启用
-      只会拦截不存在的示例域名，却会向使用方传递"已内置威胁情报"的错误信号。
-      替换指引（替换后请将 enabled 改为 true）：
-      1. 将 paramsRegex.url 的占位域名替换为真实 IOC 清单（平台侧 threat-intel
-         下发，或本地策略文件覆盖，通过 policyPath 配置指定本地策略）；
-      2. 清单来源建议使用可订阅的威胁情报源（如开源 feed 或企业 TI 平台），
-         并建立定期轮换与误报复核流程；
-      3. 替换后补充真实域名的 testCase（正/负向各一），并执行
-         npx vitest run tests/intervention/policy-testcases.test.ts 验证。
+      占位 IOC 示例，默认 enabled:false——启用只会拦截不存在的域名却传递「已内置威胁情报」的假信号。替换为真实清单后改 true 并补正负向 testCase。
     match:
       actionType:
         - network_http
@@ -3507,8 +3571,7 @@ rules:
     category: data_desensitization
     severity: medium
     notes: |
-      agent_tool_call 入参 body 凭据脱敏（modify）。启发式宽正则命中 AWS AKIA / PEM 私钥块 / JWT / 键值凭据后 redactFields；详见 testCases。
-      误伤面：长 base64 字符串包含类似模式会被命中，由 rate-limit 兜底。
+      tool body 凭据脱敏（modify）。长 base64 串可能误命中，由 rate-limit 兜底。
     match:
       actionType:
         - agent_tool_call
@@ -3540,8 +3603,7 @@ rules:
     category: data_desensitization
     severity: medium
     notes: |
-      agent_message 入参 content 凭据脱敏（modify）。同 body 启发式策略，作用域为 message 内容。
-      误伤面同 in-tool-body。
+      message content 凭据脱敏（modify），误伤面同 in-tool-body。
     match:
       actionType:
         - agent_tool_call
@@ -3573,15 +3635,7 @@ rules:
     category: data_desensitization
     severity: medium
     notes: |
-      收敛为锚定模式：AWS AKIA / PEM 私钥块 / JWT /
-      键值凭据（值长度 ≥12 或采集侧脱敏标记 ***），避免原宽正则误伤普通业务 body。
-      两条链路能力不同，勿混读：
-      - agent_tool_call / network_http：可真实改写 params，modify 生效（真脱敏）；
-      - network_http：runtime hook 事后评估（hooks/network.js 无 modify 能力），
-        且采集侧 redactSensitiveBody 已把敏感键值（SENSITIVE_BODY_KEYS）就地改写为
-        ***，评估看到的就是脱敏后形态。此处 modify 仅为"凭据字段外发"审计标注，
-        真正的脱敏发生在采集侧——这也是 D1-4 同时接受明文值与 *** 两种形态的原因
-        （只锚明文时，运行时永不命中，属假绿）。
+      凭据外发标注（modify）。注意两条链路能力不同：agent_tool_call 侧 modify 真生效；network_http 是采集侧先脱敏再评估，插件侧 modify 仅为审计标注。
     match:
       actionType:
         - network_http
@@ -3636,8 +3690,7 @@ rules:
     category: data_desensitization
     severity: medium
     notes: |
-      process_start 命令行凭据脱敏（modify）。cmdline 内联凭据 redact。
-      误伤面：演示性命令（demo AKIA...）会被命中，由 Tier-1 critical 轨覆盖。
+      命令行内联凭据脱敏（modify）。
     match:
       actionType:
         - agent_tool_call
@@ -3652,9 +3705,11 @@ rules:
       paramsRegex:
         command:
           # -d/--data 后面 JSON/字符串里出现凭据字段（允许引号在中间）
-          - (curl|wget|httpie|httpx)\s+[^|;&]*(-d|--data|--data-raw|--data-binary)\b[^|;&]*(password|passwd|pwd|token|secret|api[_-]?key|private[_-]?key|access[_-]?key)
+          - pattern: '(curl|wget|httpie|httpx)\s+[^|;&]*(-d|--data|--data-raw|--data-binary)\b[^|;&]*(password|passwd|pwd|token|secret|api[_-]?key|private[_-]?key|access[_-]?key)'
+            flags: 'i'
           # URL query 里直接携带明文凭据
-          - (curl|wget|httpie|httpx)\s+[^|;&]*['"](password|token|secret|api[_-]?key)\s*[:=]
+          - pattern: '(curl|wget|httpie|httpx)\s+[^|;&]*[''"](password|token|secret|api[_-]?key)\s*[:=]'
+            flags: 'i'
     action:
       decision: modify
       modify:
@@ -3680,8 +3735,7 @@ rules:
     category: data_desensitization
     severity: low
     notes: |
-      modify 限制用户数据路径。低危 modify，对命中规则的 params.path 做白名单约束。
-      零误伤面（仅收紧白名单不丢字段）。
+      modify 限制用户数据路径。只收紧白名单、不丢字段，无误伤面。
     match:
       actionType:
         - agent_tool_call
@@ -3727,8 +3781,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      单个传输工具特征属弱信号（curl/scp/git push 是正常构建与运维行为），仅 warn 记录；
-      白名单豁免内网地址段与占位受信域。置信度：低 → 决策上限 warn。
+      单个传输工具是弱信号（curl/scp/git push 属正常构建运维），仅 warn；内网地址段与受信域豁免。
     match:
       actionType:
         - process_start
@@ -3780,8 +3833,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      suspicious_encoding 标签 + 敏感路径双信号，置信度中，命中后放行并审计留痕。
-      多层/分块编码识别属于标签注入逻辑的后续升级项。
+      可疑编码 + 敏感路径双信号，放行并审计留痕。
     match:
       actionType:
         - process_start
@@ -3814,9 +3866,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      数据库备份是正常业务，不直接 block，放行并审计留痕；本机/备份实例导出经白名单豁免
-      （--host 空格与 --host= 等号双形态均豁免，::1 / 0.0.0.0 一并视为本机）。
-      置信度：中（工具名弱信号 + db_dump 标签）→ 决策上限 audit。
+      数据库备份属正常业务，放行留痕。本机 / 备份实例导出经白名单豁免。
     match:
       actionType:
         - process_start
@@ -3862,10 +3912,7 @@ rules:
     category: sensitive_data_access
     severity: medium
     notes: |
-      命令行凭据外发走 process_start/agent_tool_call + 命令行 D1 锚定模式，
-      命中后 modify 脱敏 command 字段。network_http 侧凭据检测由
-      data-leak-model-api-001（audit）与 redact-credentials-exfil（modify）覆盖。
-      secret_in_content 标签仍由 runtime hook 注入，供事件标注与后续关联分析使用。
+      命令行凭据外发脱敏（modify）。network_http 侧由 data-leak-model-api-001 与 redact-credentials-exfil 覆盖。
     match:
       actionType:
         - agent_tool_call
@@ -3907,16 +3954,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      提示词、会话上下文或工具结果进入非可信模型供应商/外部 API 的请求体。
-      network_http 事件已接入干预引擎；network hook 不向事件注入
-      risk_flags（secret_in_content/pii_in_content 无 network 侧来源），故本规则
-      直接用 bodyRegex D1 锚定模式识别请求体中的凭据/密钥内容，
-      命中后放行：本规则产出 audit 审计标注；同一 body 由 redact-credentials-exfil
-      并行命中并产出 modify（有实际处置行为，决策优先级高于纯记录的 audit）。
-      network_http 的实际脱敏发生在采集侧 hooks/network.js redactSensitiveBody，
-      插件侧为事后评估、无改写或转发能力，故此处 modify 亦为标注语义。
-      paramsNotRegex.host 为受信供应商占位（(^|\.)internal$），
-      使用方应替换为签约供应商域名清单(trusted_destinations)。
+      请求体携带凭据发往非可信供应商，产出 audit 标注（实际脱敏在采集侧）。paramsNotRegex.host 是占位，使用方需替换为签约供应商清单。
     match:
       actionType:
         - network_http
@@ -3968,17 +4006,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      链式关联（先脱库后外传）按会话内历史事件弱关联成立，且只在
-      withinSteps 窗口（默认 5 步）内成立——更早的脱库记录视为历史背景，
-      不与当前外传动作关联；弱关联
-      上限为 warn，不得 block。
-      chain 由数组形态改为对象形态（withinSteps + prior），
-      数组形态在 YAML 中无法携带窗口参数、回退全历史；对象形态链节的
-      paramsRegex.command 与数组形态同义（映射为对历史事件 params 的
-      内容扫描）。
-      2026-10-21：scp/sftp/rsync 到外部域名（不带脱库链）的外传面改由
-      data-leak-remote-transfer-001（warn）兜底，本规则只承担"链式关联"增量；
-      原有两条"无链 allow"负向用例的预期已随之改为 warn。
+      会话内脱库→外传的链式弱关联，只在 withinSteps 窗口内成立，上限 warn。
     match:
       actionType:
         - process_start
@@ -4064,13 +4092,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      读进程内存是凭据/密钥窃取的强信号（ATT&CK T1003 OS Credential Dumping），
-      覆盖：gdb -p <pid> attach 调试、cat /proc/<pid>/mem 直读、
-      /proc/<pid>/maps 内存映射侦察、pmap 内存布局侦察、
-      smaps/pagemap/environ 凭据面、/proc/<pid>/(cwd|fd|root) 符号链接通道、
-      /dev/(mem|kmem|kmsg) 物理内存设备、gcore/procdump/memdump core dump 工具链。
-      合法场景极少（逆向工程/调试器开发），误报面可控；block + appealable。
-      进程内自省（debug 自己）由 gdb --pid <self> 命中模式豁免。
+      读进程内存（gdb attach、/proc/pid/mem、core dump 工具链）。调试自身进程豁免。
     match:
       actionType:
         - process_start
@@ -4182,17 +4204,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      直连远程生产数据库（不走 mysqldump 等导出工具）是实时数据窃取强信号
-      （ATT&CK T1213 Data from Information Repositories），覆盖：
-      mysql/psql/mongo/redis-cli 直连非本机/非白名单主机、
-      redis-cli 流式订阅（MONITOR/SUBSCRIBE/PSUBSCRIBE）、
-      mysql/mariadb 客户端内 shell 转义（\! / system）与 INTO OUT/DUMPFILE 写盘、
-      psql COPY TO PROGRAM 服务端命令通道、
-      pg_basebackup/xtrabackup 远程物理备份外发。
-      与 data-leak-db-dump-001（mysqldump 离线导出，audit）互补：dump 留痕观察，
-      live 直连直接 block。
-      本机/备份实例/开发实例经 host 白名单豁免（直连臂与 pg_basebackup 远程臂
-      分别带 localhost/RFC1918 carve-out）。
+      直连远程生产库、流式订阅、客户端内 shell 转义。与 db-dump-001（audit）互补；本机 / 备份 / 开发实例豁免。
     match:
       actionType:
         - process_start
@@ -4200,27 +4212,37 @@ rules:
       paramsRegex:
         command:
           # mysql 直连（必须带 -h）
-          - \bmysql\b[^|&;\n]*\s+-h\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)
+          - pattern: '\bmysql\b[^|&;\n]*\s+-h\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)'
+            flags: 'i'
           # psql 直连（必须带 -h）
-          - \bpsql\b[^|&;\n]*\s+-h\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)
+          - pattern: '\bpsql\b[^|&;\n]*\s+-h\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)'
+            flags: 'i'
           # mongo 直连
-          - \bmongo(?:sh)?\b[^|&;\n]*\s+(?:-h|--host)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)
+          - pattern: '\bmongo(?:sh)?\b[^|&;\n]*\s+(?:-h|--host)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)'
+            flags: 'i'
           # redis-cli 直连
-          - \bredis-cli\b[^|&;\n]*\s+(?:-h|--host)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)
+          - pattern: '\bredis-cli\b[^|&;\n]*\s+(?:-h|--host)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.(?:com|net|org|io|cloud|internal|local)\b)'
+            flags: 'i'
           # redis-cli 流式订阅/监听（实时数据外发，无需 host 条件）
-          - \bredis-cli\b[^|&;\n]{0,80}?\b(?:MONITOR|SUBSCRIBE|PSUBSCRIBE)\b
+          - pattern: '\bredis-cli\b[^|&;\n]{0,80}?\b(?:MONITOR|SUBSCRIBE|PSUBSCRIBE)\b'
+            flags: 'i'
           # mysql/mariadb 客户端内 shell 转义与 INTO OUT/DUMPFILE 写盘外发
-          - \b(?:mysql|mariadb)\b[^|&;\n]{0,200}?(?:INTO\s+(?:OUT|DUMP)FILE\b|\\\!\s*\S+|system\s+\S+)
+          - pattern: '\b(?:mysql|mariadb)\b[^|&;\n]{0,200}?(?:INTO\s+(?:OUT|DUMP)FILE\b|\\\!\s*\S+|system\s+\S+)'
+            flags: 'i'
           # psql COPY TO PROGRAM（服务端命令执行通道）
-          - \b(?:psql|pg_basebackup)\b[^|&;\n]{0,300}?\bCOPY\b[^|&;\n]{0,300}?\bTO\s+PROGRAM\b
+          - pattern: '\b(?:psql|pg_basebackup)\b[^|&;\n]{0,300}?\bCOPY\b[^|&;\n]{0,300}?\bTO\s+PROGRAM\b'
+            flags: 'i'
           # pg_basebackup 远程物理备份（RFC1918/localhost carve-out）
-          - \bpg_basebackup\b[^|&;\n]{0,200}?(?:-h\s+|--host[=\s])(?!(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|localhost\b))[^\s]+
+          - pattern: '\bpg_basebackup\b[^|&;\n]{0,200}?(?:-h\s+|--host[=\s])(?!(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|localhost\b))[^\s]+'
+            flags: 'i'
           # xtrabackup/mariabackup 远程流式备份外发
-          - \b(?:xtrabackup|mariabackup)\b[^|&;\n]{0,200}?(?:--remote-host\b|--stream=xbstream\b)
+          - pattern: '\b(?:xtrabackup|mariabackup)\b[^|&;\n]{0,200}?(?:--remote-host\b|--stream=xbstream\b)'
+            flags: 'i'
       paramsNotRegex:
         command:
           # 本机/备份实例/开发实例豁免
-          - -h\s+(?:localhost|127\.0\.0\.1|::1|backup|dev|test|staging)
+          - pattern: '-h\s+(?:localhost|127\.0\.0\.1|::1|backup|dev|test|staging)'
+            flags: 'i'
     action:
       decision: block
       blockReason: 检测到直连远程数据库，属实时数据窃取强信号
@@ -4331,22 +4353,7 @@ rules:
     category: behavior_guidance
     severity: medium
     notes: |
-      降噪处理（2026-10-09）：该规则匹配条件仅有 actionType: agent_start，
-      每个新会话必命中一条 medium 级 audit 告警，alert fatigue 风险大于
-      留痕价值（agent_start 事件本身已是会话启动审计记录），故禁用。
-      Guidance 注入能力（before_prompt_build）落地后恢复 enabled: true。
-
-      agent_start 阶段宿主能力边界（已核对 OpenClaw 2026.9.4 源码）：
-      before_agent_run 门控仅支持 pass/block，不存在 systemPromptAddition，
-      context_adjust 决策不下发宿主、只写入审计事件，代码会显式记录不支持原因。
-      对话内引导依赖 Guidance 补全方案（before_prompt_build，另案实施）；
-      如需会话级硬阻断请改用 decision: block。
-
-      + ：原 decision: context_adjust
-      在 SPL v2 引擎类型已移除，schema/loader 仍接受为向后兼容
-      （DecisionComposer 链式决策中遇到 context_adjust 会跳过链尾）。本规则
-      的语义本就是"当前不可下发，只事件留痕"，与 audit 决策（只留痕）一致
-      ——故同步切到 audit，移除 guidance 区段（host 端无法消费）。
+      会话启动即命中，告警疲劳大于留痕价值，默认禁用。宿主 before_agent_run 不支持引导文本注入。
     match:
       actionType:
         - agent_start
@@ -4382,19 +4389,7 @@ rules:
     action:
       decision: audit
     notes: |
-      agent_message 阶段宿主能力边界（已核对 OpenClaw 2026.9.4 源码）：
-      before_message_write 是同步 hook，插件返回仅支持 block / message 替换，
-      无法向 LLM 对话注入引导文本。本规则的 context_adjust 决策（含
-      GuidanceStateMachine 超阈值升级）只写入审计事件，不下发宿主，代码会
-      显式记录不支持原因。要对越界路径请求直接拦截，请改用 decision: block
-      的 agent_message 规则；对话内引导依赖 Guidance 补全方案
-      （before_prompt_build，另案实施）。
-
-      + ：原 decision: context_adjust 在
-      SPL v2 引擎类型已移除，schema/loader 仍接受为向后兼容
-      （DecisionComposer 链式决策中遇到 context_adjust 会跳过链尾）。本规则
-      的语义本就是"当前不可下发，只事件留痕"，与 audit 一致，故同步切到
-      audit，移除 guidance 区段。
+      宿主 before_message_write 只能 block 或替换消息，无法注入引导，故仅事件留痕。
     testCases:
       - name: 用户请求读取 /etc/passwd 触发引导
         input:
@@ -4437,21 +4432,7 @@ rules:
     action:
       decision: audit
     notes: |
-      OpenClaw 的 beforeMessageWrite 在真实环境中传入的 content 为空、sessionKey 为 unknown，
-      无法直接拦截用户问题。因此通过 beforeToolCall 兜底：当智能体实际发起越界路径读取时
-      返回 context_adjust 引导。注意（修正历史描述）：enforce 模式不会把
-      context_adjust 自动转 block——宿主 before_tool_call 只能消费 block/modify 形态，
-      引导文案无法注入 LLM 对话，当前仅事件留痕。对话内引导依赖 Guidance 补全方案
-      （before_prompt_build，另案实施）。
-      match 由 ^/tmp/ 一刀切收窄为 /tmp 下的敏感文件形态（私钥/凭据/系统
-      文件拷贝）。/tmp 是构建、日志、临时文件的常规路径，原形态落地等于拦死正常业务；
-      收窄后常规路径直接 allow，不依赖 Guidance 补全（超阈值转 block）改造是否发生。
-
-      + ：原 decision: context_adjust 在
-      SPL v2 引擎类型已移除，schema/loader 仍接受为向后兼容
-      （DecisionComposer 链式决策中遇到 context_adjust 会跳过链尾）。本规则
-      的语义本就是"当前不可下发，只事件留痕"，与 audit 一致，故同步切到
-      audit，移除 guidance 区段。
+      经 beforeToolCall 兜底拦截越界路径读取；引导文案无法进对话，仅事件留痕。
     testCases:
       - name: 读取 /tmp 下 SSH 私钥触发引导
         input:
@@ -4493,17 +4474,7 @@ rules:
     category: self_protection
     severity: high
     notes: |
-      启发式留痕规则：runtime hook 在传播被显式
-      跳过（explicit_skip）或 env 剥离后重注入（env_stripped）时打标，本规
-      则消费 self_protection_bypass 标签做运营信号留痕。
-
-      误伤面：正常用户在受限容器或沙箱里跑 CLI 时，runtime hook 可能因环境
-      隔离自动 skip，行为合规但会触发本规则误报。观察期已满 1 周（2026-09
-      至 2026-09-30），命中数 0，符合预期。
-
-      保留 warn 而非 block：process_start 是事后评估入口，决策只留痕不下
-      发（HOST_DELIVERABLE_DECISIONS 不支持 process_start 上挂 block），
-      同时豁免/剥离本身不构成可拦截的恶意动作——是配套审计信号。
+      runtime hook 被跳过或 env 剥离时的运营留痕。检测的是插件自身状态而非外部恶意行为。
     match:
       actionType:
         - process_start
@@ -4531,16 +4502,7 @@ rules:
     category: self_protection
     severity: high
     notes: |
-      启发式留痕规则：runtime hook 自身未生效
-      （插件未加载或被禁）时 store.ts 在启动期打 unpatched_engine 标签，本规
-      则消费该标签做运营信号留痕。
-
-      误伤面：插件冷启动过程中（plugin manager 启动 → runtime hook install
-      完成的窗口）偶发命中，行为合规但会有信号。命中数随插件启停可预期
-      波动。
-
-      保留 warn 而非 block：检测的是自身插件状态而非外部恶意行为，且
-      process_start 不可挂 block（同上规则）。属合规审计信号而非拦截意图。
+      runtime hook 未生效（插件未加载/被禁）时的运营留痕，冷启动窗口偶发命中。
     match:
       actionType:
         - process_start
@@ -4563,12 +4525,12 @@ rules:
         expectedDecision: allow
 
   # ---------------------------------------------------------------
-  # 通用攻击面规则组（v1.2.0）。id/blockCode 按 openclaw 命名族
+  # 通用攻击面规则组。id/blockCode 按 openclaw 命名族
   # （blockCode 首段 = category 首词大写）；正则禁用嵌套量词
   # （(?:\s+\S+)* 类写法会被两侧 ReDoS 守卫拒绝），宽松间隙统一用
   # 有界 [\s\S]{0,N}? 表达。warn-scratch-dir-spawn 暂缓 —— 该规则消费
   # scratch_dir_spawn 旗标，字典已收录但 openclaw runtime hook / process
-  # monitor 均无任何 emitter，启用即成哑弹，待采集层补打标后再启用。
+  # monitor 均无任何 emitter，规则永不触发，待采集层补打标后再启用。
   # ---------------------------------------------------------------
 
   - id: block-exfil-paste-service
@@ -4578,13 +4540,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      blockCode DATA_LEAK_MONITORING_PASTE_SERVICE_004。
-      覆盖面：paste bin（pastebin.com / paste.mozilla.org / dpaste.org / ix.io / sprunge.us /
-      clbin.com / hastebin.com / ghostbin.com / bashupload.com）、文件中转（transfer.sh /
-      file.io / temp.sh / 0x0.st）、webhook/隧道（webhook.site / requestbin.com /
-      pipedream.com / hookbin.com / beeceptor.com）。命中形态要求"上传类 flag
-      （-T/--upload-file/-d/--data/-F/--form）× 已知外发泄漏域名"双向锚定，
-      纯下载/纯浏览不在拦截面。
+      上传类 flag × 已知 paste/隧道域名双向锚定。纯下载、纯浏览不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -4682,10 +4638,7 @@ rules:
     category: data_leak_monitoring
     severity: high
     notes: |
-      blockCode DATA_LEAK_MONITORING_PASTE_SERVICE_005。
-      原规则为 write-body 维度；openclaw 版改走 command 维度（gh gist create /
-      curl/wget 带数据 flag 访问 api.github.com/gists / git push 到 gist.github.com），
-      与 block-exfil-paste-service 同族互补。gh gist list/view 等只读子命令不在拦截面。
+      gist 创建与推送（command 维度）。gh gist list/view 等只读子命令不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -4769,10 +4722,7 @@ rules:
     category: data_leak_monitoring
     severity: medium
     notes: |
-      blockCode DATA_LEAK_MONITORING_UPLOAD_003 的 scp/sftp/rsync
-      臂；URL 外传面已由 data-leak-upload-001 覆盖，本条只补远端主机名为外部域名
-      的传输形态。命中需 data_exfiltration 旗标 + 命令双锚定，内网 IP / 无旗标的
-      常态构建传输不在告警面。
+      scp / sftp / rsync 到外部域名。URL 外传面由 data-leak-upload-001 覆盖。
     match:
       actionType:
         - process_start
@@ -4847,13 +4797,7 @@ rules:
     category: intrusion_defense
     severity: high
     notes: |
-      blockCode INTRUSION_DEFENSE_REVERSE_SHELL_MULTILANG_003。
-      与 block-exec-reverse-shell（bash /dev/tcp、nc -e、mkfifo、socat、python socket
-      已覆盖）互补，补齐 Perl / PHP / Node / Lua / PowerShell / openssl s_client /
-      Telnet / nc -c / AWK / sqlite3 .shell / ssh -R 反向隧道 / gcc 编译即执行。
-      每条臂要求"建连 + 执行/重定向"双信号同框，单行 benign 脚本（perl -e print /
-      node -e console.log / php -r echo）不误伤。原规则的 ssh -D 臂（动态转发
-      后台化） legit 运维面大（SOCKS 调试常态），本批不收，待 FP 数据积累后再评估。
+      多语言反弹 shell（Perl / PHP / Node / PowerShell / ssh -R 等）。每条臂要求建连与执行双信号同框，单行 benign 脚本不误伤。
     match:
       actionType:
         - agent_tool_call
@@ -5024,11 +4968,7 @@ rules:
     category: self_protection
     severity: high
     notes: |
-      blockCode SELF_PROTECTION_CAPABILITIES_026 的
-      写入类臂。setcap 本体已由 block-setuid-setcap-privesc（14 提权类 cap 白名单
-      block）覆盖，本条只补缺口：capsh 增删 cap / 切特权位、chcap、setpriv
-      --inh-caps（cap 继承链操纵）。只读查询（getcap/getpcaps/pscap/capsh --print）
-      不在拦截面。
+      capsh / chcap / setpriv 操纵 cap 继承链。setcap 本体由 block-setuid-setcap-privesc 覆盖，只读查询不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -5110,11 +5050,7 @@ rules:
     category: intrusion_defense
     severity: medium
     notes: |
-      blockCode INTRUSION_DEFENSE_PROCESS_TERMINATION_006。
-      kill 仅收 -9/-KILL/-SIGKILL/-SIGABRT 强信号
-      （裸 kill <pid> / kill -TERM 是正常运维），pkill/killall/xkill 全口径但叠加
-      开发框架 / 桌面 / 基础设施进程名白名单（node/python 刻意不在白名单——
-      pkill node 是真实攻击向量）。decision 为 warn。
+      kill 仅收强信号（-9 / -KILL 等），裸 kill 与 -TERM 是正常运维；pkill/killall 叠加开发框架进程名白名单。
     match:
       actionType:
         - agent_tool_call
@@ -5201,11 +5137,7 @@ rules:
     category: data_leak_monitoring
     severity: low
     notes: |
-      blockCode DATA_LEAK_MONITORING_PROCFS_CREDENTIAL_008。
-      覆盖 /proc/<pid>/{cmdline,status,io,stack,auxv,exe,syscall,wchan}——不是真实内存
-      dump（/proc/<pid>/mem/maps 已由 data-leak-proc-mem-001 block），但携带进程元
-      数据，运维合法场景多（cat /proc/1/status 查 init），降 warn 留痕。
-      /proc/<pid>/environ 属确凿凭据本体，仍由 block-exec-sensitive-file 兜底。
+      读 /proc/pid 元数据（非真实内存 dump），运维场景多，降 warn。/proc/pid/environ 仍由 block-exec-sensitive-file 兜底。
     match:
       actionType:
         - agent_tool_call
@@ -5300,9 +5232,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      BASH_FUNC_xxx%% 是 bash 进程间函数导出的隐藏通道：攻击者经
-      export BASH_FUNC_cmd%%='() { evil; }' 注入子进程命令解析，
-      与 LD_PRELOAD / BASH_ENV 同级风险。env 维度命中即 block。
+      BASH_FUNC_xxx%% 函数导出通道，把恶意命令注入子进程的解析。
     match:
       actionType:
         - agent_tool_call
@@ -5376,9 +5306,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      SSH_AUTH_SOCK / SSH_AGENT_PID 让子进程直接消费 agent 中的私钥
-      （ssh 登录、git 签名凭据侧信道）；非 agent 自动化场景的正当通道。
-      env 维度显式注入即 block，可申诉。
+      SSH_AUTH_SOCK 注入让子进程直接消费 agent 中的私钥。显式注入即 block，可申诉。
     match:
       actionType:
         - agent_tool_call
@@ -5453,8 +5381,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      GPG_AGENT_INFO 让子进程消费 gpg-agent 中的私钥（GPG 签名 / 解密
-      侧信道）。env 维度显式注入即 block，可申诉。
+      GPG_AGENT_INFO 注入让子进程消费 gpg-agent 中的私钥。可申诉。
     match:
       actionType:
         - agent_tool_call
@@ -5528,11 +5455,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      env 维度版本：BASH_ENV 在每个非交互 bash 启动时自动 source、
-      ENV 在 sh 启动时执行、PROMPT_COMMAND 每次 prompt 前 eval，
-      与命令行内联形态（self-protection-block-bash-env）同族互补。
-      两规则分写原因：匹配器对 paramsRegex 多 key 为 AND 语义，
-      command + env 合写会使双维度双双失效。
+      BASH_ENV / ENV / PROMPT_COMMAND 的 env 维度形态。与命令行内联规则分写：paramsRegex 多 key 是 AND 语义，合写会使双维度双双失效。
     match:
       actionType:
         - agent_tool_call
@@ -5608,10 +5531,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      与 block-crontab-pipe-persistence 分工：那条管 echo/printf/crontab -l
-      管道持久化，本条管 crontab -e/-r 交互编辑与 crontab <file> 文件安装
-      两种 modify 面；重定向写 /etc/cron* 由
-      block-write-sensitive-system-files-command 覆盖，互不重叠。
+      crontab -e/-r 交互编辑与 crontab <file> 文件安装。重定向写 /etc/cron* 另由 block-write-sensitive-system-files-command 覆盖。
     match:
       actionType:
         - agent_tool_call
@@ -5690,10 +5610,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      正文维度：write/edit 工具写入的脚本或配置内容里引用 /etc/cron*
-      路径（先写脚本、再由脚本落地 cron 的两段式持久化）。
-      file 工具直写 /etc/cron 路径由 block-write-system-backdoor 覆盖，
-      本条补正文引用面，互不重叠。
+      写入的脚本或配置内容引用 /etc/cron* 路径（两段式持久化）。
     match:
       actionType:
         - agent_tool_call
@@ -5767,10 +5684,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      防火墙清空抹除网络层防御（出口管控 / 入站最小化全部失效），
-      是 exfil 前置动作的典型信号。覆盖 iptables/ip6tables 清空与删链、
-      nft flush/delete、ufw disable/reset、firewalld 永久移除规则。
-      列表类只读（-L/list/status）不在拦截面。
+      清空或禁用防火墙规则，是 exfil 的前置动作。列表类只读不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -5857,9 +5771,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      正文维度：写入脚本内容包含 iptables/nft/ufw/firewalld 清空指令
-      （间接持久化通道，先落脚本、再找时机执行）。注释行（# 开头）
-      提及不在命中面。
+      写入脚本内容包含防火墙清空指令（间接持久化）。注释行提及不命中。
     match:
       actionType:
         - agent_tool_call
@@ -5933,10 +5845,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      关闭内核级强制访问控制（SELinux/AppArmor）后后续攻击再无
-      内核策略层兜底，是提权与持久化前置动作。覆盖 setenforce
-      permissive/0、aa-* 降级工具、semodule 删策略、systemctl/service
-      停用安全服务。查询类（getenforce/sestatus/aa-status）不在拦截面。
+      关闭内核强制访问控制，是提权与持久化的前置动作。查询类命令不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -6024,12 +5933,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      ptrace PTRACE_ATTACH 附加运行中进程即可跨进程读写内存、
-      旁路命令行审计（ATT&CK T1055 Process Injection / T1622
-      Debugger Evasion 反向利用）。gdb -p/--pid 形态由
-      data-leak-proc-mem-001 覆盖，本条补 strace/ltrace/perf -p、
-      gdb --attach 长选项、gdb -ex attach/call、python ctypes
-      ptrace(PTRACE_ATTACH) 直接调用形态。
+      strace / perf -p 等附加进程形态。gdb -p 由 data-leak-proc-mem-001 覆盖。
     match:
       actionType:
         - agent_tool_call
@@ -6112,11 +6016,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      删除 / 截断 / 覆写审计证据（security-events*.jsonl /
-      security-policy* / /var/log/audit/）是攻击收尾标准动作
-      （ATT&CK T1070 Indicator Removal）。覆盖 shell 删除族、
-      find -delete、python os/shutil/pathlib 文件 API、重定向
-      截断与 tee 覆写形态。读取不在本规则面。
+      删除 / 截断 / 覆写审计证据文件，是攻击收尾标准动作。读取不在拦截面。
     match:
       actionType:
         - agent_tool_call
@@ -6207,10 +6107,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      命令行直接引用插件安装路径（node_modules 包体 / 扩展目录 /
-      事件与策略文件名）是读取、篡改或规避审计的前置动作。
-      包管理器安装/链接上下文（npm/yarn/pnpm/npx 提及 node_modules
-      路径）经 paramsNotRegex 豁免，不误伤依赖安装。
+      命令行引用插件安装路径，是读取、篡改或规避审计的前置动作。npm/yarn/pnpm 上下文豁免。
     match:
       actionType:
         - agent_tool_call
@@ -6301,11 +6198,7 @@ rules:
     category: self_protection
     severity: critical
     notes: |
-      dd 覆写块设备、mkfs 重格式化、wipefs 清签名、grub-install /
-      efibootmgr 改 bootloader 属磁盘破坏 / 拒服标准动作（ATT&CK
-      T1485 Data Destruction）。真实兜底在 device cgroup，本规则
-      覆盖 sd/nvme/vd/hd/mmcblk 全设备族；落盘到普通文件的 dd
-      不在命中面。
+      dd 覆写块设备、mkfs 重格式化、wipefs 清签名、改 bootloader。dd 落盘到普通文件不命中。
     match:
       actionType:
         - agent_tool_call

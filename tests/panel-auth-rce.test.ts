@@ -157,14 +157,38 @@ describe("panel auth/RCE hardening", () => {
     expect(res.headers["access-control-allow-credentials"]).toBeUndefined();
   });
 
-  it("rejects Origin: null without a panel nonce", async () => {
+  it("rejects Origin: null without a panel nonce — but lets the panel read the 403", async () => {
     const res = await request(base, {
       method: "POST",
       headers: { Origin: "null", "Content-Type": "application/json" },
       body: JSON.stringify({ method: "security.metrics", params: {} }),
     });
     expect(res.status).toBe(403);
-    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    // ACAO: null 是**故意**发的，跟上面那条 attacker origin 的 "undefined" 反着来。
+    // 不发的话浏览器的 CORS 检查会把 fetch 直接 reject 成 "Failed to fetch"，
+    // 面板里的 r.status===401/403 分支（scheduleAuthReload → 自动重载重建会话）
+    // 一辈子走不到：用户只看到一个点了没反应、不报错、也换不回别的语言的控件。
+    // 让面板读得到自己的拒绝理由，恢复路径才存在。
+    //
+    // 这里没有放松任何东西：POST 依旧 403；不带 Access-Control-Allow-Credentials
+    // （opaque origin 本来也送不到 cookie）；响应体只有一句固定文案。改这条断言
+    // 前先读上面两条——attacker origin 必须仍然读不到。
+    expect(res.headers["access-control-allow-origin"]).toBe("null");
+    expect(res.headers["access-control-allow-credentials"]).toBeUndefined();
+    expect(JSON.parse(res.body).ok).toBe(false);
+  });
+
+  it("a stale panel nonce is rejected, and the panel can tell it apart", async () => {
+    // 语言切换写入 openclaw.json 会让宿主重载插件，panelNonces 随之清空，
+    // 页面手里那个 nonce 就成了 stale 的。此时 POST 必须仍然 403——但要能被
+    // 读出来，否则用户看到的只是"点了没反应"。
+    const res = await request(base, {
+      method: "POST",
+      headers: { Origin: "null", "X-Panel-Nonce": "not-a-real-nonce", "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "security.config.save", params: {} }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers["access-control-allow-origin"]).toBe("null");
   });
 
   it("accepts Origin: null with the minted nonce, ACAO null without credentials", async () => {
@@ -272,6 +296,75 @@ describe("panel auth/RCE hardening", () => {
     expect(panel.getReloadCount()).toBe(0);
     expect(panel.els.get("panel").innerHTML).toContain("HTTP 500");
   });
+
+  // ── 1c. 宿主重载窗口 → 读不到响应 ≠ 可以立刻 reload ────────────────
+  //
+  // Config 页保存写的是宿主的 openclaw.json，宿主随后重载插件配置。
+  // 那个窗口里所有插件路由由宿主自己回 500 且**不带** CORS 头，本插件 handler
+  // 根本没被调用：浏览器只能报 TypeError("Failed to fetch")，面板读到的是
+  // "没有响应"而不是"500"。此刻 location.reload() 正好落进窗口，把用户甩到
+  // 一张裸 500 页上（用户报的现象）。所以读不到响应时必须等路由重新给出可读
+  // 响应、且连续可读到判据成立，才导航。
+  //
+  // （header 的语言开关已经不再写宿主配置——见 panel-i18n.test.ts——但它仍然
+  // 走同一个 settle 闸门：万一哪天宿主连插件自己的状态文件也 watch，窗口照
+  // 旧存在，闸门就是唯一的防线。）
+
+  it("unreadable RPC failures wait for the route to answer again before reloading", async () => {
+    const { html, nonce } = await extractPanelHtml();
+    let routeReadable = true;
+    const panel = await runPanel({
+      nonce,
+      html,
+      respond: (method) => (method === "security.metrics" ? { metrics: { total: 0 } } : {}),
+      rejectWhen: () => !routeReadable,
+    });
+    // boot 时 metrics 成功过一次 → rpcEverOk 为真，后续读不到才值得自愈。
+    expect(panel.getReloadCount()).toBe(0);
+
+    routeReadable = false;
+    await panel.clickTab("metrics");
+    await panel.flush(1500);
+    // 窗口里：探针读不到响应，绝不重载（否则就是那张裸 500 页）。
+    expect(panel.getReloadCount()).toBe(0);
+    expect(panel.calls.filter((c) => c.method === "security.status").length).toBeGreaterThan(0);
+
+    routeReadable = true;
+    await panel.flush(7000);
+    // 缓过来之后：连续可读够数才导航，且整条链路只导航一次。
+    expect(panel.getReloadCount()).toBe(1);
+  }, 20000);
+
+  it("the language toggle saves, then navigates only after the reload window closes", async () => {
+    const { html, nonce } = await extractPanelHtml();
+    let inReloadWindow = true;
+    const panel = await runPanel({
+      nonce,
+      html,
+      langSwitch: { current: "en", buttons: ["zh"] },
+      respond: (method) => {
+        if (method === "security.metrics") return { metrics: { total: 0 } };
+        if (method === "security.panel.locale.set") return { ok: true, locale: "zh" };
+        return {};
+      },
+      // 窗口里连探针都读不到：宿主自己的 500 没有 ACAO。除了开关本身那一发
+      // （它必须先成功，偏好才谈得上落盘）。
+      rejectWhen: (method) => inReloadWindow && method !== "security.panel.locale.set",
+    });
+
+    panel.clickLang("zh");
+    await panel.flush(1200);
+    // 偏好落盘，但此刻路由还读不到 → 不导航。
+    expect(panel.calls.some((c) => c.method === "security.panel.locale.set")).toBe(true);
+    expect(panel.getReloadCount()).toBe(0);
+    // 按钮保持 disabled（用户不该能再点一次）。
+    expect(panel.langButtons.find((b) => b.lang === "zh")?.disabled).toBe(true);
+
+    inReloadWindow = false;
+    await panel.flush(7000);
+    // 路由恢复可读并连续读到判据成立后才导航，一次且仅一次。
+    expect(panel.getReloadCount()).toBe(1);
+  }, 20000);
 
   // ── 6. POST body cap ────────────────────────────────────────────────
 
@@ -530,6 +623,16 @@ describe("panel auth/RCE hardening", () => {
     html: string;
     respond: (method: string, params: unknown, callIndex: number) => unknown;
     rejectMethods?: string[];
+    /**
+     * Model a browser-level failure — the response came back without CORS
+     * headers (the host's own 500 while it reloads plugin config), so fetch()
+     * rejects with a TypeError and no status ever reaches the panel. Throws a
+     * TypeError, unlike rejectMethods' plain Error, because rpc() keys its
+     * self-heal off err.name === "TypeError".
+     */
+    rejectWhen?: (method: string) => boolean;
+    /** Header language switcher: data-current plus one button per locale. */
+    langSwitch?: { current: string; buttons: string[] };
     /** Force a specific HTTP status for the matching RPC; default 200. */
     statusOverride?: (method: string) => number;
   }) {
@@ -541,6 +644,7 @@ describe("panel auth/RCE hardening", () => {
       return els.get(id)!;
     };
     let reloadCount = 0;
+    const langButtons: Array<{ lang: string; disabled: boolean; textContent: string }> = [];
     const sandbox: Record<string, unknown> = {
       console,
       setTimeout,
@@ -550,6 +654,7 @@ describe("panel auth/RCE hardening", () => {
       fetch: async (_url: string, fetchOpts: { body: string }) => {
         const parsed = JSON.parse(fetchOpts.body) as { method: string; params: unknown };
         calls.push(parsed);
+        if (opts.rejectWhen?.(parsed.method)) throw new TypeError("Failed to fetch");
         if (opts.rejectMethods?.includes(parsed.method)) throw new Error("network down");
         const reply = await opts.respond(parsed.method, parsed.params, calls.length - 1);
         const status = opts.statusOverride?.(parsed.method) ?? 200;
@@ -572,11 +677,42 @@ describe("panel auth/RCE hardening", () => {
       AbortController,
       document: undefined as unknown,
       navigator: {},
-      location: { reload: () => { reloadCount++; } },
+      location: {
+        reload: () => { reloadCount++; },
+        // wireLangButton rewrites the query string before reloading; absent
+        // fields would make location.search.indexOf throw inside the click
+        // handler and mask whatever the test is actually about.
+        search: "",
+        pathname: "/openclaw-security-monitor/panel-tab",
+        hash: "",
+      },
     };
     sandbox.window = sandbox;
     sandbox.top = sandbox;
     sandbox.self = sandbox;
+    // Purpose-built (not makeEl): wireLangSwitch reads data-current off the box
+    // and data-lang off each button, and makeEl's getAttribute always returns
+    // null — with that the switcher silently wires zero buttons.
+    if (opts.langSwitch) {
+      const current = opts.langSwitch.current;
+      for (const lang of opts.langSwitch.buttons) {
+        const btn = {
+          lang,
+          disabled: false,
+          textContent: lang,
+          getAttribute: (a: string) => (a === "data-lang" ? lang : null),
+          addEventListener(type: string, fn: (e: unknown) => void) {
+            if (type === "click") handlers.set(`lang:${lang}`, fn);
+          },
+        };
+        langButtons.push(btn);
+      }
+      getEl("langswitch");
+      els.set("langswitch", {
+        getAttribute: (a: string) => (a === "data-current" ? current : null),
+        querySelectorAll: () => langButtons,
+      } as unknown as ReturnType<typeof makeEl>);
+    }
     sandbox.document = {
       readyState: "complete",
       body: makeEl("body", handlers),
@@ -607,6 +743,8 @@ describe("panel auth/RCE hardening", () => {
       calls,
       flush,
       clickTab,
+      langButtons,
+      clickLang: (lang: string) => handlers.get(`lang:${lang}`)!({ target: {} }),
       getReloadCount: () => reloadCount,
     };
   }

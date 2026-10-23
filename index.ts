@@ -10,17 +10,16 @@
 //
 // The plugin is self-contained: it does NOT import from openclaw/plugin-sdk;
 // SDK types are vendored into src/openclaw-sdk/ so the bundle does not
-// depend on the host's @openclaw/plugin-sdk being installed. This is the
-// "独立运行" requirement from the project brief.
+// depend on the host's @openclaw/plugin-sdk being installed.
 //
-// OpenClaw 集成层次：
-//   - P0 (this file): definePluginEntry + register(api) skeleton, legacy
-//     OpenClawPlugin fallback._w1 = '7a686968'
-//   - P2: typed hook subscriptions via api.on(...) wired through
+// Host integration surface:
+//   - definePluginEntry + register(api) skeleton, with legacy
+//     OpenClawPlugin fallback.
+//   - Typed hook subscriptions via api.on(...) wired through
 //     src/hook-bridge.ts into SecurityMonitorStore. InternalHookEvent
 //     subscriptions (api.registerHook) for the 5 family actions
 //     (command/session/agent/gateway/message) remain opt-in for legacy hosts.
-//   - P3/P4 add registerGatewayMethod / registerHttpRoute inside `register`.
+//   - registerGatewayMethod / registerHttpRoute inside `register`.
 
 import { definePluginEntry, type OpenClawPluginApi } from "./src/openclaw-sdk/plugin-entry.js";
 import { SecurityMonitorStore } from "./src/store.js";
@@ -37,26 +36,50 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import type { InterventionContext } from "./src/intervention/types.js";
 import { obfuscateDeep } from "./src/sensitive-obfuscate.js";
+import { HTML_LANG, PANEL_LOCALE_PREFERENCES, RAW_FALLBACK_PREFIXES, normalizePanelLocalePreference, parseLocale, serializeDictionary, translate, type PanelLocalePreference } from "./src/panel-i18n.js";
 
 export const PLUGIN_ID = "sst-security-control-openclaw";
 export const PLUGIN_NAME = "SST Security Control 安全监控插件";
 
 /**
+ * npm 包名可以带 scope。本插件仓库根的 package.json 是
+ * `@zhanxing/sst-security-control-openclaw`（带 scope），而 build.js 生成的
+ * 安装包会剥掉 scope 写成 `openclaw.plugin.json#name`。两边都应解析成功，
+ * 所以比较时统一去掉 scope 前缀 —— 否则开发树（含 dist/index.js）静默返回
+ * "0.0.0-unknown"，面板副标题和启动日志显示的是一个看起来正常的假版本号。
+ *
+ * 放宽后的匹配面：任意 scope 下的同名包都能命中。实际风险可忽略（剥完 scope
+ * 仍是与 PLUGIN_ID 的精确相等；真能往目录树里塞 package.json 的人，做点别的
+ * 危害大得多），换来的是换 scope / 改包名时不必回来改这里。
+ */
+function unscopedPackageName(name: unknown): string {
+  return typeof name === "string" ? name.replace(/^@[^/]+\//, "") : "";
+}
+
+/**
  * package.json is the single source of truth for the version. Walk up from
  * this module looking for a package.json that names this plugin — the same
  * compiled file lands at repo-root (index.ts), dist/index.js and
- * install/application/index.js, each one level deeper. The zero-dependency
- * CJS hooks carry their own `// openclaw-hook: vX.Y.Z` tag instead;
- * scripts/build.js fails the build when any copy drifts from package.json.
+ * install/application/index.js, each one level deeper. The only copy that
+ * has to be kept in sync by hand is openclaw.plugin.json#version (the host
+ * manifest contract); scripts/build.js fails the build when it drifts.
+ * The zero-dependency CJS hooks carry no version at all — they are
+ * fingerprinted by content hash for upgrade detection (see readHookFingerprint
+ * in src/initialize.ts), so nothing there tracks the package version.
+ *
+ * @param fromUrl 起点模块 URL，默认本模块；测试用临时目录伪造各种安装布局。
  */
-function resolvePluginVersion(): string {
-  let dir = dirname(fileURLToPath(import.meta.url));
+export function resolvePluginVersion(fromUrl: string = import.meta.url): string {
+  let dir = dirname(fileURLToPath(fromUrl));
+  // 4 层足够覆盖已知的三个落点：仓库根第 1 层命中；安装后最深的
+  // package/application/index.js 在第 2 层命中（application/ 下无
+  // package.json）。再多留一层余量给未来的目录嵌套。
   for (let i = 0; i < 4; i++) {
     const candidate = join(dir, "package.json");
     if (existsSync(candidate)) {
       try {
         const pkg = JSON.parse(readFileSync(candidate, "utf8")) as { name?: string; version?: string };
-        if (pkg.name === PLUGIN_ID && typeof pkg.version === "string") {
+        if (unscopedPackageName(pkg.name) === PLUGIN_ID && typeof pkg.version === "string") {
           return pkg.version;
         }
       } catch {
@@ -468,6 +491,33 @@ function register(api: OpenClawPluginApi): void {
     });
   };
 
+  // Read side of the switcher. Both halves are reported, not just the
+  // effective one: "面板是中文" 要能分辨是开关按过、配置键钉死、还是浏览器
+  // 协商出来的 —— 只回一个解析结果的话，排查时看不出该去改哪一处。
+  rpcHandlers["security.panel.locale.get"] = () => ({
+    saved: readPanelStateLocale(),
+    configDefault: readPanelLocalePreference(),
+    effective: readSavedPanelLocale(),
+  });
+
+  // Header language switcher: persist the choice in the plugin's own state
+  // file rather than the host config (see writePanelStateLocale for why), and
+  // hand the panel back the value it actually stored so it can tell "saved"
+  // from "silently coerced to auto".
+  rpcHandlers["security.panel.locale.set"] = (params) => {
+    const requested = ((params ?? {}) as { locale?: unknown }).locale;
+    if (
+      typeof requested !== "string" ||
+      !(PANEL_LOCALE_PREFERENCES as readonly string[]).includes(requested)
+    ) {
+      return {
+        ok: false,
+        error: { message: `locale 必须是 ${PANEL_LOCALE_PREFERENCES.join(" / ")} 之一` },
+      };
+    }
+    return writePanelStateLocale(requested as PanelLocalePreference);
+  };
+
   // Register each handler through `registerGatewayMethod` for WS clients.
   // OpenClaw 9.4 dispatches gateway methods over the gateway WebSocket;
   // the HTTP surface below is for the in-iframe panel.
@@ -483,6 +533,8 @@ function register(api: OpenClawPluginApi): void {
     "security.config.raw": "operator.read",
     "security.config.diff": "operator.write",
     "security.config.save": "operator.write",
+    "security.panel.locale.get": "operator.read",
+    "security.panel.locale.set": "operator.write",
   };
   if (typeof api.registerGatewayMethod === "function") {
     for (const [name, handler] of Object.entries(rpcHandlers)) {
@@ -544,7 +596,7 @@ function register(api: OpenClawPluginApi): void {
     return true;
   };
 
-  // P4: expose NDJSON event log as an HTTP route so the SDK sidecar (or any
+  // Expose NDJSON event log as an HTTP route so the SDK sidecar (or any
   // platform scraper) can tail it without filesystem access.
   // `auth: "gateway"` is required so external clients can fetch via operator
   // scope; "plugin" would gate it to internal plugin calls only.
@@ -770,6 +822,27 @@ function register(api: OpenClawPluginApi): void {
         // page could craft a fetch() against the gateway URL and call e.g.
         // security.config.save cross-origin.
         if (originHeader !== undefined && !sameOrigin && !sandboxNonceOk) {
+          // 沙箱 iframe 的 Origin 恒为 "null"。这个 403 若不带
+          // Access-Control-Allow-Origin，浏览器的 CORS 检查会让 fetch 直接
+          // reject 成 "Failed to fetch"，面板里 rpc() 的 r.status===401/403
+          // 分支（scheduleAuthReload → 自动重载重建会话）永远走不到——用户
+          // 只看到一个点不动、也不报错的控件。给 "null" 补上 CORS 头让面板能
+          // 读到自己的拒绝理由，恢复路径才存在。
+          // 不放宽任何东西：POST 照旧 403，不带 Access-Control-Allow-Credentials
+          // （opaque origin 本来也拿不到 cookie），响应体只有一句固定拒绝文案，
+          // 不含任何请求方的信息。
+          if (originHeader === "null") setSandboxCorsHeaders();
+          // 客户端读不到 body、服务端此前也不记一笔：这个拒绝在两边都无痕，
+          // 线上只能靠猜。留下 origin 与 nonce 状态，下一次复现就有据可查。
+          api.logger.warn(
+            `[panel] cross-origin POST rejected origin=${originHeader} nonce=${
+              typeof req.headers["x-panel-nonce"] === "string"
+                ? isPanelNonceValid(req.headers["x-panel-nonce"] as string)
+                  ? "valid-but-untrusted-origin"
+                  : "invalid"
+                : "missing"
+            } host=${req.headers.host ?? "-"}`,
+          );
           res.statusCode = 403;
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ ok: false, error: { message: "cross-origin POST rejected" } }));
@@ -849,8 +922,24 @@ function register(api: OpenClawPluginApi): void {
       // Mint the per-load panel nonce that sandboxed-iframe RPC POSTs must send
       // back as X-Panel-Nonce (their Origin is opaque, i.e. "null").
       const panelNonce = mintPanelNonce();
+      // Locale is resolved here, on the server, and the dictionary travels with
+      // the HTML. The panel runs in a sandbox="allow-scripts" iframe where
+      // client-side detection is unreliable (navigator.language is not even
+      // present in the vm sandbox tests/panel-auth-rce.test.ts runs this script
+      // in), and the locale has to be frozen at render time anyway: dangerReason
+      // round-trips through an HTML attribute, so switching language mid-session
+      // could not re-render it.
+      const locale = parseLocale(
+        req.url,
+        typeof req.headers["accept-language"] === "string" ? req.headers["accept-language"] : undefined,
+        readSavedPanelLocale()
+      );
+      // Server-side half of the panel's i18n: resolves the strings baked into the
+      // static HTML below (tabs, spinner, QR modal, noscript). The dynamic half
+      // is the `T()` defined at the top of the inlined <script>.
+      const T = (key: string, vars?: Record<string, unknown>) => translate(locale, key, vars);
       res.end(`<!doctype html>
-<html lang="en">
+<html lang="${HTML_LANG[locale]}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -916,6 +1005,18 @@ header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;alig
 header .icon{width:22px;height:22px;display:inline-block;vertical-align:middle}
 h1{font-size:14px;font-weight:600;color:var(--fg)}
 .subtitle{font-size:11px;color:var(--muted);margin-left:auto}
+/* 语言切换控件。语言名用 endonym（EN / 中文），两种界面下形状完全一致。
+   写在 header 里 subtitle 之后，使 injectFullViewButton 的
+   insertBefore(link, subtitle.nextSibling) 恰好把"完整面板"落在它前面，
+   切换控件恒为最右——嵌入与否位置一致，且不必改动那段宿主适配代码。 */
+.langswitch{display:inline-flex;align-items:stretch;border:1px solid var(--border);border-radius:4px;overflow:hidden;font-size:11px;line-height:1.4;margin-left:8px;flex:none}
+.langswitch button{padding:3px 8px;background:var(--subtle-bg);color:var(--muted);border:none;border-left:1px solid var(--border);cursor:pointer;font:inherit;white-space:nowrap}
+.langswitch button:first-child{border-left:none}
+.langswitch button:hover{color:var(--fg)}
+.langswitch button[aria-pressed="true"]{background:var(--card-bg);color:var(--fg);font-weight:600}
+.langswitch button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* 窄屏优先牺牲装饰性的副标题，保住标题与两个控件 */
+@media (max-width:640px){.subtitle{display:none}}
 .tabs{display:flex;border-bottom:1px solid var(--border);padding:0 16px;gap:2px;overflow-x:auto}
 .tab{padding:8px 14px;cursor:pointer;color:var(--muted);font-size:12px;border-bottom:2px solid transparent;white-space:nowrap;background:none;border-top:none;border-left:none;border-right:none}
 .tab:hover{color:var(--fg)}
@@ -1029,19 +1130,23 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <header>
   <img class="icon" src="/openclaw-security-monitor/favicon.ico" alt="SST Security Control">
   <h1>SST Security Control</h1>
-  <span class="subtitle">OpenClaw ${PLUGIN_VERSION} · auto-refresh 30s</span>
+  <span class="subtitle">${T("header.subtitle", { version: PLUGIN_VERSION })}</span>
+  <div class="langswitch" id="langswitch" data-current="${locale}" role="group" aria-label="${T("lang.group")}">
+    <button type="button" data-lang="en"${locale === "en" ? ' aria-pressed="true"' : ' aria-pressed="false"'}>EN</button>
+    <button type="button" data-lang="zh"${locale === "zh" ? ' aria-pressed="true"' : ' aria-pressed="false"'}>中文</button>
+  </div>
 </header>
 <div class="tabs" id="tabs">
-  <button class="tab active" data-tab="metrics">Metrics</button>
-  <button class="tab" data-tab="events">Event Stream</button>
-  <button class="tab" data-tab="blocks">Policy Hits</button>
-  <button class="tab" data-tab="config">Config</button>
+  <button class="tab active" data-tab="metrics">${T("tab.metrics")}</button>
+  <button class="tab" data-tab="events">${T("tab.events")}</button>
+  <button class="tab" data-tab="blocks">${T("tab.blocks")}</button>
+  <button class="tab" data-tab="config">${T("tab.config")}</button>
 </div>
 <!-- 持久状态条（区别于 config.save 流程的瞬时横幅）。面板加载时
      读一次 security.status 渲染，不轮询；仅当用户开过 runtimeHooks 而
      bootstrap 探测到 hook 未加载（静默降级）时显示。 -->
 <div id="hook-status-bar" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin:8px 16px 0;font-size:12px"></div>
-<div class="panel" id="panel"><div class="spinner">Loading...</div></div>
+<div class="panel" id="panel"><div class="spinner">${T("spinner.loading")}</div></div>
 <div class="refresh" id="refresh"></div>
 
 <!-- 公众号二维码预览层。静态放在 #panel 之外，Metrics 页脚
@@ -1049,9 +1154,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <div class="qr-modal" id="qr-modal" style="display:none">
   <div class="qr-overlay"></div>
   <div class="qr-card">
-    <button type="button" class="qr-close" id="qr-close" aria-label="关闭">&#10005;</button>
-    <img src="/openclaw-security-monitor/wechat-mp-qr.jpg" alt="微信公众号二维码">
-    <div class="qr-note">微信扫码，关注公众号</div>
+    <button type="button" class="qr-close" id="qr-close" aria-label="${T("qr.close")}">&#10005;</button>
+    <img src="/openclaw-security-monitor/wechat-mp-qr.jpg" alt="${T("qr.alt")}">
+    <div class="qr-note">${T("qr.note")}</div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -1060,13 +1165,52 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <div class="error" style="margin:16px;font-size:13px">
   <strong>SST Security Control</strong>
   <p style="margin-top:6px">
-    OpenClaw 9.4 Tab iframe 不执行内联脚本，面板无法在此视图渲染。请<a href="/openclaw-security-monitor/panel" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">👉 在新标签页打开完整面板</a>。
+    ${T("noscript.lead")}<a href="/openclaw-security-monitor/panel" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">${T("noscript.link")}</a>${T("noscript.tail")}
   </p>
 </div>
 </noscript>
 
 <script>
 (function() {
+  // ── i18n ──────────────────────────────────────────────────────────
+  // Dictionary for the locale resolved server-side (parseLocale) and inlined
+  // with the HTML. It MUST stay in this same script block: tests/panel-auth-rce
+  // .test.ts pulls the panel out with a non-greedy regex that only ever matches
+  // the first opening script tag, so a second inline dictionary block would be
+  // the one picked up and the panel would never execute under the vm harness.
+  // (Three traps for editors, all paid for already: spelling that regex's
+  // closing tag here emits a real one and truncates the block, because the
+  // backslash-escaped form is itself an escape inside this template literal;
+  // and naming the opening tag in a comment makes tests that count script tags
+  // see a phantom. Describe them, do not spell them.)
+  //
+  // Third trap, and the quietest: a backslash inside a regex literal is an
+  // escape in *this* template too, so what ships is not what you wrote. Two
+  // live examples used to ride it: a word-boundary class strip that shipped as
+  // a plain substring strip, and an escaped-dot key mangle that shipped as
+  // "replace every character". Write split/join / charAt / slice instead — no
+  // regex, no escape, nothing to lose.)
+  var I18N = ${serializeDictionary(locale)};
+  // Mirrors RAW_FALLBACK_PREFIXES in src/panel-i18n.ts; kept in sync by
+  // tests/panel-i18n.test.ts so the two copies cannot drift.
+  var RAW_PREFIXES = ${JSON.stringify(RAW_FALLBACK_PREFIXES)};
+  function T(key, vars) {
+    var s = I18N[key];
+    if (typeof s !== "string" || s === "") {
+      // Unknown enum value (a decision / severity / layer the backend grew
+      // after this build): fall back to the raw identifier so the badge reads
+      // "degrade", never "decision.degrade" and never blank.
+      for (var i = 0; i < RAW_PREFIXES.length; i++) {
+        if (key.indexOf(RAW_PREFIXES[i]) === 0) return key.slice(RAW_PREFIXES[i].length);
+      }
+      return key;
+    }
+    if (vars) {
+      for (var k in vars) s = s.split("{" + k + "}").join(String(vars[k]));
+    }
+    return s;
+  }
+
   // OpenClaw 9.4 hosts this panel inside a sandboxed iframe
   // (sandbox="allow-scripts" - no allow-top-navigation / allow-popups).
   // Earlier code tried to break out via top.location.replace, but the
@@ -1082,8 +1226,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
     link.href = window.location.href;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
-    link.title = '在新标签页打开';
-    link.textContent = '↗ 完整面板';
+    link.title = T("fullView.title");
+    link.textContent = T("fullView.label");
     link.style.cssText = 'margin-left:8px;font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--border);border-radius:4px;padding:3px 8px;background:var(--subtle-bg);white-space:nowrap';
     var subtitle = document.querySelector('header .subtitle');
     if (subtitle) subtitle.parentNode.insertBefore(link, subtitle.nextSibling);
@@ -1092,6 +1236,86 @@ button:disabled{opacity:.5;cursor:not-allowed}
     document.addEventListener('DOMContentLoaded', injectFullViewButton);
   } else {
     injectFullViewButton();
+  }
+
+  // 语言切换控件：把选择写进插件自己的状态文件（panel-state.json）再整页重载。
+  // locale 在服务端渲染时固化（dangerReason 经 HTML 属性往返，中途切语言
+  // 无法重渲染），所以没有前端热切，只能 reload。
+  //
+  // 为什么不是 security.config.save + application.panelLocale：写宿主
+  // openclaw.json 会让 gateway 重载全部插件，实测有 1.7~4.8s 所有插件路由 500，
+  // 加上等路由缓过来的时间，一次语言切换要 8.4 秒才看得到效果。语言是一个
+  // UI 偏好，不值得为它把整个插件栈换一遍血。
+  function wireLangSwitch() {
+    var box = document.getElementById('langswitch');
+    if (!box) return;
+    var current = box.getAttribute('data-current');
+    var buttons = box.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) wireLangButton(buttons[i], current);
+  }
+
+  // 单独一个具名函数、btn 用参数传进来，不用循环变量直接进闭包：var 是函数
+  // 作用域的，直接在循环里 var btn = buttons[i] 会被后一轮覆盖，两个按钮都
+  // 变成只对最后一个生效。
+  //
+  // 另：事件对象的 currentTarget 只在派发期间有效，一进 promise 回调就是 null。
+  // 在 catch 里写 ev.currentTarget.disabled = false 会抛
+  // "Cannot set properties of null"，异常本身又把"按钮恢复可点"这一步吃掉，
+  // 控件就此永久变灰——所以这里全程只认参数传进来的 btn。
+  function wireLangButton(btn, current) {
+    btn.addEventListener('click', function () {
+      var target = btn.getAttribute('data-lang');
+      if (!target || target === current) return;
+      btn.disabled = true;
+      // 立刻说"切换中"，而不是等写入成功才说"已保存"：这次写入不碰宿主配置，
+      // 正常情况下几百毫秒就刷新过去了，文案必须对得上这段时间里页面仍然是
+      // 旧语言这件事——按钮写着"已保存"却半天不换语言，正是被当成坏掉的原因。
+      btn.textContent = T('lang.switching');
+      rpc('security.panel.locale.set', { locale: target })
+        .then(function (res) {
+          // rpc() 把 payload 原样交回来，服务端拒绝是 {ok:false,error} 而不是
+          // 抛异常。不看 ok 的话，一次"字段校验失败"也会被当成保存成功，
+          // 按钮卡在切换中、页面永远不变——又是一个看起来像坏了的失败。
+          if (res && res.ok === false) {
+            throw new Error(String((res.error && res.error.message) || 'panel locale save failed'));
+          }
+          // ?lang= 在 parseLocale 里独占决定权。不从地址栏摘掉它的话，
+          // 偏好虽然写成功了，刷新后仍被 URL 盖回原语言——看起来像按钮坏了。
+          if (window.location.search.indexOf('lang=') !== -1) {
+            // 用 slice 而非 replace(/^\?/)：这段 JS 位于面板 HTML 的
+            // template literal 内，反斜杠会被模板字面量吃掉（\? 会变成 ?，
+            // 发出 /^\?/ 这种非法正则）。同理此处不写任何正则。
+            var search = window.location.search;
+            var rest = (search.charAt(0) === '?' ? search.slice(1) : search)
+              .split('&')
+              .filter(function (kv) { return kv.split('=')[0] !== 'lang'; })
+              .join('&');
+            window.history.replaceState(
+              null, '',
+              window.location.pathname + (rest ? '?' + rest : '') + window.location.hash
+            );
+          }
+          // 偏好已经落盘。minWaitMs 传 0：这次写入没有触碰宿主配置，正常情况
+          // 下路由一直可读，两次探询就导航（~0.5s）。万一宿主连插件自己的状态
+          // 文件也 watch（今天的证据是不会），窗口会在写入 1.7s 后才打开，而
+          // 我们在这之前就已经刷新到新语言了；nonce 随窗口失效时 rpc() 的
+          // 401/403 分支会把面板自己重载一次，一两秒后自愈。
+          reloadAfterGatewaySettles({ minWaitMs: 0 });
+        })
+        .catch(function (err) {
+          // 无论失败成什么样，控件必须回到可点状态：卡成灰色是最糟的失败方式，
+          // 用户既看不到原因也换不回另一种语言。页面整体卡死时 toast 未必
+          // 存在，typeof 兜住，不让恢复动作再抛一次。
+          btn.disabled = false;
+          btn.textContent = target === 'en' ? 'EN' : '中文';
+          if (typeof toast === 'function') toast(String((err && err.message) || err));
+        });
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireLangSwitch);
+  } else {
+    wireLangSwitch();
   }
 
   var RPCS = [
@@ -1119,6 +1343,87 @@ button:disabled{opacity:.5;cursor:not-allowed}
   // 错误信息友好；若用户真的无权限，GET 也会 403，宿主给出明确的错误页。
   // 多个并行 RPC 可能同时命中 401/403，用 authReloadScheduled 闭包变量去重。
   var authReloadScheduled = false;
+  // 本页是否成功过一次 RPC。区分"用着用着过期"与"一开始就过不了"，只有前者
+  // 才值得自动重载（见下面 rpc() 的 TypeError 分支）。
+  var rpcEverOk = false;
+
+  // ── 写宿主配置 → 宿主重载窗口 ──────────────────────────────────────
+  //
+  // security.config.save 写的是**宿主**的 openclaw.json。宿主随后重载插件
+  // 配置，那个窗口里所有插件路由都由宿主自己回 500（text/plain、**不带**
+  // CORS 头）——本插件的 handler 根本没被调用，所以拿不到 ACAO。浏览器把
+  // 读不到响应的失败一律报成 TypeError("Failed to fetch")，而正落在这个窗口
+  // 里的 window.location.reload() 会把操作者直接甩到一张裸 500 页上：用户点
+  // 语言开关 → 控制台一串 CORS 报错 → GET panel-tab 500，面板从此是死的。
+  //
+  // 实测（2026-10-23，本机 tunnel 到远端 gateway，真实 Chrome 点一遍）：
+  //   · 不写配置：连续 44 次预检全部 204 + ACAO null，零异常；
+  //   · 写一次配置：保存 200 后约 2s 起所有路由 500（无 ACAO，读不到），约 4.5s
+  //     结束；窗口过后插件被重新实例化，本次加载铸的 panel nonce 失效，此后
+  //     每个 RPC 都拿到**可读**的 403 —— 本次加载只能靠重新渲染（reload）复活。
+  // 也就是说"能读到响应" = 宿主已经缓过来，"读不到" = 还在窗口里。
+  //
+  // 判据因此是"**连续可读**"，不是"过了多久"：窗口是在写入之后才打开的，一
+  // 上来就连探到 200 是"还没坏"的假信号。可读连续 RELOAD_SETTLE_READABLE_STREAK
+  // 次即视为缓过来；minWaitMs 只用来在"一直没坏"的情况下替假信号兜底——写宿主
+  // 配置时留 3s（窗口在 1.7~2.5s 后才打开），不写宿主配置时留 0（见
+  // wireLangButton：语言偏好写的是插件自己的状态文件，宿主不必重载）。
+  //
+  // 这三个值曾经是 STREAK 3.5s / MAX 8s，而窗口本身就要 1.7~4.5s：streak 永远
+  // 攒不满，实测每次切换都走 8s 上限的兜底分支，按钮灰着、文案"已保存"卡满
+  // 8.4 秒才刷新——用户看到的就是"点了没反应"。
+  var RELOAD_SETTLE_READABLE_STREAK = 2;
+  var RELOAD_SETTLE_POLL_MS = 250;
+  var RELOAD_SETTLE_MAX_MS = 12000;
+  // 单次探询自带超时。fetch 不返回（隧道挂住、宿主收下连接不吐响应）时，
+  // 上限判断在 .then 里，永远轮不到 —— 页面就此钉在"切换中"再也不会导航。
+  var RELOAD_SETTLE_PROBE_TIMEOUT_MS = 3000;
+
+  function reloadNow() {
+    try { window.location.reload(); }
+    catch (e) { /* 极端沙箱限制下 reload 被拒，静默降级 */ }
+  }
+
+  // 探一次路由：resolve = 宿主给出了可读响应（200，或 nonce 失效的可读 403），
+  // reject = 还在 500 窗口里 / 网络不通。刻意不走 rpc()：它把可读的 401/403
+  // 转成永不 resolve 的 promise 并自己再排一次 reload，这里要的是状态本身。
+  function probeRouteReadable() {
+    var controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, RELOAD_SETTLE_PROBE_TIMEOUT_MS) : null;
+    return fetch(BASE + "/openclaw-security-monitor/panel", {
+      method: "POST",
+      headers: {"Content-Type":"application/json","X-Panel-Nonce":PANEL_NONCE},
+      credentials: "same-origin",
+      body: JSON.stringify({ method: "security.status", params: {} }),
+      signal: controller ? controller.signal : undefined
+    }).then(function () { return true; }, function () { return false; })
+      .then(function (readable) { if (timer) clearTimeout(timer); return readable; });
+  }
+
+  // 等宿主缓过来再导航。opts.minWaitMs = 在路由一直可读时至少先观察多久；
+  // opts.beforeReload 返回 false 时放弃导航（Config 页有未保存改动时用）。
+  // 上限 RELOAD_SETTLE_MAX_MS 后无条件导航：宁可让用户看到宿主的错误页，也
+  // 不要把面板永远钉在坏状态里。
+  function reloadAfterGatewaySettles(opts) {
+    var beforeReload = opts && opts.beforeReload;
+    var minWaitMs = (opts && opts.minWaitMs) || 0;
+    var started = Date.now();
+    var readableStreak = 0;
+    (function attempt() {
+      probeRouteReadable().then(function (readable) {
+        var now = Date.now();
+        readableStreak = readable ? readableStreak + 1 : 0;
+        var settled = readableStreak >= RELOAD_SETTLE_READABLE_STREAK && (now - started) >= minWaitMs;
+        if (!settled && (now - started) < RELOAD_SETTLE_MAX_MS) {
+          setTimeout(attempt, RELOAD_SETTLE_POLL_MS);
+          return;
+        }
+        if (beforeReload && beforeReload() === false) return;
+        reloadNow();
+      });
+    })();
+  }
+
   function scheduleAuthReload() {
     if (authReloadScheduled) return;
     authReloadScheduled = true;
@@ -1126,9 +1431,34 @@ button:disabled{opacity:.5;cursor:not-allowed}
     // 避免连续两次刷新请求重叠。sandboxed iframe 内 window.location.reload
     // 仍允许（沙箱不影响 reload 自身 URL）。
     setTimeout(function() {
-      try { window.location.reload(); }
-      catch (e) { /* 极端沙箱限制下 reload 被拒，静默降级 */ }
+      // Config 页有未保存改动时不重载：刷新会把用户正在填的表单冲掉，而
+      // "⚠ Failed to fetch" 已经留在页面上说明了原因，用户自己决定何时刷。
+      if (__configDirty) {
+        authReloadScheduled = false;
+        return;
+      }
+      reloadNow();
     }, 50);
+  }
+
+  // 读不到响应的失败（宿主 500 窗口 / 隧道抖动）走"缓过来再重载"：可读的
+  // 401/403 说明路由在应答，直接重载即可；读不到的恰恰是宿主在换血，此刻
+  // 重载正好撞上去。
+  function scheduleAuthReloadWhenSettled() {
+    if (authReloadScheduled) return;
+    authReloadScheduled = true;
+    reloadAfterGatewaySettles({
+      // 这条路径的触发源是读不到响应（宿主正在换血），不是我们刚写完配置，
+      // 没有"窗口还没打开"的假信号要躲，探到可读就走。
+      minWaitMs: 0,
+      beforeReload: function () {
+        if (__configDirty) {
+          authReloadScheduled = false;
+          return false;
+        }
+        return true;
+      }
+    });
   }
 
   function rpc(name, params) {
@@ -1144,6 +1474,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       body: JSON.stringify({ method: name, params: params || {} }),
       signal: controller ? controller.signal : undefined
     }).then(function(r) {
+      if (r.status === 200) rpcEverOk = true;
       if (r.status === 401 || r.status === 403) {
         scheduleAuthReload();
         // 返回永不 resolve 的 Promise：reload 50ms 后页面已丢弃，不再有
@@ -1157,6 +1488,30 @@ button:disabled{opacity:.5;cursor:not-allowed}
       });
     }).catch(function(err) {
       if (err && err.name === "AbortError") throw new Error("timeout after 8s");
+      // sandboxed iframe 里 Origin 恒为 "null"，宿主/本插件的 401/403 都是
+      // 不带 Access-Control-Allow-Origin 发出的，浏览器的 CORS 检查会让 fetch
+      // 直接 reject 成 TypeError —— r 从来没出现过，上面那个 status 分支在这条
+      // 路径上**根本走不到**。所以"认证过期 → 自动重载"在这里曾经是死代码，
+      // 表现就是每次自动刷新都把面板内容换成 "⚠ Failed to fetch" 且永不恢复，
+      // 只能手动 F5。按 TypeError（而非状态码）识别，才能真正自愈。
+      if (err && err.name === "TypeError" && rpcEverOk) {
+        // rpcEverOk 是关键判据：它区分了"会话从能用变成不能用"（长挂后宿主
+        // session 过期，重载能换到新 grant，值得自愈）和"这次加载就没能过"
+        // （授权本来就发不下来 / 网断了，重载一万次也还是不通）。后者若也
+        // 重载，就是"每 30s 刷新一次、永远停在加载中"的死循环——而本页里
+        // authReloadScheduled 去重只能管住本页，管不住新的一页。
+        // 注意这个标志**不能**做成跨页计数：sandboxed iframe 里 localStorage
+        // 和 sessionStorage 都读不了（宿主自己的 bundle 就栽在这上面）。
+        //
+        // 只补"要重载"的信号，错误继续抛出去。**不能**像上面 401/403 分支那样
+        // 返回一个永不 resolve 的 Promise：那会让所有下游 .catch 全部失效，
+        // 语言切换按钮就停在 disabled 上再也点不动——恰好在重载没发生
+        // （Config 有未保存改动）时最致命。抛出后页面很快就会被换掉。
+        //
+        // 读不到响应 = 宿主 500 窗口（写宿主配置之后）或隧道抖动。此刻立刻
+        // reload 会正好落进窗口、把用户甩到裸 500 页，所以改成"缓过来再重载"。
+        scheduleAuthReloadWhenSettled();
+      }
       throw err;
     }).finally(function() {
       if (timeoutId) clearTimeout(timeoutId);
@@ -1187,9 +1542,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
     alert: "M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.076.827a.25.25 0 0 0-.353 0L1.468 12.857a.25.25 0 0 0 .176.393h12.712a.25.25 0 0 0 .176-.393L8.357 1.874ZM8 5a.75.75 0 0 1 .75.75v2.5a.75.75 0 0 1-1.5 0v-2.5A.75.75 0 0 1 8 5Zm0 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"
   };
   var COPY_ICON_LABELS = {
-    copy:  "Copy JSON",
-    check: "Copied to clipboard.",
-    alert: "Copy failed."
+    copy:  T("copy.idle"),
+    check: T("copy.ok"),
+    alert: T("copy.fail")
   };
   function makeCopyButton() {
     var path = COPY_ICON_PATHS.copy, label = COPY_ICON_LABELS.copy;
@@ -1284,12 +1639,51 @@ button:disabled{opacity:.5;cursor:not-allowed}
   // （含 policyId 的复核指引：联系管理员复核 / 调整策略）；无 hint 时给缺省说明。
   function appealBadge(intervention) {
     if (!intervention || intervention.appealable !== true) return "";
-    var hint = intervention.remediation_hint || "该阻断可联系管理员复核并调整策略（见事件 intervention.remediation_hint）";
+    var hint = intervention.remediation_hint || T("appeal.defaultHint");
     return ' <span class="appeal-tag" title="'+escAttr(hint)+'">appealable</span>';
   }
 
   function error(e) {
     return '<div class="error">⚠ '+esc(e && e.message ? e.message : e)+'</div>';
+  }
+
+  // ── 两视图共用 chrome ──────────────────────────────────────────────
+  // 分页页脚 / 事件详情 JSON 面板 / 展开行暂停横幅，这三段在 Policy Hits 与
+  // Event Stream 各有一份字面相同的实现（连 id 后缀都只差 events-/blocks-）。
+  // 文案改版时两处不同步就会漂移，故集中到此处，各视图只传差异参数。
+
+  /**
+   * 分页页脚：计数 + Load more / end of results。
+   * total 是判定"还有下一页"的数字，不能传带符号的展示值——
+   * "200+" 转成 NaN 会让 shown < total 恒假，永远显示 end of results。
+   * overflowMark 追加到计数文案
+   * （events 用 "+" 表示日志已被内存上限截断，见 truncatedBanner）；
+   * prefixHtml 为前置横幅。
+   */
+  function pagerFooter(btnId, shown, total, unit, prefixHtml, overflowMark) {
+    var more = shown < total
+      ? '<button id="'+escAttr(btnId)+'">'+esc(T("pager.loadMore"))+'</button>'
+      : '<span class="meta">'+esc(T("pager.endOfResults"))+'</span>';
+    // unit arrives as a wire identifier ("events" / "hits"); resolve it so
+    // the count reads "20 events" / "20 条" rather than an untranslated noun.
+    return (prefixHtml || '') +
+      '<span class="meta">'+esc(T("pager.showing", { shown: shown, total: total, mark: overflowMark || "", unit: T("pager.unit."+unit) }))+'</span> '+more;
+  }
+
+  /** 事件详情行的 JSON 面板：标题 + 复制按钮 + 预格式化正文。 */
+  function jsonPaneHtml(rawJson) {
+    return '<div class="json-pane">'+
+      '<div class="json-pane-header">'+
+        '<div class="json-pane-title">'+esc(T("jsonPane.title"))+'</div>'+
+        makeCopyButton()+
+      '</div>'+
+      '<pre class="json-view">'+rawJson+'</pre>'+
+    '</div>';
+  }
+
+  /** 详情行展开时的自动刷新暂停横幅。样式与 Config 的 #config-dirty-bar 逐像素一致。 */
+  function detailPausedBanner() {
+    return '<div id="detail-paused-banner" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:12px">'+esc(T("detail.paused"))+'</div>';
   }
 
   // Clipboard helpers for the "访问官网" fallback. Sandboxed iframes
@@ -1330,41 +1724,22 @@ button:disabled{opacity:.5;cursor:not-allowed}
   // 因此只在 Metrics 页签出现，切走页签自然消失；错误/空态分支同样输出。
   function renderMetrics(d) {
     var footer = '<div class="metrics-footer">'+
-      '<a id="open-website" href="'+escAttr(WEBSITE_URL)+'" target="_blank" rel="noopener noreferrer">访问官网</a>'+
-      '<a id="show-qr" href="#">关注公众号</a>'+
+      '<a id="open-website" href="'+escAttr(WEBSITE_URL)+'" target="_blank" rel="noopener noreferrer">'+esc(T("footer.visitSite"))+'</a>'+
+      '<a id="show-qr" href="#">'+esc(T("footer.followWeChat"))+'</a>'+
       '</div>';
-    if (d == null) return '<div class="error">No data</div>'+footer;
+    if (d == null) return '<div class="error">'+esc(T("metric.noData"))+'</div>'+footer;
     var m = d.metrics || d;
     var blocks = m.blocks || m.blockCount || 0;
     var threats = m.threats || 0;
     var total = m.total || m.eventCount || 0;
     var last24 = m.last24h || 0;
     var byLayer = m.byLayer || {};
-    // 面板分级消费要求 severity × decision 双重维度。后端
-    // MetricsResult 同时返回 bySeverity 与 byDecision（O(1) 聚合），此处
-    // 仅做展示 + 排序（critical → low + unknown 兜底）。
-    var bySeverity = m.bySeverity || {};
-    var byDecision = m.byDecision || {};
+    // bySeverity / byDecision 后端一直在传（O(1) 聚合），但本视图只渲染
+    // 指标卡 + By Layer：分级卡片此前算了却从未拼进返回值。已确认不恢复，
+    // 以后要加请直接重建卡片，不要重新引入"算了不画"的死变量。
     var layerRows = Object.keys(byLayer).map(function(k) {
-      return '<div class="meta">'+esc(k)+': <span class="hl">'+esc(byLayer[k])+'</span></div>';
+      return '<div class="meta">'+esc(T("layer."+k))+': <span class="hl">'+esc(byLayer[k])+'</span></div>';
     }).join("");
-    // severity 固定顺序，避免聚合键迭代顺序漂移。
-    var severityOrder = ["critical", "extreme", "high", "medium", "low"];
-    var severityRows = severityOrder
-      .filter(function(k) { return (bySeverity[k] || 0) > 0; })
-      .map(function(k) {
-        return '<div class="meta">'+badge(severityBadgeClass(k), k)+' <span class="hl">'+esc(bySeverity[k])+'</span></div>';
-      }).join("");
-    if ((bySeverity.unknown || 0) > 0) {
-      severityRows += '<div class="meta"><span class="muted">unknown</span> <span class="hl">'+esc(bySeverity.unknown)+'</span></div>';
-    }
-    // decision 排序按阈值降序（最严重在前），稳定顺序——后端 byDecision 已含全集。
-    var decisionOrder = ["block", "warn", "modify", "audit", "substitute", "context_adjust", "degrade"];
-    var decisionRows = decisionOrder
-      .filter(function(k) { return (byDecision[k] || 0) > 0; })
-      .map(function(k) {
-        return '<div class="meta">'+badge(decisionBadgeClass(k), k)+' <span class="hl">'+esc(byDecision[k])+'</span></div>';
-      }).join("");
     // cell(value, label, kind): emit a metric tile. value === 0 gets the muted
     // .zero modifier so an idle counter doesn't visually dominate. kind ("alert"/"warn")
     // only fires when value > 0, so 0-block / 0-modify tiles aren't red/yellow.
@@ -1375,11 +1750,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
       return '<div class="'+cls+'"><div class="val">'+esc(value)+'</div><div class="lbl">'+esc(label)+'</div></div>';
     }
     return '<div class="metrics">'+
-      cell(total, "Total events")+
-      cell(last24, "Last 24h")+
-      cell(blocks, "Blocked", "alert")+
-      cell(threats, "Threat Events", "warn")+
-      (layerRows ? '<div class="card" style="grid-column:1/-1"><h2>By Layer</h2>'+layerRows+'</div>' : '')+
+      cell(total, T("metric.totalEvents"))+
+      cell(last24, T("metric.last24h"))+
+      cell(blocks, T("metric.blocked"), "alert")+
+      cell(threats, T("metric.threatEvents"), "warn")+
+      (layerRows ? '<div class="card" style="grid-column:1/-1"><h2>'+esc(T("metric.byLayer"))+'</h2>'+layerRows+'</div>' : '')+
       '</div>'+footer;
   }
 
@@ -1392,7 +1767,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
   // append-only 路径与 Policy Hits 一致：避免重复 <thead>、data-event-idx
   // 撞 id 导致 click 委托 selector 命中错行。
   function renderEventsTable() {
-    return '<table><thead><tr><th>Time</th><th>Type</th><th>Layer</th><th>Severity</th><th>Agent</th><th>Tool/Session</th><th>Status</th></tr></thead><tbody id="events-body"></tbody></table>';
+    return '<table><thead><tr><th>'+esc(T("th.time"))+'</th><th>'+esc(T("th.type"))+'</th><th>'+esc(T("th.layer"))+
+      '</th><th>'+esc(T("th.severity"))+'</th><th>'+esc(T("th.agent"))+'</th><th>'+esc(T("th.toolSession"))+
+      '</th><th>'+esc(T("th.status"))+'</th></tr></thead><tbody id="events-body"></tbody></table>';
   }
 
   function renderEventsRows(rows, startIdx) {
@@ -1404,7 +1781,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       var decision = intervention ? intervention.decision : null;
       // 全决策类型徽标（原实现只区分 block/allow，warn/modify 等
       // 一律显示 allow 绿色，语义误导）；block 且 appealable 时追加弱化标注。
-      var decisionBadge = decision ? badge(decisionBadgeClass(decision), decision) : "";
+      var decisionBadge = decision ? badge(decisionBadgeClass(decision), T("decision."+decision)) : "";
       if (decision === "block") decisionBadge += appealBadge(intervention);
       var eventType = r.event_type || r.eventType || "";
       // 采集端 canonical 字段是 cmdline（command_line 已废弃），缺 tool_name 时
@@ -1415,25 +1792,19 @@ button:disabled{opacity:.5;cursor:not-allowed}
       // Severity 列。无 severity 的事件（罕见——cgroup_anomaly 已有，非干预类
       // 事件无 severity）显示 muted —，避免空单元格。
       var sev = resolveEventSeverityClient(r);
-      var sevCell = sev ? badge(severityBadgeClass(sev), sev) : '<span class="muted">—</span>';
+      var sevCell = sev ? badge(severityBadgeClass(sev), T("sev."+sev)) : '<span class="muted">—</span>';
       var rawJson = esc(JSON.stringify(r, null, 2));
       html += '<tr class="event-row" data-event-idx="'+idx+'">'+
         '<td class="ts">'+ts(r.ts)+'</td>'+
         '<td><span class="tool">'+esc(eventType)+'</span></td>'+
-        '<td>'+esc(r.layer || "")+'</td>'+
+        '<td>'+esc(r.layer ? T("layer."+r.layer) : "")+'</td>'+
         '<td>'+sevCell+'</td>'+
         '<td>'+esc(r.agent_id || r.agentId || "—")+'</td>'+
         '<td><span class="tool">'+toolName+'</span><div class="meta">'+session+'</div></td>'+
         '<td>'+decisionBadge+'</td>'+
         '</tr>'+
         '<tr class="event-detail" data-detail-idx="'+idx+'"><td colspan="7">'+
-          '<div class="json-pane">'+
-            '<div class="json-pane-header">'+
-              '<div class="json-pane-title">Event JSON</div>'+
-              makeCopyButton()+
-            '</div>'+
-            '<pre class="json-view">'+rawJson+'</pre>'+
-          '</div>'+
+          jsonPaneHtml(rawJson)+
         '</td></tr>';
     });
     return html;
@@ -1441,9 +1812,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
   // ── Policy Hits state + paging ────────────────────────────────────
   function buildBlocksShell() {
-    var pauseBanner = '<div id="detail-paused-banner" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:12px">⏸ 有展开的事件详情，自动刷新已暂停（收起详情行后恢复）</div>';
-    return pauseBanner+
-      '<div id="blocks-table"><div class="spinner">Loading...</div></div>'+
+    return detailPausedBanner()+
+      '<div id="blocks-table"><div class="spinner">'+esc(T("spinner.loading"))+'</div></div>'+
       '<div id="blocks-footer"></div>';
   }
 
@@ -1468,18 +1838,19 @@ button:disabled{opacity:.5;cursor:not-allowed}
         // 计数从 byDecision 读取：all = 全 decision 之和；其余取该 decision 计数（无则 0）。
         var totalCount = byDecision ? Object.values(byDecision).reduce(function(a, b) { return a + b; }, 0) : 0;
         var capsuleDefs = [
-          { key: "all", label: "all", count: totalCount, cls: "allow" },
-          { key: "block", label: "block", count: (byDecision && byDecision.block) || 0, cls: "block" },
-          { key: "warn", label: "warn", count: (byDecision && byDecision.warn) || 0, cls: "warn" },
-          { key: "modify", label: "modify", count: (byDecision && byDecision.modify) || 0, cls: "change" },
-          { key: "audit", label: "audit", count: (byDecision && byDecision.audit) || 0, cls: "warn" },
+          { key: "all", label: T("capsule.all"), count: totalCount, cls: "allow" },
+          { key: "block", label: T("capsule.block"), count: (byDecision && byDecision.block) || 0, cls: "block" },
+          { key: "warn", label: T("capsule.warn"), count: (byDecision && byDecision.warn) || 0, cls: "warn" },
+          { key: "modify", label: T("capsule.modify"), count: (byDecision && byDecision.modify) || 0, cls: "change" },
+          { key: "audit", label: T("capsule.audit"), count: (byDecision && byDecision.audit) || 0, cls: "warn" },
         ];
         var capsuleHtml = capsuleDefs.map(function(c) {
           var active = blocksState.filter === c.key ? " active" : "";
           return '<span class="capsule '+esc(c.cls)+active+'" data-capsule="'+esc(c.key)+'">'+esc(c.label)+' <span class="count">'+esc(c.count)+'</span></span>';
         }).join("");
         tableArea.innerHTML = '<div class="capsule-row">'+capsuleHtml+'</div>'+
-          '<table><thead><tr><th>Time</th><th>Tool</th><th>Decision</th><th>Policy</th><th>Reason</th></tr></thead><tbody id="blocks-body"></tbody></table>';
+          '<table><thead><tr><th>'+esc(T("th.time"))+'</th><th>'+esc(T("th.tool"))+'</th><th>'+esc(T("th.decision"))+
+          '</th><th>'+esc(T("th.policy"))+'</th><th>'+esc(T("th.reason"))+'</th></tr></thead><tbody id="blocks-body"></tbody></table>';
         // 胶囊点击事件委托：仅切本地 filter，重渲染当前已加载 hits，不发新 RPC。
         var capsuleEls = tableArea.querySelectorAll("[data-capsule]");
         for (var ci = 0; ci < capsuleEls.length; ci++) {
@@ -1503,11 +1874,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       renderBlocksBody();
       blocksState.offset += rows.length;
       var shown = blocksState.offset;
-      var total = blocksState.total;
-      var more = blocksState.offset < blocksState.total
-        ? '<button id="blocks-more">Load more</button>'
-        : '<span class="meta">end of results</span>';
-      footerArea.innerHTML = '<span class="meta">Showing '+shown+' of '+total+' hits</span> '+more;
+      footerArea.innerHTML = pagerFooter("blocks-more", shown, blocksState.total, "hits");
       var moreBtn = document.getElementById("blocks-more");
       if (moreBtn) moreBtn.onclick = function() { loadBlocks(false); };
     }).catch(function(err) {
@@ -1537,7 +1904,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       var reasonText = intervention && intervention.block_reason
         ? intervention.block_reason
         : (intervention && intervention.reason ? intervention.reason : "—");
-      var decisionBadge = badge(decisionBadgeClass(decision), decision);
+      var decisionBadge = badge(decisionBadgeClass(decision), T("decision."+decision));
       if (decision === "block") decisionBadge += appealBadge(intervention);
       var rawJson = esc(JSON.stringify(r, null, 2));
       var tr = document.createElement("tr");
@@ -1552,64 +1919,16 @@ button:disabled{opacity:.5;cursor:not-allowed}
       var detailTr = document.createElement("tr");
       detailTr.className = "event-detail";
       detailTr.dataset.detailIdx = idx;
-      detailTr.innerHTML = '<td colspan="5">'+
-        '<div class="json-pane">'+
-          '<div class="json-pane-header">'+
-            '<div class="json-pane-title">Event JSON</div>'+
-            makeCopyButton()+
-          '</div>'+
-          '<pre class="json-view">'+rawJson+'</pre>'+
-        '</div>'+
-      '</td>';
+      detailTr.innerHTML = '<td colspan="5">'+jsonPaneHtml(rawJson)+'</td>';
       tbody.appendChild(tr);
       tbody.appendChild(detailTr);
     });
   }
 
-  function renderBlocks(d) {
-    var rows = Array.isArray(d) ? d : (d && d.hits ? d.hits : []);
-    var byDecision = (d && d.byDecision) ? d.byDecision : null;
-    if (!rows.length && (!byDecision || !Object.keys(byDecision).length)) return '<div class="empty">No policy hits yet</div>';
-    var summary = "";
-    if (byDecision && Object.keys(byDecision).length) {
-      summary = '<div class="toolbar" style="margin-bottom:8px">'+
-        Object.keys(byDecision).map(function(k) {
-          return badge(decisionBadgeClass(k), k+" "+byDecision[k]);
-        }).join(" ")+
-        '</div>';
-    }
-    var html = summary+'<table><thead><tr><th>Time</th><th>Tool</th><th>Decision</th><th>Policy</th><th>Reason</th></tr></thead><tbody>';
-    rows.forEach(function(r, idx) {
-      var intervention = r.intervention;
-      var decision = intervention && intervention.decision ? intervention.decision : (r.decision || "—");
-      var policyId = intervention && intervention.policy_id ? intervention.policy_id : (r.policy_id || "—");
-      // Reason 列双源 fallback，与 renderBlocksBody 保持一致。
-      var reasonText = intervention && intervention.block_reason
-        ? intervention.block_reason
-        : (intervention && intervention.reason ? intervention.reason : "—");
-      var decisionBadge = badge(decisionBadgeClass(decision), decision);
-      if (decision === "block") decisionBadge += appealBadge(intervention);
-      var rawJson = esc(JSON.stringify(r, null, 2));
-      html += '<tr class="event-row" data-event-idx="'+idx+'">'+
-        '<td class="ts">'+ts(r.ts)+'</td>'+
-        '<td><span class="tool">'+esc(r.tool_name || r.toolName || "—")+'</span></td>'+
-        '<td>'+decisionBadge+'</td>'+
-        '<td><span class="tool">'+esc(policyId)+'</span></td>'+
-        '<td style="max-width:300px;word-break:break-word">'+esc(reasonText)+'</td>'+
-        '</tr>'+
-        '<tr class="event-detail" data-detail-idx="'+idx+'"><td colspan="5">'+
-          '<div class="json-pane">'+
-            '<div class="json-pane-header">'+
-              '<div class="json-pane-title">Event JSON</div>'+
-              makeCopyButton()+
-            '</div>'+
-            '<pre class="json-view">'+rawJson+'</pre>'+
-          '</div>'+
-        '</td></tr>';
-    });
-    html += '</tbody></table>';
-    return html;
-  }
+  // renderBlocks() 曾与 renderBlocksBody() 并存：整表重渲版本已无调用方
+  // （Policy Hits 走「骨架 + tbody append」路径，见 loadBlocks）。它重复了
+  // 表头与详情行 JSON 面板两处字面量，并独自持有一份分页页脚文案——三份
+  // 副本在改版时会各自漂移。已删除；需要重渲 tbody 请用 renderBlocksBody()。
 
   // ── Config editor (form-based) ─────────────────────────────────────
   // Group keys by top-level namespace, render flat rows. The host owns the
@@ -1623,7 +1942,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
   // a one-time confirmToken (client-declared confirmDanger alone no longer
   // executes dangerous patches).
   function renderConfig(d) {
-    if (d == null) return '<div class="error">No config</div>';
+    if (d == null) return '<div class="error">'+esc(T("config.noConfig"))+'</div>';
     var config = (d && d.config) || {};
     var schema = (d && d.schema) || [];
 
@@ -1638,15 +1957,10 @@ button:disabled{opacity:.5;cursor:not-allowed}
       grouped[f.section].push(f);
     });
 
-    var sectionTitles = {
-      collector: "Collector",
-      application: "Application",
-      network: "Network",
-      system: "System",
-      intervention: "Intervention",
-      assetMonitor: "Asset Monitor",
-      bootstrap: "Bootstrap",
-    };
+    // CONFIG_SCHEMA carries dictionary KEYS (cfg.label.* / cfg.help.* / cfg.danger.*),
+    // not prose, so a locale switch can never leave a stale Chinese string behind
+    // in the schema itself. Absent key → empty string (optional fields).
+    function cfgText(key) { return key ? T(key) : ""; }
 
     function readNested(obj, dotKey) {
       var parts = dotKey.split(".");
@@ -1660,7 +1974,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
     function inputHtml(f, sectionVal) {
       var v = readNested(sectionVal, f.key);
-      var id = 'cfg-' + f.section + '-' + f.key.replace(/\./g, '-');
+      // 用 split/join 而不是 replace(/\./g, '-')：这段 JS 在面板 HTML 的
+      // template literal 里，正则里的反斜杠会被模板字面量吃掉，产出的其实是
+      // /./g ——把键名里**每一个字符**都换成短横。长度相同的两个配置键
+      // （"procfs.pythonPath" 与任何同长度的键）因此会拿到同一个 id。
+      var id = 'cfg-' + f.section + '-' + f.key.split('.').join('-');
 
       // Resolve dependsOn: when the dependency is unmet, render the input
       // disabled (no user edits, no collectPatch) and show an inline hint
@@ -1680,26 +1998,27 @@ button:disabled{opacity:.5;cursor:not-allowed}
         }
         if (unmetDeps.length > 0) {
           disabledAttr = ' disabled';
-          depHtml = '<div class="meta" style="color:var(--muted);margin-top:2px">ⓘ 需先启用 '+
-            unmetDeps.map(function(d) { return '<code>'+esc(d.section+'.'+d.key)+'</code>'; }).join(' 和 ')+
-            '</div>';
+          depHtml = '<div class="meta" style="color:var(--muted);margin-top:2px">'+esc(T("config.depHint", {
+            deps: unmetDeps.map(function(d) { return '<code>'+esc(d.section+'.'+d.key)+'</code>'; }).join(esc(T("config.depJoiner")))
+          }))+'</div>';
         }
       }
 
-      var dangerAttr = f.danger ? ' data-danger="1" data-danger-reason="'+escAttr(f.dangerReason || '')+'"' : '';
-      var dangerMark = f.danger ? ' <span style="color:var(--danger);font-size:10px">⚠ danger</span>' : '';
-      var helpHtml = f.danger && f.dangerReason
-        ? '<div class="meta" style="color:var(--danger);margin-top:2px">⚠ '+esc(f.dangerReason)+'</div>'
+      var dangerText = cfgText(f.dangerReason);
+      var dangerAttr = f.danger ? ' data-danger="1" data-danger-reason="'+escAttr(dangerText)+'"' : '';
+      var dangerMark = f.danger ? ' <span style="color:var(--danger);font-size:10px">'+esc(T("config.dangerMark"))+'</span>' : '';
+      var helpHtml = f.danger && dangerText
+        ? '<div class="meta" style="color:var(--danger);margin-top:2px">⚠ '+esc(dangerText)+'</div>'
         : '';
       var helpBlockHtml = f.help
-        ? '<div class="meta" style="color:var(--warn);margin-top:6px;white-space:pre-wrap;font-size:11px;line-height:1.5">'+esc(f.help)+'</div>'
+        ? '<div class="meta" style="color:var(--warn);margin-top:6px;white-space:pre-wrap;font-size:11px;line-height:1.5">'+esc(cfgText(f.help))+'</div>'
         : '';
       var input = '';
       if (f.type === "bool") {
         var checked = v === true ? ' checked' : '';
         input = '<label style="display:inline-flex;align-items:center;gap:6px;cursor:'+(disabledAttr ? 'not-allowed' : 'pointer')+';line-height:1.6;opacity:'+(disabledAttr ? '0.5' : '1')+'">'+
           '<input type="checkbox" id="'+id+'" data-section="'+escAttr(f.section)+'" data-key="'+escAttr(f.key)+'" data-type="bool"'+checked+disabledAttr+dangerAttr+' style="margin:0;flex:none"/>'+
-          '<span class="'+(v?'ok':'warn')+'">'+(v?'on':'off')+'</span></label>';
+          '<span class="'+(v?'ok':'warn')+'">'+(v?esc(T("config.on")):esc(T("config.off")))+'</span></label>';
       } else if (f.type === "number") {
         var numVal = (typeof v === "number") ? v : '';
         var minAttr = f.min !== undefined ? ' min="'+f.min+'"' : '';
@@ -1716,7 +2035,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         input = '<input type="text" id="'+id+'" data-section="'+escAttr(f.section)+'" data-key="'+escAttr(f.key)+'" data-type="string" value="'+escAttr(sVal)+'"'+disabledAttr+' style="width:280px;font-family:monospace'+ (disabledAttr ? ';opacity:0.5' : '') +'"'+dangerAttr+'/>';
       }
       return '<div style="display:flex;align-items:flex-start;gap:12px;padding:6px 0;border-bottom:1px solid var(--border)">'+
-        '<div style="flex:0 0 200px"><span class="tool">'+esc(f.label)+dangerMark+'</span><div class="meta">'+esc(f.section+'.'+f.key)+'</div></div>'+
+        '<div style="flex:0 0 200px"><span class="tool">'+esc(cfgText(f.label))+dangerMark+'</span><div class="meta">'+esc(f.section+'.'+f.key)+'</div></div>'+
         '<div style="flex:1">'+input+helpHtml+helpBlockHtml+depHtml+'</div></div>';
     }
 
@@ -1729,11 +2048,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
       var body = visibleFields.map(function(f) { return inputHtml(f, sectionVal); }).join("");
       if (advancedFields.length > 0) {
         body += '<details style="margin:8px 0 2px;border:1px dashed var(--border);border-radius:4px;padding:4px 10px 6px">'+
-          '<summary style="cursor:pointer;font-size:12px" class="meta">高级（'+advancedFields.length+' 项调优参数，默认不必改动）▾</summary>'+
+          '<summary style="cursor:pointer;font-size:12px" class="meta">'+esc(T("config.advanced", { n: advancedFields.length }))+'</summary>'+
           advancedFields.map(function(f) { return inputHtml(f, sectionVal); }).join("")+
           '</details>';
       }
-      return '<details class="card" open style="margin-bottom:8px"><summary style="cursor:pointer"><h2 style="display:inline">'+esc(sectionTitles[sec] || sec)+'</h2> <span class="meta">('+fields.length+' 项)</span></summary>'+
+      return '<details class="card" open style="margin-bottom:8px"><summary style="cursor:pointer"><h2 style="display:inline">'+esc(T("sec."+sec))+'</h2> <span class="meta">'+esc(T("config.itemCount", { n: fields.length }))+'</span></summary>'+
         '<form id="config-form" data-section="'+escAttr(sec)+'" autocomplete="off">'+
         body+
         '</form></details>';
@@ -1742,11 +2061,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
     var html =
       '<div id="config-dirty-bar" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:12px"></div>'+
       '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'+
-        '<span class="meta">编辑后点击保存，重启 gateway 后生效。源: plugins.entries[id].config (DEFAULT_CONFIG × 用户 openclaw.json)</span>'+
+        '<span class="meta">'+esc(T("config.sourceHint"))+'</span>'+
         '<div style="display:flex;gap:6px">'+
-          '<button type="button" id="reset-config" title="丢弃本地编辑，重新从服务器加载当前配置（不会恢复默认值）">撤销更改</button>'+
-          '<button type="button" id="copy-config">Copy JSON</button>'+
-          '<button type="button" id="save-config" style="background:var(--accent)">保存</button>'+
+          '<button type="button" id="reset-config" title="'+escAttr(T("config.resetTitle"))+'">'+esc(T("config.reset"))+'</button>'+
+          '<button type="button" id="copy-config">'+esc(T("copy.idle"))+'</button>'+
+          '<button type="button" id="save-config" style="background:var(--accent)">'+esc(T("config.save"))+'</button>'+
         '</div>'+
       '</div>'+
       sectionsHtml+
@@ -1756,15 +2075,15 @@ button:disabled{opacity:.5;cursor:not-allowed}
       // it when any changed field has danger:true.
       '<div id="danger-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center">'+
         '<div style="background:var(--card-bg);border:1px solid var(--danger);border-radius:8px;padding:20px;max-width:520px;width:90%">'+
-          '<h3 style="color:var(--danger);margin-bottom:12px">⚠ 危险操作确认</h3>'+
+          '<h3 style="color:var(--danger);margin-bottom:12px">'+esc(T("danger.title"))+'</h3>'+
           '<div id="danger-modal-body" style="margin-bottom:12px;font-size:12px"></div>'+
           '<label style="display:block;margin-bottom:12px;cursor:pointer;line-height:1.6">'+
             '<input type="checkbox" id="danger-confirm" style="margin:0 6px 0 0;vertical-align:middle"/>'+
-            '<span style="font-size:12px;vertical-align:middle">我已确认上述变更的影响，仍要保存</span>'+
+            '<span style="font-size:12px;vertical-align:middle">'+esc(T("danger.confirmLabel"))+'</span>'+
           '</label>'+
           '<div style="display:flex;gap:8px;justify-content:flex-end">'+
-            '<button type="button" id="danger-cancel">取消</button>'+
-            '<button type="button" id="danger-ok" disabled>确认保存</button>'+
+            '<button type="button" id="danger-cancel">'+esc(T("danger.cancel"))+'</button>'+
+            '<button type="button" id="danger-ok" disabled>'+esc(T("danger.ok"))+'</button>'+
           '</div>'+
         '</div>'+
       '</div>';
@@ -1874,7 +2193,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
     if (!bar) return;
     __configDirty = isConfigDirty();
     bar.style.display = __configDirty ? "block" : "none";
-    if (__configDirty) bar.textContent = "● 有未保存改动，自动刷新已暂停（保存或撤销更改后恢复）";
+    if (__configDirty) bar.textContent = T("config.dirty");
   }
 
   function collectPatch() {
@@ -1915,9 +2234,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
     var n = document.createElement("div");
     n.style.cssText = "position:fixed;top:20px;right:20px;background:var(--card-bg);border:1px solid var(--success);border-radius:6px;padding:12px;max-width:420px;z-index:1001;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,.4)";
     n.innerHTML =
-      '<strong style="color:var(--success)">✓ 配置已写入磁盘</strong><br>' +
-      '<span class="meta">备份: '+esc(res.backup || "无")+'</span><br>' +
-      '<span style="color:var(--warn)">⚠ 需重启 gateway 后生效</span>';
+      '<strong style="color:var(--success)">'+esc(T("banner.savedTitle"))+'</strong><br>' +
+      '<span class="meta">'+esc(T("banner.backup", { path: res.backup || T("banner.none") }))+'</span><br>' +
+      '<span style="color:var(--warn)">'+esc(T("banner.restart"))+'</span>';
     document.body.appendChild(n);
     setTimeout(function() { if (n.parentNode) n.parentNode.removeChild(n); }, 8000);
   }
@@ -1934,10 +2253,10 @@ button:disabled{opacity:.5;cursor:not-allowed}
         esc(d.reason) + '</li>';
     }).join("");
     n.innerHTML =
-      '<strong style="color:var(--warn)">⚠ 重启 gateway 后以下项会被自动关闭</strong><br>' +
-      '<span class="meta">原因：宿主环境不满足前置条件（如 NODE_OPTIONS 未引用 runtime hook / Python 缺 psutil）</span>' +
+      '<strong style="color:var(--warn)">'+esc(T("banner.bootstrapTitle"))+'</strong><br>' +
+      '<span class="meta">'+esc(T("banner.bootstrapReason"))+'</span>' +
       '<ul style="margin:8px 0 6px;padding-left:20px">'+items+'</ul>' +
-      '<span class="meta">完整诊断：宿主 OpenClaw 日志中的 bootstrap complete 行（容器部署用 <code>docker logs &lt;容器名&gt;</code> 查看）</span>';
+      '<span class="meta">'+esc(T("banner.bootstrapDiagLead"))+'<code>docker logs</code>'+T("banner.bootstrapDiagTail")+'</span>';
     document.body.appendChild(n);
     setTimeout(function() { if (n.parentNode) n.parentNode.removeChild(n); }, 15000);
   }
@@ -1953,7 +2272,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         esc(w.message) + '</li>';
     }).join("");
     n.innerHTML =
-      '<strong style="color:var(--warn)">⚠ 配置已保存，请注意以下提示</strong>' +
+      '<strong style="color:var(--warn)">'+esc(T("banner.warningsTitle"))+'</strong>' +
       '<ul style="margin:8px 0 6px;padding-left:20px">'+items+'</ul>';
     document.body.appendChild(n);
     setTimeout(function() { if (n.parentNode) n.parentNode.removeChild(n); }, 15000);
@@ -1981,7 +2300,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         });
       }
       body.innerHTML =
-        '<p style="margin-bottom:8px">以下变更涉及关键参数，保存前请确认：</p>' +
+        '<p style="margin-bottom:8px">'+esc(T("danger.intro"))+'</p>' +
         '<ul style="margin:0;padding-left:18px">' + rows.join("") + '</ul>';
     }
     var confirmBox = document.getElementById("danger-confirm");
@@ -1995,15 +2314,15 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
   function doSave(patch, confirmDanger, confirmToken, dangerList) {
     var btn = document.getElementById("save-config");
-    if (btn) { btn.disabled = true; btn.textContent = "保存中..."; }
+    if (btn) { btn.disabled = true; btn.textContent = T("save.saving"); }
     rpc("security.config.save", { patch: patch, confirmDanger: !!confirmDanger, confirmToken: confirmToken || undefined })
       .then(function(res) {
         if (res && res.ok) {
           if (btn) {
-            btn.textContent = "已保存 ✓";
+            btn.textContent = T("save.saved");
             btn.style.background = "var(--success)";
             setTimeout(function() {
-              btn.textContent = "保存";
+              btn.textContent = T("config.save");
               btn.style.background = "var(--accent)";
               btn.disabled = false;
             }, 2500);
@@ -2035,26 +2354,26 @@ button:disabled{opacity:.5;cursor:not-allowed}
           // Danger fields need confirmation: the server issued a one-time
           // confirmToken bound to this exact patch. Show the modal; the retry
           // after "确认保存" carries token + confirmDanger=true.
-          if (btn) { btn.disabled = false; btn.textContent = "保存"; }
+          if (btn) { btn.disabled = false; btn.textContent = T("config.save"); }
           openDangerModal(patch, dangerList || null, res.error.confirmToken, res.error.fields || []);
         } else {
-          if (btn) { btn.disabled = false; btn.textContent = "保存"; }
-          var msg = (res && res.error && res.error.message) || "未知错误";
+          if (btn) { btn.disabled = false; btn.textContent = T("config.save"); }
+          var msg = (res && res.error && res.error.message) || T("save.unknownError");
           if (res && res.error && res.error.details) msg += "\\n" + JSON.stringify(res.error.details);
-          if (res && res.error && res.error.fields) msg += "\\n需要确认: " + res.error.fields.join(", ");
-          alert("保存失败: " + msg);
+          if (res && res.error && res.error.fields) msg += "\\n" + T("save.needsConfirm") + res.error.fields.join(", ");
+          alert(T("save.failed") + msg);
         }
       })
       .catch(function(err) {
-        if (btn) { btn.disabled = false; btn.textContent = "保存"; }
-        alert("RPC 失败: " + (err && err.message ? err.message : err));
+        if (btn) { btn.disabled = false; btn.textContent = T("config.save"); }
+        alert(T("save.rpcFailed") + (err && err.message ? err.message : err));
       });
   }
 
   function saveConfig() {
     var c = collectPatch();
     if (Object.keys(c.patch).length === 0) {
-      alert("没有检测到变更");
+      alert(T("save.noChanges"));
       return;
     }
     var dangerous = c.changed.filter(function(x) { return x.danger; });
@@ -2103,23 +2422,23 @@ button:disabled{opacity:.5;cursor:not-allowed}
   function buildEventsShell() {
     var opts = EVENT_TYPE_OPTIONS.map(function(t) {
       var sel = t === eventsState.eventType ? ' selected' : '';
-      var txt = t === '' ? 'All event types' : t;
+      var txt = t === '' ? T("events.allTypes") : t;
       return '<option value="'+escAttr(t)+'"'+sel+'>'+esc(txt)+'</option>';
     }).join('');
     // Pause banner — same shape as Config's #config-dirty-bar (var(--warn) bg,
     // black text, 6px 10px padding, radius 4px). Sits above the toolbar so it
     // stays visible regardless of scroll position and matches Config's
-    // pause affordance pixel-for-pixel.
-    var pauseBanner = '<div id="detail-paused-banner" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:12px">⏸ 有展开的事件详情，自动刷新已暂停（收起详情行后恢复）</div>';
-    return pauseBanner+
+    // pause affordance pixel-for-pixel. Shared with Policy Hits — see
+    // detailPausedBanner().
+    return detailPausedBanner()+
       '<div class="toolbar">'+
       '<select id="filter-event-type">'+opts+'</select>'+
-      '<input id="filter-since" placeholder="since (minutes ago)" value="'+escAttr(eventsState.sinceMinutes)+'" style="max-width:170px"/>'+
-      '<button id="filter-apply">Apply</button>'+
+      '<input id="filter-since" placeholder="'+escAttr(T("events.since"))+'" value="'+escAttr(eventsState.sinceMinutes)+'" style="max-width:170px"/>'+
+      '<button id="filter-apply">'+esc(T("events.apply"))+'</button>'+
       '<span class="grow"></span>'+
-      '<span class="meta" id="filter-help">limit 50 per page</span>'+
+      '<span class="meta" id="filter-help">'+esc(T("events.limit"))+'</span>'+
       '</div>'+
-      '<div id="events-table"><div class="spinner">Loading...</div></div>'+
+      '<div id="events-table"><div class="spinner">'+esc(T("spinner.loading"))+'</div></div>'+
       '<div class="events-footer" id="events-footer"></div>';
   }
 
@@ -2147,7 +2466,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         // (#blocks-body) 一致；data-event-idx 用全局 offset 计数避免撞 id。
         tableArea.innerHTML = rows.length
           ? renderEventsTable()
-          : '<div class="empty">No events yet</div>';
+          : '<div class="empty">'+esc(T("events.empty"))+'</div>';
       }
       if (rows.length) {
         var tbody = document.getElementById("events-body");
@@ -2158,15 +2477,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
       }
       eventsState.offset += rows.length;
       var truncatedBanner = eventsState.truncated
-        ? '<div class="banner">⚠ Only the most recent in-memory events are shown — the on-disk log exceeds the cache cap (older history is pruned from the search). Stats on the Metrics tab continue to reflect the full log.</div>'
+        ? '<div class="banner">'+esc(T("events.truncated"))+'</div>'
         : '';
       var shown = eventsState.offset;
-      var total = eventsState.total + (eventsState.truncated ? "+" : "");
-      var more = eventsState.offset < eventsState.total
-        ? '<button id="events-more">Load more</button>'
-        : '<span class="meta">end of results</span>';
-      footerArea.innerHTML = truncatedBanner +
-        '<span class="meta">Showing '+shown + ' of '+total + ' events</span>' + more;
+      footerArea.innerHTML = pagerFooter("events-more", shown, eventsState.total, "events",
+        truncatedBanner, eventsState.truncated ? "+" : "");
       var moreBtn = document.getElementById("events-more");
       if (moreBtn) moreBtn.onclick = function() { loadEvents(false); };
     }).catch(function(err) {
@@ -2196,7 +2511,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
     // showing the current edit state and the dirty banner makes the pause
     // visible. Tab switches (explicit user action) still re-render.
     if (activeTab === "config" && __configDirty) {
-      document.getElementById("refresh").textContent = "Last updated: "+new Date().toLocaleTimeString()+" (paused — Config 有未保存改动)";
+      document.getElementById("refresh").textContent = T("refresh.updated", { time: new Date().toLocaleTimeString() })+" "+T("refresh.pausedConfig");
       var banner = document.getElementById("detail-paused-banner");
       if (banner) banner.style.display = "none";
       return;
@@ -2212,13 +2527,13 @@ button:disabled{opacity:.5;cursor:not-allowed}
     // #config-dirty-bar so the two pause affordances are visually unified.
     var bannerEl = document.getElementById("detail-paused-banner");
     if ((activeTab === "events" || activeTab === "blocks") && __detailOpen) {
-      document.getElementById("refresh").textContent = "Last updated: "+new Date().toLocaleTimeString()+" (paused — 关闭展开行后恢复刷新)";
+      document.getElementById("refresh").textContent = T("refresh.updated", { time: new Date().toLocaleTimeString() })+" "+T("refresh.pausedDetail");
       if (bannerEl) bannerEl.style.display = "block";
       return;
     }
     if (bannerEl) bannerEl.style.display = "none";
     var now = new Date().toLocaleTimeString();
-    document.getElementById("refresh").textContent = "Last updated: "+now;
+    document.getElementById("refresh").textContent = T("refresh.updated", { time: now });
 
     var p;
     if (activeTab === "metrics") {
@@ -2244,7 +2559,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         return renderConfig(d);
       }).catch(error);
     } else {
-      p = Promise.resolve('<div class="empty">Unknown tab</div>');
+      p = Promise.resolve('<div class="empty">'+esc(T("misc.unknownTab"))+'</div>');
     }
     p.then(function(html) {
       panel.innerHTML = html;
@@ -2310,14 +2625,14 @@ button:disabled{opacity:.5;cursor:not-allowed}
           ? JSON.stringify(res.config, null, 2)
           : fallbackJson;
         return copyText(payload).then(function() {
-          btn.textContent = "Copied";
-          setTimeout(function() { btn.textContent = "Copy JSON"; }, 1500);
-        }, function() { btn.textContent = "Copy failed"; });
+          btn.textContent = T("copy.configCopied");
+          setTimeout(function() { btn.textContent = T("copy.idle"); }, 1500);
+        }, function() { btn.textContent = T("copy.configFailed"); });
       }, function() {
         copyText(fallbackJson).then(function() {
-          btn.textContent = "Copied (脱敏视图)";
-          setTimeout(function() { btn.textContent = "Copy JSON"; }, 1500);
-        }, function() { btn.textContent = "Copy failed"; });
+          btn.textContent = T("copy.configCopiedFallback");
+          setTimeout(function() { btn.textContent = T("copy.idle"); }, 1500);
+        }, function() { btn.textContent = T("copy.configFailed"); });
       });
       return;
     }
@@ -2340,7 +2655,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       var win = window.open(WEBSITE_URL, "_blank", "noopener");
       if (!win) {
         copyText(WEBSITE_URL).then(function(ok) {
-          toast(ok ? "链接已复制，请粘贴到新标签页打开" : "无法自动打开或复制，请手动访问 "+WEBSITE_URL);
+          toast(ok ? T("toast.copied") : T("toast.cannotOpen", { url: WEBSITE_URL }));
         });
       }
       return;
@@ -2415,7 +2730,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
     if (!bar || !st) return;
     if (st.runtimeHooksEnabled === true && st.runtimeHookLoaded === false) {
       bar.style.display = "block";
-      bar.textContent = "⚠ Runtime hook 未生效：宿主 NODE_OPTIONS 未预加载安全 hook，运行时进程/网络防护当前不生效（配置未主动关闭，属静默降级）。详见 Config 页 application.runtimeHooks.enabled 说明。";
+      bar.textContent = T("status.hookNotLoaded");
     }
   }).catch(function() { /* status 不可用时静默，面板照常工作 */ });
   render();
@@ -2554,9 +2869,19 @@ const DANGEROUS_CONFIG_KEYS = new Set([
 // form renderer (returned via security.config.get.schema) and the save-time
 // validator. Each row is a single editable leaf under `section`. Nested keys
 // use dot notation (e.g. "procfs.pythonPath" → system.procfs.pythonPath).
+//
+// `label` / `help` / `dangerReason` hold **dictionary keys**, not prose:
+// `cfg.label.<section>.<key>`, `cfg.help.<section>.<key>`,
+// `cfg.danger.<section>.<key>`, resolved by the panel through
+// src/panel-i18n.ts. Storing keys rather than one language's text is what
+// keeps a single source of truth — the prose lives in exactly one place and a
+// language switch cannot leave a stale Chinese string behind in the schema.
+// tests/panel-i18n.test.ts fails if a field here has no matching dictionary
+// entry, so adding a row without its copy is a red test, not a silent gap.
 interface ConfigField {
   section: string;
   key: string;
+  /** Dictionary key: cfg.label.<section>.<key> */
   label: string;
   type: "bool" | "number" | "string" | "enum";
   values?: readonly string[];
@@ -2570,7 +2895,7 @@ interface ConfigField {
   hidden?: boolean;
   // Conditional dependency on another field. When the dependency is unmet
   // (the other field's value does not equal `value`, defaulting to true),
-  // the input is rendered disabled with an inline "(需先启用 X)" hint and
+  // the input is rendered disabled with an inline "enable X first" hint and
   // its current value is not editable. Use for child toggles that have no
   // effect when their parent toggle is off (e.g. networkEnabled vs.
   // runtimeHooks.enabled) so users don't read a stale "on" state as
@@ -2578,134 +2903,112 @@ interface ConfigField {
   // (e.g. procfs.pythonPath needs system.enabled AND procfs.enabled); the
   // single-object form keeps working.
   dependsOn?: { section: string; key: string; value?: unknown } | Array<{ section: string; key: string; value?: unknown }>;
-  // Fold the field into a per-section "高级" collapse (default collapsed).
+  // Fold the field into a per-section "advanced" collapse (default collapsed).
   // Use for tuning knobs that are safe to ignore for day-to-day operation;
   // unlike `hidden` the field stays discoverable one click away.
   advanced?: boolean;
-  // Optional long-form instructions shown below the input. Use for fields
-  // that need operator-side setup beyond a simple toggle (e.g. docker env
-  // vars, host preloads). `dangerReason` is reserved for short warnings
-  // inside the danger-confirm modal.
+  // Optional long-form instructions shown below the input. Dictionary key:
+  // cfg.help.<section>.<key>. Use for fields that need operator-side setup
+  // beyond a simple toggle (e.g. docker env vars, host preloads).
+  // `dangerReason` (cfg.danger.<section>.<key>) is reserved for short
+  // warnings inside the danger-confirm modal.
   help?: string;
   danger?: boolean;
   dangerReason?: string;
 }
 const CONFIG_SCHEMA: ConfigField[] = [
-  { section: "collector", key: "ndjsonPath", label: "本地 NDJSON 路径", type: "string",
-    danger: true, dangerReason: "改路径后下次启动会在新位置创建文件，旧路径文件不会被自动清理" },
-  { section: "collector", key: "maxFileSizeBytes", label: "NDJSON 文件大小上限 (bytes)", type: "number", min: 0, max: 1073741824,
-    danger: true, dangerReason: "调小后会立刻触发 rotate，把当前文件改名 .rotated；sidecar SDK 必须同时 tail .rotated 才能不丢事件" },
-  { section: "collector", key: "maxEventsInMemory", label: "面板内存事件数上限", type: "number", min: 100, max: 50000,
+  { section: "collector", key: "ndjsonPath", label: "cfg.label.collector.ndjsonPath", type: "string",
+    danger: true, dangerReason: "cfg.danger.collector.ndjsonPath" },
+  { section: "collector", key: "maxFileSizeBytes", label: "cfg.label.collector.maxFileSizeBytes", type: "number", min: 0, max: 1073741824,
+    danger: true, dangerReason: "cfg.danger.collector.maxFileSizeBytes" },
+  { section: "collector", key: "maxEventsInMemory", label: "cfg.label.collector.maxEventsInMemory", type: "number", min: 100, max: 50000,
     hidden: true,
-    danger: true, dangerReason: "调小会让 Event Stream / Policy Hits 看不到更早的事件；调大增加面板堆内存占用" },
-  { section: "application", key: "enabled", label: "启用", type: "bool" },
-  { section: "application", key: "captureUserPrompt", label: "捕获用户 Prompt", type: "bool" },
-  { section: "application", key: "captureSystemPrompt", label: "捕获系统 Prompt", type: "bool" },
-  { section: "application", key: "captureAgentPlan", label: "捕获 Agent Plan", type: "bool" },
-  { section: "application", key: "captureCodeMode", label: "捕获 Code Mode", type: "bool",
-    help: "捕获 code_mode_exec 工具调用的代码正文（事件 code_content 字段）；关闭后 code_mode 事件只保留元数据，不含代码内容。" },
-  { section: "application", key: "captureReasoning", label: "捕获推理过程", type: "bool" },
-  { section: "application", key: "captureUserId", label: "捕获用户 ID", type: "bool",
-    help: "按 userIdField 指定的字段名从消息 / 工具元数据提取用户 ID，用于审计归因；关闭后事件不再携带 user_id。" },
-  { section: "application", key: "userIdField", label: "用户 ID 字段名", type: "string", min: 1, max: 64,
-    danger: true, dangerReason: "审计归因字段，改成不存在的字段名会让所有事件 user_id 变空，影响合规追溯",
-    help: "从消息事件中取 userId 的字段名。OpenClaw 9.4 默认 'userId'；其他宿主若不一致会导致审计归因为空。"
+    danger: true, dangerReason: "cfg.danger.collector.maxEventsInMemory" },
+  { section: "application", key: "enabled", label: "cfg.label.application.enabled", type: "bool" },
+  { section: "application", key: "captureUserPrompt", label: "cfg.label.application.captureUserPrompt", type: "bool" },
+  { section: "application", key: "captureSystemPrompt", label: "cfg.label.application.captureSystemPrompt", type: "bool" },
+  { section: "application", key: "captureAgentPlan", label: "cfg.label.application.captureAgentPlan", type: "bool" },
+  { section: "application", key: "captureCodeMode", label: "cfg.label.application.captureCodeMode", type: "bool",
+    help: "cfg.help.application.captureCodeMode" },
+  { section: "application", key: "captureReasoning", label: "cfg.label.application.captureReasoning", type: "bool" },
+  { section: "application", key: "captureUserId", label: "cfg.label.application.captureUserId", type: "bool",
+    help: "cfg.help.application.captureUserId" },
+  { section: "application", key: "userIdField", label: "cfg.label.application.userIdField", type: "string", min: 1, max: 64,
+    danger: true, dangerReason: "cfg.danger.application.userIdField",
+    help: "cfg.help.application.userIdField"
   },
-  { section: "application", key: "maxContentLength", label: "单字段最大长度", type: "number", min: 100, max: 100000,
+  { section: "application", key: "maxContentLength", label: "cfg.label.application.maxContentLength", type: "number", min: 100, max: 100000,
     hidden: true },
-  { section: "application", key: "sessionTtlMs", label: "会话缓存 TTL (ms)", type: "number", min: 60000, max: 86400000,
+  { section: "application", key: "sessionTtlMs", label: "cfg.label.application.sessionTtlMs", type: "number", min: 60000, max: 86400000,
     hidden: true },
-  { section: "application", key: "runtimeHooks.enabled", label: "启用 Runtime Hooks", type: "bool",
-    danger: true, dangerReason: "需 NODE_OPTIONS='--require <hook>' 才能生效，否则无数据",
-    help:
-      "⚙ 启用 ≠ 立即生效。bundled hooks 首次启用时已拷到\n" +
-      "  ~/.openclaw/extensions/sst-security-control-openclaw/\n" +
-      "还须让 gateway 启动环境设 NODE_OPTIONS 引用 runtime.js。\n" +
-      "路径须为运行环境内的绝对路径（容器内 home 取决于镜像，常见为 /home/node）：\n\n" +
-      "  # docker run / docker-compose\n" +
-      "  -e NODE_OPTIONS='--require /home/node/.openclaw/extensions/sst-security-control-openclaw/runtime.js'\n\n" +
-      "  # 宿主机直装\n" +
-      "  NODE_OPTIONS='--require $HOME/.openclaw/extensions/sst-security-control-openclaw/runtime.js'\n\n" +
-      "⚠ 仅 openclaw gateway restart 不会让 NODE_OPTIONS 生效，\n" +
-      "  须重建容器 / 重启宿主进程。验证：日志出现 runtimeHookLoaded=true"
+  { section: "application", key: "runtimeHooks.enabled", label: "cfg.label.application.runtimeHooks.enabled", type: "bool",
+    danger: true, dangerReason: "cfg.danger.application.runtimeHooks.enabled",
+    help: "cfg.help.application.runtimeHooks.enabled"
   },
-  { section: "application", key: "runtimeHooks.networkEnabled", label: "Runtime Hooks · 启用网络拦截", type: "bool",
+  { section: "application", key: "runtimeHooks.networkEnabled", label: "cfg.label.application.runtimeHooks.networkEnabled", type: "bool",
     dependsOn: { section: "application", key: "runtimeHooks.enabled", value: true },
-    help: "默认 true。Runtime Hooks 同时拦截 child_process + fetch；只想要进程拦截、不想要网络拦截时关闭。必须先启用「启用 Runtime Hooks」。关闭/开启在 gateway 重启后生效（本进程已加载 network hook 的场景同样生效，无需重建容器）。"
+    help: "cfg.help.application.runtimeHooks.networkEnabled"
   },
-  { section: "system", key: "enabled", label: "启用", type: "bool",
-    danger: true, dangerReason: "需主机预装 python3 + psutil，否则启动失败并频繁告警",
-    help:
-      "⚙ 启用前需主机预装 python3 + psutil>=5.9.0。\n" +
-      "plugin 启动时执行 <pythonPath> -c \"import psutil\" 探测，失败则自动关闭本层。\n\n" +
-      "  # Debian / Ubuntu\n" +
-      "  apt-get install -y python3 python3-pip && python3 -m pip install 'psutil>=5.9.0'\n\n" +
-      "  # Alpine（容器精简镜像）\n" +
-      "  apk add --no-cache python3 py3-pip && python3 -m pip install 'psutil>=5.9.0'\n\n" +
-      "  # RHEL / Fedora\n" +
-      "  dnf install -y python3 python3-pip && python3 -m pip install 'psutil>=5.9.0'\n\n" +
-      "python 路径非默认时改 system.procfs.pythonPath（默认 \"python3\"）。\n" +
-      "⚠ 仅 openclaw gateway restart 不补 psutil 缺失，须重建镜像或装系统包。"
+  // 面板语言。非 danger 字段：切语言不需要二次确认，也不需要重启 gateway
+  // ——面板 GET 每次现读 host 配置（readPanelLocalePreference）。
+  { section: "application", key: "panelLocale", label: "cfg.label.application.panelLocale", type: "enum", values: ["auto", "en", "zh"],
+    help: "cfg.help.application.panelLocale" },
+  { section: "system", key: "enabled", label: "cfg.label.system.enabled", type: "bool",
+    danger: true, dangerReason: "cfg.danger.system.enabled",
+    help: "cfg.help.system.enabled"
   },
-  { section: "system", key: "procfs.enabled", label: "procfs 采集", type: "bool",
+  { section: "system", key: "procfs.enabled", label: "cfg.label.system.procfs.enabled", type: "bool",
     dependsOn: { section: "system", key: "enabled", value: true },
-    help:
-      "只读 psutil 进程扫描，默认不做任何杀伤（autoKill 默认关闭）。\n" +
-      "需主机 python3 + psutil；bootstrap 探测缺失时会自动关闭本层并在保存时提示。\n" +
-      "开启并重启 gateway 后，绑定的工具调用进程树会产生 process_start / " +
-      "process_change / process_exit / process_snapshot 事件。"
+    help: "cfg.help.system.procfs.enabled"
   },
-  { section: "system", key: "cgroups.enabled", label: "cgroups 指标", type: "bool",
+  { section: "system", key: "cgroups.enabled", label: "cfg.label.system.cgroups.enabled", type: "bool",
     dependsOn: { section: "system", key: "enabled", value: true },
-    help:
-      "只读 cgroup v1/v2 指标（cpu / memory / blkio / pids），低开销。\n" +
-      "随 process monitor 一同启动，开启并重启后产生 cgroup_snapshot / cgroup_anomaly 事件；\n" +
-      "稳态心跳由 cgroups.heartbeatEnabled + cgroups.aggregateWindowSeconds 控制。"
+    help: "cfg.help.system.cgroups.enabled"
   },
-  { section: "system", key: "procfs.pythonPath", label: "Python 路径", type: "string",
+  { section: "system", key: "procfs.pythonPath", label: "cfg.label.system.procfs.pythonPath", type: "string",
     dependsOn: [
       { section: "system", key: "enabled", value: true },
       { section: "system", key: "procfs.enabled", value: true },
     ] },
-  { section: "system", key: "procfs.scanIntervalMs", label: "扫描间隔 (ms)", type: "number", min: 100, max: 60000,
+  { section: "system", key: "procfs.scanIntervalMs", label: "cfg.label.system.procfs.scanIntervalMs", type: "number", min: 100, max: 60000,
     advanced: true,
     dependsOn: [
       { section: "system", key: "enabled", value: true },
       { section: "system", key: "procfs.enabled", value: true },
     ] },
-  { section: "intervention", key: "enabled", label: "启用", type: "bool",
-    danger: true, dangerReason: "关闭后所有 hook 不再拦截，agent 可执行任意工具调用" },
-  { section: "intervention", key: "mode", label: "模式", type: "enum", values: ["enforce", "audit"],
-    danger: true, dangerReason: "enforce 会真实拦截；audit 仅记录不拦截" },
-  { section: "intervention", key: "failStrategy", label: "失败策略",
+  { section: "intervention", key: "enabled", label: "cfg.label.intervention.enabled", type: "bool",
+    danger: true, dangerReason: "cfg.danger.intervention.enabled" },
+  { section: "intervention", key: "mode", label: "cfg.label.intervention.mode", type: "enum", values: ["enforce", "audit"],
+    danger: true, dangerReason: "cfg.danger.intervention.mode" },
+  { section: "intervention", key: "failStrategy", label: "cfg.label.intervention.failStrategy",
     type: "enum", values: ["fail_open", "fail_closed", "fail_open_high_risk_only"],
-    danger: true, dangerReason: "fail_closed 在规则超时时会拒绝所有未匹配操作" },
-  { section: "intervention", key: "guidance.enabled", label: "引导式干预", type: "bool",
-    danger: true, dangerReason: "关闭后引导变直接拦截，行为静默切换",
-    help: "命中 context_adjust 规则时先给出引导建议（调整范围 / 替代操作），而不是直接阻断。⚠ 关闭 = 引导变直接拦截（GUIDANCE_DISABLED），属策略收紧，请评估误拦影响后再关。" },
-  { section: "intervention", key: "reportBlockedEvents", label: "上报被拦截事件", type: "bool",
-    danger: true, dangerReason: "关闭后无法在面板/审计中查看任何拦截记录，审计追溯完全消失",
-    help: "被策略拦截（block）的工具调用是否落盘为事件。关闭后拦截本身仍生效，但面板 Policy Hits / 事件流不再显示这些拦截记录。" },
-  { section: "intervention", key: "decisionTimeoutMs", label: "决策超时 (ms)", type: "number", min: 10, max: 10000,
+    danger: true, dangerReason: "cfg.danger.intervention.failStrategy" },
+  { section: "intervention", key: "guidance.enabled", label: "cfg.label.intervention.guidance.enabled", type: "bool",
+    danger: true, dangerReason: "cfg.danger.intervention.guidance.enabled",
+    help: "cfg.help.intervention.guidance.enabled" },
+  { section: "intervention", key: "reportBlockedEvents", label: "cfg.label.intervention.reportBlockedEvents", type: "bool",
+    danger: true, dangerReason: "cfg.danger.intervention.reportBlockedEvents",
+    help: "cfg.help.intervention.reportBlockedEvents" },
+  { section: "intervention", key: "decisionTimeoutMs", label: "cfg.label.intervention.decisionTimeoutMs", type: "number", min: 10, max: 10000,
     hidden: true,
-    help: "保留字段：评估核心全同步，超时分支不生效；待后续异步评估重构后启用。" },
-  { section: "intervention", key: "policyPath", label: "策略文件路径", type: "string",
-    danger: true, dangerReason: "若路径不可读或无规则文件，插件会静默回退到 allow-all，所有防护失效" },
-  { section: "intervention", key: "reloadIntervalMs", label: "策略重载间隔 (ms)", type: "number", min: 1000, max: 600000,
+    help: "cfg.help.intervention.decisionTimeoutMs" },
+  { section: "intervention", key: "policyPath", label: "cfg.label.intervention.policyPath", type: "string",
+    danger: true, dangerReason: "cfg.danger.intervention.policyPath" },
+  { section: "intervention", key: "reloadIntervalMs", label: "cfg.label.intervention.reloadIntervalMs", type: "number", min: 1000, max: 600000,
     hidden: true },
-  { section: "assetMonitor", key: "enabled", label: "启用", type: "bool",
-    danger: true, dangerReason: "关闭后 agent 配置 / skill / MCP 变更不再审计" },
-  { section: "assetMonitor", key: "scanIntervalMs", label: "扫描间隔 (ms)", type: "number", min: 10000, max: 3600000,
+  { section: "assetMonitor", key: "enabled", label: "cfg.label.assetMonitor.enabled", type: "bool",
+    danger: true, dangerReason: "cfg.danger.assetMonitor.enabled" },
+  { section: "assetMonitor", key: "scanIntervalMs", label: "cfg.label.assetMonitor.scanIntervalMs", type: "number", min: 10000, max: 3600000,
     hidden: true },
-  { section: "assetMonitor", key: "collectContent", label: "收集文件内容", type: "bool",
-    danger: true, dangerReason: "会上传 agent 配置文件内容（敏感字段已混淆）" },
-  { section: "assetMonitor", key: "collectSkillPackage", label: "收集 Skill 安装包", type: "bool",
-    danger: true, dangerReason: "开启会增加事件体积，请确认下游存储可接受",
-    help: "扫描 skill 目录并随 asset 事件附带 ZIP 包（base64），供下游审计与扫描；关闭后仅上报文件清单与指纹。" },
-  { section: "assetMonitor", key: "collectConfigPackage", label: "收集配置文件包", type: "bool",
-    danger: true, dangerReason: "开启后 agent 配置文件原文会打包随事件上报（敏感字段已混淆）",
-    help: "将 agent 配置文件打包为 ZIP 随事件上报（包内为原文，解析摘要中的敏感值已混淆）；关闭后仅保留解析摘要。" },
-  { section: "bootstrap", key: "entryDefaults", label: "启动写入 host 默认值", type: "bool" },
+  { section: "assetMonitor", key: "collectContent", label: "cfg.label.assetMonitor.collectContent", type: "bool",
+    danger: true, dangerReason: "cfg.danger.assetMonitor.collectContent" },
+  { section: "assetMonitor", key: "collectSkillPackage", label: "cfg.label.assetMonitor.collectSkillPackage", type: "bool",
+    danger: true, dangerReason: "cfg.danger.assetMonitor.collectSkillPackage",
+    help: "cfg.help.assetMonitor.collectSkillPackage" },
+  { section: "assetMonitor", key: "collectConfigPackage", label: "cfg.label.assetMonitor.collectConfigPackage", type: "bool",
+    danger: true, dangerReason: "cfg.danger.assetMonitor.collectConfigPackage",
+    help: "cfg.help.assetMonitor.collectConfigPackage" },
+  { section: "bootstrap", key: "entryDefaults", label: "cfg.label.bootstrap.entryDefaults", type: "bool" },
 ];
 
 function validateConfigPatch(
@@ -2770,6 +3073,103 @@ function validateConfigPatch(
   }
   if (errors.length > 0) return { ok: false, errors, dangerous, unknown };
   return { ok: true, dangerous, unknown };
+}
+
+/**
+ * Read `application.panelLocale` from the host config file on every panel GET.
+ *
+ * Deliberately NOT via middleware.getConfig(): that is the activation-time
+ * snapshot, so a language chosen in the header switcher would need a gateway
+ * restart before the panel honoured it — the toggle would look broken. Reading
+ * the file per request mirrors what security.config.raw already does, and one
+ * small JSON read per page load is not worth optimising away.
+ *
+ * Any failure (missing file, unparseable JSON, missing subtree) degrades to
+ * "auto", which is exactly the pre-existing negotiation behaviour.
+ */
+function readPanelLocalePreference(): PanelLocalePreference {
+  try {
+    const parsed = JSON.parse(readFileSync(resolveHostConfigPath(), "utf8")) as {
+      plugins?: { entries?: Record<string, { config?: unknown }> };
+    };
+    const block = parsed?.plugins?.entries?.[PLUGIN_ID]?.config as
+      | { application?: { panelLocale?: unknown } }
+      | undefined;
+    return normalizePanelLocalePreference(block?.application?.panelLocale);
+  } catch {
+    return "auto";
+  }
+}
+
+/**
+ * 面板语言偏好的落盘位置：`openclaw.json` 旁边的 `panel-state.json`。
+ *
+ * 挨着宿主配置文件放（而不是硬编码 `~/.openclaw`）是为了跟着
+ * OPENCLAW_HOME / OPENCLAW_CONFIG_PATH 走，测试也因此只要指一个临时目录。
+ */
+function resolvePanelStatePath(): string {
+  const override = process.env.OPENCLAW_PANEL_STATE_PATH;
+  if (override) return override;
+  return join(dirname(resolveHostConfigPath()), "panel-state.json");
+}
+
+/**
+ * 读 header 开关上一次的选择，读不到/损坏都折成 auto（= 未设置）。
+ *
+ * 与 readPanelLocalePreference 一样每次 GET 现读：走 getConfig() 那份启动
+ * 快照的话，用户刚点的语言要等 gateway 重启才生效，开关看起来就是坏的。
+ */
+function readPanelStateLocale(): PanelLocalePreference {
+  try {
+    const parsed = JSON.parse(readFileSync(resolvePanelStatePath(), "utf8")) as { panelLocale?: unknown };
+    return normalizePanelLocalePreference(parsed?.panelLocale);
+  } catch {
+    return "auto";
+  }
+}
+
+/**
+ * 面板语言偏好的最终生效值：开关写下的 `panel-state.json` 优先于配置键
+ * `application.panelLocale`。
+ *
+ * 两处并存是有意的，不是历史遗留：
+ *   · header 开关写 panel-state.json —— 写宿主 openclaw.json 会让 gateway
+ *     重载全部插件，实测有 1.7~4.8s 的窗口期所有插件路由 500，语言切换要等
+ *     8s 以上才看得见效果（见面板脚本里 RELOAD_SETTLE_* 那段注释）；
+ *   · `application.panelLocale` 保留为"钉死的默认值"：想给一台机器固定语言
+ *     的运维仍然可以在 Config 页或手改文件里定，优先级低于开关。
+ * 两者都是"已保存的偏好"，由 parseLocale 当作一层处理。
+ */
+function readSavedPanelLocale(): PanelLocalePreference {
+  const fromSwitch = readPanelStateLocale();
+  return fromSwitch !== "auto" ? fromSwitch : readPanelLocalePreference();
+}
+
+/**
+ * 写 header 开关的选择。只碰插件自己的状态文件，**不**写宿主 openclaw.json
+ * —— 面板上的每一个其它保存动作都要 gateway 重载插件，8 秒的等待就是从那里
+ * 来的（交付后的现场实测），语言切换不值得付这个代价。
+ *
+ * 写入走 tmp + rename（L4），读方永远看不到半个文件；失败时返回错误而不
+ * 抛，调用方（面板）据此把按钮还给用户并说明原因。
+ */
+function writePanelStateLocale(locale: PanelLocalePreference): { ok: true; locale: PanelLocalePreference } | { ok: false; error: { message: string } } {
+  const target = resolvePanelStatePath();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(tmp, JSON.stringify({ panelLocale: locale }, null, 2) + "\n", "utf8");
+    renameSync(tmp, target);
+  } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* ignore */ }
+    return { ok: false, error: { message: "写入面板语言偏好失败: " + (err as Error).message } };
+  }
+  try {
+    JSON.parse(readFileSync(target, "utf8"));
+  } catch (err) {
+    return { ok: false, error: { message: "写后校验失败: " + (err as Error).message } };
+  }
+  return { ok: true, locale };
 }
 
 // L4 (atomic write) + L5 (backup) + L6 (best-effort lock) + L7 (audit log)
@@ -3020,7 +3420,7 @@ function flattenConfigLeaves(config: Record<string, unknown>, prefix = ""): Reco
     }
   }
   return out;
-}
+}//_w1 = '7a686968'
 
 function markDangerousConfig(
   changes: Array<{ key: string; from: unknown; to: unknown }>

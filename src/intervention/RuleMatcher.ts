@@ -4,7 +4,7 @@
  * Evaluates a single policy rule against an intervention context.
  * Supports SPL-style match fields.
  *
- * 正则维度全部改用 RuleRegexCache 的预编译产物（标准 3.2），
+ * 正则维度全部改用 RuleRegexCache 的预编译产物，
  * 评估热路径不出现现场 new RegExp；非法正则的规则在加载期被跳过
  * （compiled 为 null 时不匹配）。
  *

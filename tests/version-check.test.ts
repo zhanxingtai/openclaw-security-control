@@ -11,10 +11,14 @@ import {
 /**
  * 版本号单一来源断言。
  *
- * package.json 是唯一权威版本；build.js 构建前运行
- * assertVersionConsistency，任何副本漂移都必须导致构建失败并报告
- * 漂移位置。这里用临时目录搭建最小假仓库，覆盖一致/单点漂移/
- * 多点漂移三种路径，不实际跑构建。
+ * package.json 是唯一权威版本，唯一允许存在的副本是
+ * openclaw.plugin.json#version（宿主清单契约）。build.js 构建前运行
+ * assertVersionConsistency，漂移必须导致构建失败并报告漂移位置。
+ *
+ * 同时钉住"不该被 gate 的东西确实不被 gate"：fixture 里 hook tag、
+ * hooks/package.json、src/store.ts 全部故意写成跟 package.json 不同的值，
+ * 检查仍须通过。这是本次收敛的核心保证——把不该对齐的副本移出 gate 后，
+ * 它们再漂移也不会有人来拦，反过来也证明它们确实已不在副本清单里。
  */
 
 const VERSION = "9.9.9";
@@ -30,10 +34,11 @@ function seedFixture(version: string): void {
   mkdirSync(path.join(root, "src"), { recursive: true });
   writeJson("package.json", { name: "sst-security-control-openclaw", version });
   writeJson("openclaw.plugin.json", { version });
-  writeJson("hooks/package.json", { name: "hooks", version });
+  // 以下三处刻意与 package.json 不同：它们不在 gate 内
+  writeJson("hooks/package.json", { name: "hooks", version: "0.9.0" });
   writeFileSync(
     path.join(root, "hooks/runtime.js"),
-    `#!/usr/bin/env node\n// openclaw-hook: v${version}\n`
+    "#!/usr/bin/env node\n// openclaw-hook: v0.9.3\n"
   );
   writeFileSync(
     path.join(root, "hooks/network.js"),
@@ -41,7 +46,7 @@ function seedFixture(version: string): void {
   );
   writeFileSync(
     path.join(root, "src/store.ts"),
-    `export class Store {\n  readonly version = '${version}';\n}\n`
+    `export class Store {\n  readonly version = '2.0.0';\n}\n`
   );
 }
 
@@ -55,13 +60,19 @@ afterEach(() => {
 });
 
 describe("assertVersionConsistency", () => {
-  it("passes when every copy matches package.json", () => {
+  it("passes when the plugin manifest matches package.json", () => {
     const audit = assertVersionConsistency(root);
     expect(audit.expected).toBe(VERSION);
-    expect(audit.copies).toHaveLength(5);
-    for (const copy of audit.copies) {
-      expect(copy.value).toBe(VERSION);
-    }
+    expect(audit.copies).toHaveLength(1);
+    expect(audit.copies[0].label).toBe("openclaw.plugin.json#version");
+    expect(audit.copies[0].value).toBe(VERSION);
+  });
+
+  it("does not gate hook tags, hooks/package.json or src/store.ts", () => {
+    // seedFixture 把这三处都写成跟 package.json 不一致的值；不抛错即证明
+    // 它们已从副本清单里移除，不再要求每次发版手工对齐
+    expect(() => assertVersionConsistency(root)).not.toThrow();
+    expect(collectVersionCopies(root).copies).toHaveLength(1);
   });
 
   it("fails and names the drifted copy when plugin manifest drifts", () => {
@@ -71,34 +82,15 @@ describe("assertVersionConsistency", () => {
     );
   });
 
-  it("fails when a hook header tag drifts", () => {
-    writeFileSync(
-      path.join(root, "hooks/runtime.js"),
-      "#!/usr/bin/env node\n// openclaw-hook: v0.9.3\n"
-    );
-    let message = "";
-    try {
-      assertVersionConsistency(root);
-    } catch (err) {
-      message = err instanceof Error ? err.message : String(err);
-    }
-    expect(message).toContain("hooks/runtime.js header tag: 0.9.3");
-    expect(message).toContain(`expected ${VERSION}`);
-  });
-
-  it("fails when the hooks sub-package version drifts", () => {
-    writeJson("hooks/package.json", { name: "hooks", version: "0.9.0" });
+  it("flags a missing manifest version as drift", () => {
+    writeJson("openclaw.plugin.json", {});
     expect(() => assertVersionConsistency(root)).toThrow(
-      /hooks\/package\.json#version: 0\.9\.0/
+      /openclaw\.plugin\.json#version: \(missing\)/
     );
   });
 
-  it("reports every drifted copy in one error", () => {
+  it("reports the manifest drift alone, without unrelated labels", () => {
     writeJson("openclaw.plugin.json", { version: "1.0.0" });
-    writeFileSync(
-      path.join(root, "src/store.ts"),
-      `export class Store {\n  readonly version = '2.0.0';\n}\n`
-    );
     let message = "";
     try {
       assertVersionConsistency(root);
@@ -106,16 +98,10 @@ describe("assertVersionConsistency", () => {
       message = err instanceof Error ? err.message : String(err);
     }
     expect(message).toContain("openclaw.plugin.json#version: 1.0.0");
-    expect(message).toContain("src/store.ts readonly version: 2.0.0");
-    // non-drifted copies are not listed
-    expect(message).not.toContain("hooks/runtime.js header tag:");
-  });
-
-  it("flags a missing hook version tag", () => {
-    writeFileSync(path.join(root, "hooks/network.js"), "#!/usr/bin/env node\n");
-    expect(() => assertVersionConsistency(root)).toThrow(
-      /hooks\/network\.js header tag: \(tag missing\)/
-    );
+    expect(message).toContain(`expected ${VERSION}`);
+    expect(message).not.toContain("header tag");
+    expect(message).not.toContain("hooks/package.json");
+    expect(message).not.toContain("src/store.ts");
   });
 });
 

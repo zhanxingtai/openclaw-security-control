@@ -10,8 +10,7 @@ import { compileRuleRegexes, collectRulePatterns, isCatastrophicallyUnsafePatter
 import { parseSPLPolicy } from '../../src/intervention/SPLRuleLoader.js';
 import type { InterventionContext } from '../../src/intervention/types.js';
 
-// 2026-09-12 P1/P2 (#1): 正则预编译旁路结构（标准 3.2）、排序缓存与
-// enforce 命中短路（标准 3.3）的行为测试。
+// 正则预编译旁路结构、排序缓存与 enforce 命中短路的行为测试。
 
 describe('RuleRegexCache', () => {
   it('compiles all regex dimensions into RegExp at load time', () => {

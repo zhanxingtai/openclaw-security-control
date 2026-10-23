@@ -1,7 +1,7 @@
 {
   "$schema": "https://standards.sst/dicts/v1",
-  "version": 1,
-  "description": "跨项目 risk_flags 枚举字典。所有采集插件必须从此字典选用 flag，禁止自定义字符串。policy.md 的 riskFlagsAny/riskFlagsAll 引用本文件 enum。",
+  "version": 4,
+  "description": "跨项目 risk_flags 枚举字典。canonical 通道（definitions.flag_name.enum）跨项目封闭，新增 flag 必须先入 experimental 通道（definitions.experimental_flag_name.enum）并按 promotion_rules 升级。所有采集插件必须从此字典选用 flag，禁止自定义字符串。policy.md 与 spl-policy-v2/spec.md 的 riskFlagsAny/riskFlagsAll 引用本文件 enum。",
   "definitions": {
     "flag_name": {
       "type": "string",
@@ -33,6 +33,25 @@
         "internal_host",
         "secret_in_content"
       ]
+    },
+    "experimental_flag_name": {
+      "type": "string",
+      "enum": [
+        "pii_bank_card",
+        "pii_identity_card",
+        "pii_phone",
+        "sem_decode_layers",
+        "sem_lcs_gap",
+        "sem_position_cross",
+        "sem_repl_allowlist",
+        "sem_substring_diff",
+        "sem_token_structure_changed",
+        "taint_chunk_overlap",
+        "gate_anti_detect",
+        "gate_min_length",
+        "gate_allow_full"
+      ],
+      "description": "实验性 risk_flag 通道。供 SDK / 插件在 canonical 字典未收录时登记项目特定 flag；通过 promotion_rules 升级到 canonical 通道。policy.md / spl-policy-v2/spec.md 的 riskFlagsAny/riskFlagsAll 在使用前应先查本通道，再 fallback 到 flag_name 通道。verify-risk-flags.mjs 对两通道同样校验（不在任一通道 → ERROR）。新增 6 个 sem_<algo> algorithm-named flag（与 SDK 6 path 同名）；新增 4 个 taint/PII 实验 flag；新增 3 个 gate_<filter> 误报过滤层 flag（放行信号形态，不短路 first-match-wins）。"
     }
   },
   "registry": [
@@ -265,5 +284,16 @@
       "semantic_detector_disabled",
       "semantic_engine_unavailable"
     ]
+  },
+  "promotion_rules": {
+    "description": "experimental_flag_name → flag_name 升级规则。本字段定义跨仓 promote 流程的最低门槛与生命周期。",
+    "minimum_consumers": 2,
+    "minimum_consumers_rationale": "至少 2 个采集插件（openclaw / coze / vscode / hermes / n8n / dsh 中任意 2 个）在 ≥2 个真实部署中采用该 flag。避免字典收敛到不存在的概念。",
+    "minimum_sustained_days": 180,
+    "minimum_sustained_days_rationale": "experimental flag 至少稳定使用 180 天（约 6 个月），确保非短期临时需求。",
+    "promotion_path": "1. 提交 promote PR（governance/dicts/risk-flags.json：experimental_flag_name → flag_name 移动；registry 加条目；version 字段 +1） 2. 跨仓通知 OpenClaw / DSH 等至少 2 个采用方 3. CI 通过：verify-risk-flags.mjs + governance/verify.mjs 4. 等 7 天 review window 5. 合入 main 并 bump version",
+    "demotion_path": "已 promote 的 flag 若 365 天内无任何插件使用，移到 deprecated 路径（registry.deprecated 设值），进入 deprecation 流程。",
+    "deprecation_window": "1.x WARN, 2.x removed",
+    "deprecation_window_rationale": "在升级到下一主版本前给出现有插件至少 1 个 minor release 的迁移窗口；verify-risk-flags.mjs 对 deprecated flag 输出 WARN（仍可用但提示迁新名）。"
   }
 }

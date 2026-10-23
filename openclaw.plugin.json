@@ -2,17 +2,9 @@
   "id": "sst-security-control-openclaw",
   "name": "sst-security-control-openclaw",
   "displayName": "SST Security Control 安全监控插件",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "为 OpenClaw 提供运行安全检测、风险识别和高风险操作控制。支持本地独立运行，默认不注册、不联网、不上传安全数据。",
   "schema_version": 1,
-  "plugin": {
-    "id": "sst-security-control-openclaw-v1.0.0",
-    "name": "sst-security-control-openclaw",
-    "displayName": "SST Security Control 安全监控插件",
-    "version": "1.0.0",
-    "entry": "index.ts",
-    "license": "Apache-2.0"
-  },
   "host_compat": [
     {
       "host_id": "openclaw",

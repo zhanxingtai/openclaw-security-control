@@ -347,7 +347,6 @@ function pinHookEnv(values: Record<string, string | undefined>): void {
 
 export class SecurityMonitorStore implements OpenClawMiddleware {
   readonly name = 'sst-security-control-openclaw';
-  readonly version = '1.0.0';
 
   private config: SecurityMonitorConfig;
   /** Expose the merged config so the panel can render the full editable surface. */

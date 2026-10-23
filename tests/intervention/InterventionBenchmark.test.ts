@@ -6,7 +6,7 @@ import { InterventionEngineImpl } from '../../src/intervention/InterventionEngin
 import type { InterventionContext } from '../../src/intervention/types.js';
 
 /**
- * 2026-09-12 P3 (#1): CI 性能回归哨兵（标准 2.4）。
+ * CI 性能回归哨兵。
  * 覆盖 N=100/1000/5000 三档含 paramsRegex 规则的评估延迟。
  *
  * 注意：这是回归哨兵而非精确基准——阈值留足共享 CI 环境余量；

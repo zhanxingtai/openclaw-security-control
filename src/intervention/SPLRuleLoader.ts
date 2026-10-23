@@ -580,8 +580,8 @@ function warnUndeliverableNotesMissing(rule: {
  *   - 模式：^[A-Z][A-Z0-9_]*_[0-9]{3}$（多段命名，末段为 _NNN 数字编号）
  *   - 第一段必须等于 rule.category.uppercase() 的第一个单词（即多词 category
  *     仅首词进入 blockCode 第一段；如 self_protection → SELF）
- *   - 当前阶段仅 WARN（不 throw），避免破坏现行命名规范；
- *     后续批次可逐步收紧为 throw
+ *   - 当前阶段仅 WARN（不 throw），避免破坏现行命名规范；命名规范稳定后可
+ *     收紧为 throw
  */
 function warnBlockCodeSemanticMismatch(rule: {
   id: string;

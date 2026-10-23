@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
+import { fileURLToPath } from "url";
 import {
   seedDefaultPolicy,
   ensureBundledHooks,
@@ -18,6 +19,16 @@ import { normalizeConfig } from "../src/config.js";
  * probeRuntimeHookLoaded / probePythonPsutil（含 isSafePythonPath 闸门）/
  * applyBootstrapResults 的强制降级语义。
  */
+
+/**
+ * 随包 hook 源目录（源码树里的 hooks/，与 ensureBundledHooks 经
+ * findBundledDir("hooks") 解析到的同一目录）。测试从源文件现读期望内容，
+ * 不写死版本字面量。
+ */
+const BUNDLED_HOOKS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../hooks"
+);
 
 let tmpDir: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -64,28 +75,63 @@ describe("ensureBundledHooks 升级逻辑", () => {
   const enabledConfig = () =>
     normalizeConfig({ application: { runtimeHooks: { enabled: true } } });
 
+  const extDir = () => path.join(tmpDir, "extensions", "sst-security-control-openclaw");
+  const bundledSource = (file: string) => readFileSync(path.join(BUNDLED_HOOKS_DIR, file), "utf8");
+
   it("首次安装：拷贝 hook 三件套并返回 true", () => {
     expect(ensureBundledHooks(enabledConfig())).toBe(true);
-    const ext = path.join(tmpDir, "extensions", "sst-security-control-openclaw");
     for (const f of ["runtime.js", "network.js", "hook-mounter.js"]) {
-      expect(existsSync(path.join(ext, f))).toBe(true);
+      expect(existsSync(path.join(extDir(), f))).toBe(true);
     }
   });
 
-  it("版本标签一致时不重复拷贝（返回 false）", () => {
+  it("已装副本与随包副本一致时不重复拷贝（返回 false）", () => {
     ensureBundledHooks(enabledConfig());
     expect(ensureBundledHooks(enabledConfig())).toBe(false);
   });
 
-  it("目标版本标签过期时升级拷贝", () => {
+  it("已装副本内容被改动时恢复为随包副本", () => {
     ensureBundledHooks(enabledConfig());
-    const ext = path.join(tmpDir, "extensions", "sst-security-control-openclaw");
-    const target = path.join(ext, "runtime.js");
-    // 人为把目标标签改旧，下一次 ensureBundledHooks 必须发现并升级
-    const content = readFileSync(target, "utf8");
-    writeFileSync(target, content.replace(/\/\/ openclaw-hook: v\S+/, "// openclaw-hook: v0.0.1"));
+    const target = path.join(extDir(), "runtime.js");
+    writeFileSync(target, `${readFileSync(target, "utf8")}\n// tampered\n`);
     expect(ensureBundledHooks(enabledConfig())).toBe(true);
-    expect(readFileSync(target, "utf8")).toContain("// openclaw-hook: v1.0.0");
+    expect(readFileSync(target, "utf8")).toBe(bundledSource("runtime.js"));
+  });
+
+  it("文件尾部的改动（第 200 字节之后）也能触发升级", () => {
+    // 旧实现只读文件头若干字节比对 tag，尾部修复对它完全不可见 ——
+    // 这正是"OPENCLAW_MONITOR_LOG_PATH 修复重装多次仍送不到容器"的成因。
+    ensureBundledHooks(enabledConfig());
+    const target = path.join(extDir(), "runtime.js");
+    const pristine = bundledSource("runtime.js");
+    expect(pristine.length).toBeGreaterThan(200); // 前提：内容确实越过旧读取窗口
+    // 只在文件末尾附近改动，正文前 200 字节保持逐字节相同
+    const tailTampered = `${pristine.slice(0, pristine.length - 10)}// XXXXXXX\n`;
+    expect(tailTampered.slice(0, 200)).toBe(pristine.slice(0, 200));
+    writeFileSync(target, tailTampered);
+    expect(ensureBundledHooks(enabledConfig())).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(pristine);
+  });
+
+  it("hook-mounter.js（无版本 tag）也能随内容变化升级", () => {
+    // 该文件从来没有 tag。旧实现下两边都读到 undefined、判定相等而跳过，
+    // 自 tag 机制引入以来对老用户从未更新过。内容哈希对它一视同仁。
+    ensureBundledHooks(enabledConfig());
+    const target = path.join(extDir(), "hook-mounter.js");
+    expect(bundledSource("hook-mounter.js")).not.toMatch(/^\/\/ openclaw-hook:/m);
+    writeFileSync(target, `${readFileSync(target, "utf8")}\n// stale\n`);
+    expect(ensureBundledHooks(enabledConfig())).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(bundledSource("hook-mounter.js"));
+  });
+
+  it("只改版本 tag 不触发拷贝（tag 已不承载判定语义）", () => {
+    // tag 是给人读的信息性注释，不参与指纹；改它不该让用户重新落盘 hook。
+    ensureBundledHooks(enabledConfig());
+    const target = path.join(extDir(), "runtime.js");
+    const pristine = bundledSource("runtime.js");
+    writeFileSync(target, pristine.replace(/^\/\/ openclaw-hook:.*$/m, "// openclaw-hook: v0.0.1"));
+    expect(ensureBundledHooks(enabledConfig())).toBe(false);
+    expect(readFileSync(target, "utf8")).toContain("// openclaw-hook: v0.0.1");
   });
 
   it("runtimeHooks 未启用时直接返回 false", () => {

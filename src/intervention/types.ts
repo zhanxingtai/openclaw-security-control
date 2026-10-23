@@ -631,7 +631,7 @@ export interface InterventionStats {
   audits: number;
   /** Number of fallback decisions. */
   fallbacks: number;
-  /** 评估延迟累计（ms），用于心跳上报平均值（标准 4.4）。 */
+  /** 评估延迟累计（ms），用于心跳上报平均值。 */
   latencyTotalMs?: number;
   /** 平均评估延迟（ms），由 getStats 计算。 */
   avgLatencyMs?: number;

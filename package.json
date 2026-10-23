@@ -1,6 +1,6 @@
 {
   "name": "@zhanxing/sst-security-control-openclaw",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "面向 OpenClaw 的开源运行安全插件，提供本地风险检测、安全事件记录及高风险操作策略控制。",
   "type": "module",
   "main": "index.ts",
@@ -17,7 +17,8 @@
     "policies",
     "dist",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "scripts": {
     "build": "tsc",

@@ -32,7 +32,8 @@
 // Each step is best-effort: failure is logged, never thrown. The plugin must
 // always boot even when the host is missing prereqs.
 
-import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, readSync, unlinkSync } from "fs";
+import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "fs";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve, join, basename, isAbsolute } from "path";
 import { fileURLToPath } from "url";
@@ -171,21 +172,20 @@ export function ensureBundledHooks(
     mkdirSync(extensionsDir, { recursive: true });
     let installed = false;
     // hook-mounter.js is the recommended preload entry point (gracefully
-    // degrades when sibling hook files are missing). It is always copied —
-    // even on first install — so older deployments that still point
-    // NODE_OPTIONS at runtime.js / network.js directly still work.
+    // degrades when sibling hook files are missing). It ships alongside the
+    // other two so older deployments that still point NODE_OPTIONS at
+    // runtime.js / network.js directly still work.
     const HOOK_FILES = ["runtime.js", "network.js", "hook-mounter.js"];
     for (const hookName of HOOK_FILES) {
       const source = resolve(hooksDir, hookName);
       if (!existsSync(source)) continue;
       const target = resolve(extensionsDir, hookName);
-      // Upgrade when the target is missing OR when its embedded version
-      // tag (// openclaw-hook: vX.Y.Z) does not match the bundled source.
-      // Without this check, ensureBundledHooks would silently keep stale
-      // hook files after plugin upgrades — leading to the same bug we saw
-      // when the OPENCLAW_MONITOR_LOG_PATH fallback fix never reached the
-      // container despite multiple plugin reinstalls.
-      if (existsSync(target) && readHookVersion(target) === readHookVersion(source)) {
+      // Upgrade when the target is missing OR when its content fingerprint
+      // differs from the bundled source. Without this check, ensureBundledHooks
+      // would silently keep stale hook files after plugin upgrades — leading
+      // to the same bug we saw when the OPENCLAW_MONITOR_LOG_PATH fallback
+      // fix never reached the container despite multiple plugin reinstalls.
+      if (existsSync(target) && readHookFingerprint(target) === readHookFingerprint(source)) {
         continue;
       }
       copyFileSync(source, target);
@@ -211,23 +211,33 @@ export function ensureBundledHooks(
 }
 
 /**
- * Read the `// openclaw-hook: vX.Y.Z` version tag from the first 200 bytes
- * of a hook file. Returns undefined if the tag is absent or unreadable so
- * callers can decide whether to upgrade (tag mismatch → upgrade, no tag →
- * upgrade because the source always carries the tag).
+ * Fingerprint a hook file: SHA-256 over its FULL contents with the
+ * `// openclaw-hook: vX.Y.Z` header line normalized to a constant.
+ *
+ * 为什么用内容哈希而不是手写版本号：
+ *   - 这里的判定语义是"已装副本与随包副本是不是同一份内容"。哈希天然覆盖
+ *     全文，改任何一行都会让已装副本被判过期并覆盖。旧的手写 tag 有 7 次
+ *     内容改动没 bump（fix(issue-57)、fix(issue-60)、fix(issue-67) 等），
+ *     那些修复是攒到下一个版本 bump 才一起送到用户手上的 —— tag 实际扮演
+ *     的是"随哪个版本发货"，不是"第几次改动"。
+ *   - tag 行保留为人读注释，但归一化后不再影响哈希，也就不再需要人工维护。
+ *     顺手解决"发版要改两个 hook 文件头"这件事。
+ *   - hook-mounter.js 从来没有 tag。旧实现下两边都读到 undefined、判定相等
+ *     而跳过，该文件自 tag 机制引入（0cee1fc）以来对老用户从未更新过。哈希
+ *     对三个文件一视同仁，这个洞自动消失。
+ *
+ * 必须哈希整个文件而不是头部若干字节：只读前 N 字节会漏掉文件尾部的修复，
+ * 正是当初"修复送不到容器"事故的成因。
+ *
+ * Returns undefined if the file is unreadable so the caller upgrades.
  */
-function readHookVersion(filePath: string): string | undefined {
+function readHookFingerprint(filePath: string): string | undefined {
   try {
-    const fd = openSync(filePath, "r");
-    try {
-      const buffer = Buffer.alloc(200);
-      const bytesRead = readSync(fd, buffer, 0, 200, 0);
-      const head = buffer.toString("utf8", 0, bytesRead);
-      const match = head.match(/\/\/ openclaw-hook:\s*(\S+)/);
-      return match ? match[1] : undefined;
-    } finally {
-      closeSync(fd);
-    }
+    const source = readFileSync(filePath, "utf8");
+    // 归一化而非删除：带 tag 与不带 tag 的文件在同一位置留下同样的占位，
+    // 这样"只 bump 了 tag"不会改变指纹（tag 已不承载语义）。
+    const normalized = source.replace(/^\/\/ openclaw-hook:.*$/m, "// openclaw-hook");
+    return createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 16);
   } catch {
     return undefined;
   }

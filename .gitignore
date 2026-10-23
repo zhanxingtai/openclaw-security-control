@@ -1,7 +1,6 @@
 node_modules/
 dist/
 install/
-examples/
 tmp/
 .venv/
 __pycache__/
@@ -16,18 +15,12 @@ coverage/
 .idea/
 *.tsbuildinfo
 security-events.jsonl
+# 插件自有状态（面板语言偏好等）。正常落在宿主配置目录里，但把
+# OPENCLAW_HOME 指到仓库内跑时会落在这里，别把它提交出去。
+panel-state.json
 stress-reports/
-dist-artifacts/
-**/__pycache__/
-*.pyc
-*.pyo
-.gitea/*
-!.gitea/project.json
 .claude/
 .ccgui/
-.archive/
 CLAUDE.md
 # 规则评估/探测脚本调试输出
 acc.json
-probe.err.log
-stderr.log

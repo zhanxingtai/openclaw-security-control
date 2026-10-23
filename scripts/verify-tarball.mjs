@@ -50,6 +50,9 @@ const REQUIRED = [
   'package/hooks/',
   'package/system/',
   'package/README.md',
+  // 中文版 README 随包分发。没有这条断言，某天 copyFile 被漏掉时 CI 不会报错，
+  // 中文用户会在 tgz 里找不到 README.zh-CN.md。
+  'package/README.zh-CN.md',
 ];
 
 // Entries that must not appear in the install bundle.

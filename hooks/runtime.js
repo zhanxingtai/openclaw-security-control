@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// openclaw-hook: v1.0.0
+// openclaw-hook: v1.0.1 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
 /**
  * OpenClaw Security Monitor - Node.js Runtime Hook
  *

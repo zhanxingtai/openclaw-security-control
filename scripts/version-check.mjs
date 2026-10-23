@@ -1,10 +1,17 @@
 /**
  * Version single-source-of-truth check.
  *
- * package.json#version 是唯一权威版本；其他副本（openclaw.plugin.json、
- * hooks/package.json、hooks/*.js `// openclaw-hook: vX.Y.Z` 头、
- * src/store.ts `readonly version`）必须与之对齐。scripts/build.js 在编译
- * 前跑此脚本，drift 即 fail；导出纯函数供 vitest 单测覆盖两种路径。
+ * package.json#version 是唯一权威版本，openclaw.plugin.json#version 是唯一
+ * 允许存在的副本（宿主清单契约，OpenClaw 靠它认插件版本）。scripts/build.js
+ * 在编译前跑此脚本，两者不等即 fail；导出纯函数供 vitest 单测覆盖两条路径。
+ *
+ * 为什么只有这一个副本：
+ *   - hooks/*.js 里没有任何版本号。它们按内容哈希判定是否需要重装（见
+ *     src/initialize.ts readHookFingerprint），改内容自动生效，不需要人工
+ *     记得 bump 什么，也不跟踪包版本。
+ *   - hooks/package.json#version 无读者（Node 解析只看 name/main/type）。
+ *   - 运行时版本（面板副标题、启动日志）由 index.ts resolvePluginVersion()
+ *     从 package.json 现读，不缓存。
  */
 import fs from 'fs';
 import path from 'path';
@@ -22,23 +29,6 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
-/**
- * @param {string} hookSource
- * @param {string} fileName
- * @returns {VersionCopy}
- */
-function hookHeaderVersion(hookSource, fileName) {
-  const label = `hooks/${fileName} header tag`;
-  let source;
-  try {
-    source = fs.readFileSync(path.join(hookSource, fileName), 'utf8');
-  } catch {
-    return { label, value: '(file missing)' };
-  }
-  const match = source.match(/\/\/ openclaw-hook: v(\d+\.\d+\.\d+)/);
-  return { label, value: match ? match[1] : '(tag missing)' };
-}
-
 /** Collect every version copy in the tree alongside the expected value.
  * @param {string} rootDir
  * @returns {VersionAudit}
@@ -54,28 +44,6 @@ export function collectVersionCopies(rootDir) {
       value: String(readJson(path.join(rootDir, 'openclaw.plugin.json')).version ?? '(missing)'),
     },
   ];
-
-  // The hooks live at the repo root; fall back to src/hooks when absent.
-  const hooksDir = fs.existsSync(path.join(rootDir, 'hooks'))
-    ? path.join(rootDir, 'hooks')
-    : path.join(rootDir, 'src', 'hooks');
-  copies.push(hookHeaderVersion(hooksDir, 'runtime.js'));
-  copies.push(hookHeaderVersion(hooksDir, 'network.js'));
-  copies.push({
-    label: 'hooks/package.json#version',
-    value: String(readJson(path.join(hooksDir, 'package.json')).version ?? '(missing)'),
-  });
-
-  let storeSource = '';
-  try {
-    storeSource = fs.readFileSync(path.join(rootDir, 'src', 'store.ts'), 'utf8');
-  } catch {
-    /* src/store.ts may be absent */
-  }
-  if (storeSource) {
-    const match = storeSource.match(/readonly version = '([^']+)'/);
-    copies.push({ label: 'src/store.ts readonly version', value: match ? match[1] : '(missing)' });
-  }
 
   return { expected, copies };
 }

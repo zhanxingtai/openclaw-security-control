@@ -66,11 +66,22 @@ function copyFile(src, dest) {
   fs.copyFileSync(src, dest);
 }
 
+// 缓存与测试产物一律不进包。tsconfig 的 `exclude: ["**/*.test.ts"]` 只约束
+// tsc 的编译产物，管不到 copyDir 对源码目录的原样拷贝——hooks/*.test.ts 和
+// monitor/.pytest_cache/（本地跑 pytest 留下的，已被 .gitignore 忽略）此前
+// 就是这样漏进 tgz 的。规则挂在 copyDir 内部而非逐个调用点，新增拷贝路径
+// 不会重新引入。
+const CACHE_DIR_NAMES = ['__pycache__', '.pytest_cache'];
+const TEST_FILE_RE = /\.test\.[cm]?[jt]sx?$/;
+
 function copyDir(src, dest, options = {}) {
   const excludeNames = options.excludeNames || [];
   const excludeExtensions = options.excludeExtensions || [];
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    if (CACHE_DIR_NAMES.includes(entry.name) || TEST_FILE_RE.test(entry.name)) {
+      continue;
+    }
     if (excludeNames.includes(entry.name)) {
       continue;
     }
@@ -113,7 +124,7 @@ function vendorRuntimeDeps(applicationDir) {
       // browser/: Node runtime 不需要 js-yaml 的浏览器构建
       // bin/:  CLI 入口不进 tgz
       // LICENSE/CHANGELOG.md/README.md:  vendored 元数据,与 install/LICENSE 重复且运行时不需要
-      excludeNames: ['__pycache__', '.bin', 'test', 'tests', 'browser', 'bin', 'LICENSE'],
+      excludeNames: ['.bin', 'test', 'tests', 'browser', 'bin', 'LICENSE'],
       excludeExtensions: ['.cmd', '.ps1', '.map', '.d.ts', '.md'],
     });
     log(`vendored ${dep} → ${path.relative(rootDir, dest)}`);
@@ -217,7 +228,7 @@ function packageInstall() {
   // Also exclude the dist-only plugin manifest; the root manifest is the source
   // of truth for the install bundle.
   copyDir(distDir, path.join(installDir, 'application'), {
-    excludeNames: ['__pycache__', 'monitor', 'openclaw.plugin.json'],
+    excludeNames: ['monitor', 'openclaw.plugin.json'],
     excludeExtensions: ['.pyc', '.map'], // .map: 生产不需要 source map
   });
 
@@ -238,15 +249,17 @@ function packageInstall() {
   if (fs.existsSync(monitorSrc)) {
     copyDir(monitorSrc, path.join(installDir, 'system'), {
       // run_tests.py / test_process_monitor.py: 测试文件不进 tgz
-      excludeNames: ['__pycache__', 'run_tests.py', 'test_process_monitor.py'],
+      // （*.test.ts 由 copyDir 统一排除，此处只剩 Python 命名不带后缀的）
+      excludeNames: ['run_tests.py', 'test_process_monitor.py'],
       excludeExtensions: ['.pyc'],
     });
   }
 
   // Copy runtime hooks into the install bundle.
+  // hooks/ 下是未编译的 .ts 源码，copyDir 会统一排掉 *.test.ts（tsconfig 的
+  // exclude 只管 tsc 产物，管不到这里的原样拷贝）。
   if (fs.existsSync(hooksSrc)) {
     copyDir(hooksSrc, path.join(installDir, 'hooks'), {
-      excludeNames: ['__pycache__'],
       excludeExtensions: ['.pyc', '.map'],
     });
   }
@@ -280,6 +293,9 @@ function packageInstall() {
       'index.js',
       'openclaw.plugin.json',
       'README.md',
+      // 中文版 README 随包分发：npm 包页只渲染 README.md（英文），
+      // 中文用户拿到 tgz 后没有 README.zh-CN.md 就只能读英文安装步骤。
+      'README.zh-CN.md',
       // 维护者文档（docs/INSTALL.md、docs/CHANGELOG.md 等）不进 tgz；
       // 用户面向安装步骤在 README。其余维护者文档保留在仓库供审计，
       // 但不出现在公开 npm tarball。
@@ -319,11 +335,13 @@ function packageInstall() {
   );
 
   copyFile(path.join(rootDir, 'README.md'), path.join(installDir, 'README.md'));
+  copyFile(path.join(rootDir, 'README.zh-CN.md'), path.join(installDir, 'README.zh-CN.md'));
   // 合规材料：Apache-2.0 要求随分发附带许可文本。
   copyFile(path.join(rootDir, 'LICENSE'), path.join(installDir, 'LICENSE'));
-  // Include the canonical intervention policy in both policies/ and examples/
-  // so setup can seed it while keeping backward compatibility with docs that
-  // reference examples/security-policy.yaml.
+  // Ship the canonical intervention policy as policies/security-policy.yaml so
+  // setup can seed it. The former examples/security-policy.yaml mirror is gone:
+  // it was byte-identical to policies/ and the setup seed template was dropped,
+  // leaving no tracked reference to examples/ anywhere in the repo.
   const policyPaths = [
     path.join(rootDir, 'policies', 'security-policy.spl.yaml'),
     path.join(rootDir, 'policies', 'security-policy.yaml'),
@@ -333,16 +351,13 @@ function packageInstall() {
   if (policySrc) {
     fs.mkdirSync(path.join(installDir, 'policies'), { recursive: true });
     copyFile(policySrc, path.join(installDir, 'policies', 'security-policy.yaml'));
-    // examples/ 不进 tgz（与 policies/ 字节级重复,仓库内 examples/ 保留
-    // 作为 setup 阶段 seed 模板）。原 copyFile 行已注释:
-    //   copyFile(policySrc, path.join(installDir, 'examples', 'security-policy.yaml'));
+    // examples/ 已下线:不进 tgz(与 policies/ 字节级重复),仓库也不再跟踪该目录。
 
     // Ship a JSON sibling of the policy: RuleLoader falls back to the .json
     // variant when js-yaml is unavailable in the deployment, which otherwise
     // leaves the intervention engine running with an empty (allow-all) policy.
     const policyJson = JSON.stringify(yaml.load(fs.readFileSync(policySrc, 'utf8')), null, 2) + '\n';
     fs.writeFileSync(path.join(installDir, 'policies', 'security-policy.json'), policyJson);
-    // fs.writeFileSync(path.join(installDir, 'examples', 'security-policy.json'), policyJson);
     log('generated security-policy.json fallback (for deployments without js-yaml)');
 
     // SPL 策略 JSON Schema 随包分发：使用方编写自定义
@@ -509,7 +524,20 @@ function assertInstallTarballIntegrity(tarballPath, installDir) {
     for (const e of entries.slice(0, 30)) log(`    ${e}`);
     process.exit(1);
   }
-  log(`tarball integrity OK: ${path.basename(tarballPath)} 含 ${required.length} 项关键文件（${entries.length} entries）`);
+  // 反向断言：测试/缓存产物不得进包。tsconfig 的 exclude 只约束 tsc 产物，
+  // 管不到 copyDir 对源码目录的原样拷贝——hooks/*.test.ts 与
+  // monitor/.pytest_cache/ 曾这样静默进包。正向的"必含"检查看不见这类泄漏
+  // （entry 只是多了几行，测试仍绿），所以反向钉死，新泄漏直接让构建失败。
+  const leaked = entries.filter(
+    (e) => TEST_FILE_RE.test(e) || CACHE_DIR_NAMES.some((c) => e.split('/').includes(c))
+  );
+  if (leaked.length > 0) {
+    log(`FAIL: tarball ${path.basename(tarballPath)} 含 ${leaked.length} 个测试/缓存产物：`);
+    for (const e of leaked) log(`  - ${e}`);
+    log('  提示：检查 copyDir 的 exclude 规则；若新增了拷贝路径，确认它没有绕开统一过滤。');
+    process.exit(1);
+  }
+  log(`tarball integrity OK: ${path.basename(tarballPath)} 含 ${required.length} 项关键文件、0 个测试/缓存产物（${entries.length} entries）`);
 }
 
 function main() {
@@ -541,7 +569,7 @@ function main() {
   const monitorSrc = path.join(rootDir, 'src', 'monitor');
   const monitorDist = path.join(distDir, 'monitor');
   if (fs.existsSync(monitorSrc)) {
-    copyDir(monitorSrc, monitorDist, { excludeNames: ['__pycache__'], excludeExtensions: ['.pyc'] });
+    copyDir(monitorSrc, monitorDist, { excludeExtensions: ['.pyc'] });
   }
 
   // Copy plugin manifest into dist/ so OpenClaw can discover the plugin.

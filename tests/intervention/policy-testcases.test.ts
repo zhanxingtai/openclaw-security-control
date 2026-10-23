@@ -97,8 +97,8 @@ describe('policy-testcases runner', () => {
     // 基线锚点：shipped 策略当前规模（规则/可执行用例数）变化时此处更新，
     // 防止静默丢失整组用例；跳过清单（disabled 规则的用例）在下方断言为空
     // 以外的部分由 console.log 输出供审计。
-    expect(summary.rules).toBe(90); // 70 + 7（通用攻击面规则组 v1.2.0：paste/gist 外传、远端传输、多语言反弹、capabilities、进程终止、procfs）+ 13（自保护规则组 v1.3.0：cron 写入、防火墙清空、SELinux 降级、ptrace、审计文件篡改、插件路径、磁盘覆写）
-    expect(summary.executableCases).toBe(477); // 350 + 27（match 取强补充用例：imds/ssrf/rm-root/db-dump/db-live/proc-mem）+ 100（自保护规则组 + cron/firewall/SELinux/ptrace/审计/插件路径/磁盘覆写 等新增用例）
+    expect(summary.rules).toBe(91); // 70 + 7（通用攻击面规则组：paste/gist 外传、远端传输、多语言反弹、capabilities、进程终止、procfs）+ 13（自保护规则组：cron 写入、防火墙清空、SELinux 降级、ptrace、审计文件篡改、插件路径、磁盘覆写）+ 1（self-protection-block-gateway-config-write：收窄 gateway config 写轴误拦时新增）
+    expect(summary.executableCases).toBe(485); // 350 + 27（match 取强补充用例：imds/ssrf/rm-root/db-dump/db-live/proc-mem）+ 100（自保护规则组 + cron/firewall/SELinux/ptrace/审计/插件路径/磁盘覆写 等新增用例）+ 8（gateway config 写轴收窄：self-protection-block-gateway-action 净增 2 条 + 新规则 6 条）
     console.log(JSON.stringify(summary, null, 2));
   });
 

@@ -45,7 +45,7 @@ npm run build:ci
 
 ```bash
 ls -la install/
-tar -tzf install/sst-security-control-openclaw-1.0.0.tgz | grep -E "changed/file|changed/keyword"
+tar -tzf install/sst-security-control-openclaw-1.0.1.tgz | grep -E "changed/file|changed/keyword"
 ```
 
 ## 3. 避免重复测试反模式
@@ -74,7 +74,7 @@ GitHub 公开仓库（remote `github`）走独立孤儿分支 `github-main`，�
 ### 5.1 红线
 
 - **禁止在 `github-main` 上直接 commit**（含 amend/rebase/cherry-pick）。该分支上的 commit 只允许由 `scripts/oss-sync.sh` 产出。
-- OSS commit 身份固定为 `hixss <17995374+hixss@users.noreply.github.com>`，**绝不使用**全局 git 配置里的内部身份（`support@zhihuizhanxing.com`）。
+- OSS commit 身份固定为 `hixss <17995374+hixss@users.noreply.github.com>`，**绝不使用**全局 git 配置里的内部身份。
 - **绝不执行 `git push --mirror`** 到 `github` remote——会绕过所有防护把内网全量历史推到公网。
 - 不在 `github` remote 上创建 HTTPS 地址；推送只走已配置的 SSH 通道。
 

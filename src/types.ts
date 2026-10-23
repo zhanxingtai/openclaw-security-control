@@ -144,7 +144,13 @@ export interface OpenClawPluginAPI {
 
 export interface OpenClawMiddleware {
   readonly name: string;
-  readonly version: string;
+  /**
+   * 宿主契约里该字段是可选的（见 src/openclaw-sdk/plugin-api.ts 的
+   * `version?: string`）。这里保持同样可选：强制要求等于要在每个实现类里
+   * 手抄一份包版本，而版本已经由 package.json 单一权威 + 运行时解析
+   * （index.ts resolvePluginVersion）提供，副本只会漂移。
+   */
+  readonly version?: string;
   initialize?: (config: Record<string, unknown>) => Promise<void>;
   beforeToolCall?: (context: MiddlewareContext) => Promise<MiddlewareResult>;
   afterToolCall?: (context: MiddlewareContext, result: unknown) => Promise<void>;
@@ -738,6 +744,12 @@ export interface ApplicationLayerConfig {
    * (e.g. passes "unknown"). Useful for single-agent deployments.
    */
   defaultAgentId?: string;
+  /**
+   * Panel UI language. `auto` negotiates from `?lang=` / `Accept-Language` and
+   * falls back to English; `en` / `zh` pin the panel regardless of the browser.
+   * Written by the header language switcher, also editable on the Config tab.
+   */
+  panelLocale?: 'auto' | 'en' | 'zh';
   runtimeHooks?: RuntimeHooksConfig;
 }
 

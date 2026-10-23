@@ -261,7 +261,7 @@
       "$ref": "#/$defs/layeredPatternMap"
     },
     "x-openclaw-selfProtection": {
-      "description": "项目扩展区段（openclaw 自用，V2 批次 1）：构建期生成 self-protection-patterns.generated.json 供 SelfProtection.ts 加载（缺失时回退内置常量）。与早期 v1 兼容期 legacy `selfProtection` 顶层键互斥，v2 策略必须使用本字段。",
+      "description": "项目扩展区段（openclaw 自用）：构建期生成 self-protection-patterns.generated.json 供 SelfProtection.ts 加载（缺失时回退内置常量）。与 legacy `selfProtection` 顶层键互斥，v2 策略必须使用本字段。",
       "type": "object",
       "required": [
         "groups",
@@ -742,7 +742,7 @@
       },
       "allOf": [
         {
-          "description": "severity 条件必填：decision ∈ {block, warn} 时 severity 必填（V2 批次 1）；其他决策挂值无意义但允许缺省。",
+          "description": "severity 条件必填：decision ∈ {block, warn} 时 severity 必填；其他决策挂值无意义但允许缺省。",
           "if": {
             "properties": {
               "action": {

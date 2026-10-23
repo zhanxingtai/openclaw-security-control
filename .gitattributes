@@ -1,3 +1,21 @@
-# Shell 脚本与 git hooks 必须保持 LF，否则 Git Bash 下 CRLF 会让 bash 钩子报错
-*.sh                 text eol=lf
-scripts/git-hooks/*  text eol=lf
+# 全仓统一 LF。
+#
+# 背景：core.autocrlf=true 会让未声明 text 的文件在 LF 与 CRLF 之间反复转换，
+# 导致两种噪音——每条 git 命令刷 "LF will be replaced by CRLF" 警告，以及
+# index stat 缓存失效后 git status/diff-files 持续误报修改（内容其实字节级一致，
+# git diff --raw 经内容比对后并不列出它们）。
+#
+# 显式声明 text/eol 后，.gitattributes 的优先级高于 core.autocrlf，转换行为确定：
+# index 与工作区一律 LF，Windows 下也不再被 autocrlf 改写。
+#
+# text=auto 由 git 按文件前 8000 字节是否含 NUL 自动区分文本与二进制，无需逐类枚举；
+# 但 assets/ 下的二进制资产仍显式标注 binary，以免启发式判断变化时被误规范化。
+* text=auto eol=lf
+
+*.ico binary
+*.jpg binary
+
+# shell 脚本与 git hooks 必须保持 LF，否则 Git Bash 下 CRLF 会让 bash 钩子报错。
+# 已被上面的 * text=auto eol=lf 覆盖，此处显式保留以固化该意图。
+*.sh                text eol=lf
+scripts/git-hooks/* text eol=lf

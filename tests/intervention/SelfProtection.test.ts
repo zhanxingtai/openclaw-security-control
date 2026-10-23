@@ -268,6 +268,24 @@ describe('SelfProtection', () => {
       expect(result.blocked).toBe(false);
     });
 
+    it('allows benign gateway config writes that target non-plugin paths', () => {
+      // gateway config 写轴只在硬编码层做"写操作 且 指向插件配置"的意图判别，
+      // 目标是无关配置项时必须放行。SPL 侧由 self-protection-block-gateway-config-write
+      // 的 path 锚点集合做同一条判别；两层对良性配置写的结论必须一致。
+      for (const params of [
+        { action: 'config.set', path: 'logging.level', value: 'debug' },
+        { action: 'config.patch', path: 'server.timeoutMs', value: '30000' },
+        { action: 'config.unset', path: 'experimental.flag' },
+      ]) {
+        expect(SelfProtection.evaluate(toolCtx('gateway', params)).blocked).toBe(false);
+      }
+      expect(
+        SelfProtection.evaluate(
+          toolCtx('config_manager', { action: 'config.set', path: 'logging.level', value: 'debug' })
+        ).blocked
+      ).toBe(false);
+    });
+
     it('blocks openclaw plugins uninstall command (plural)', () => {
       const result = SelfProtection.evaluate(
         toolCtx('exec', {
@@ -341,6 +359,42 @@ describe('SelfProtection', () => {
       const result = SelfProtection.evaluate(
         toolCtx('plugin_uninstall', {
           plugin: 'openclaw-security-monitor',
+        })
+      );
+      expect(result.blocked).toBe(true);
+    });
+
+    // ---- 已知盲区：目标名字段名枚举不完整 ----
+    //
+    // isGatewayDisablingPlugin 的目标名只从 plugin / extension / pluginId /
+    // extensionId / id / target 六个 key 取。调用方把目标写在别的字段
+    // （最常见是 value）时取不到目标，硬编码层判不出意图。兜底分支
+    // （isSelfHarmMessage / isGatewayConfigSelfHarm 扫全部 param 文本）也
+    // 覆盖不到裸插件名——它要的是插件名 **加** enabled:false / disable / null
+    // 之类的共现形态。
+    //
+    // 当前这两条形态由 SPL 规则 self-protection-block-gateway-action 的
+    // plugins?/extensions? 分支兜住（见 self-protection-layered-decision.test.ts），
+    // 所以组合路径不漏。但硬编码层按设计应独立于策略文件生效——策略文件被
+    // 误改、被裁剪或被降级时，这一层就是最后一道。
+    //
+    // 用 it.fails 记录现状：判负即为预期。修好后本用例会转红，提醒把这条
+    // 注释与上方断言一并更新——它记录的是缺陷，不是契约。
+    it.fails('known gap: gateway plugin.uninstall with target in `value` is not caught here', () => {
+      const result = SelfProtection.evaluate(
+        toolCtx('gateway', {
+          action: 'plugin.uninstall',
+          value: 'openclaw-security_monitor',
+        })
+      );
+      expect(result.blocked).toBe(true);
+    });
+
+    it.fails('known gap: plugin_manager plugin.disable with target in `value` is not caught here', () => {
+      const result = SelfProtection.evaluate(
+        toolCtx('plugin_manager', {
+          action: 'plugin.disable',
+          value: 'openclaw-security_monitor',
         })
       );
       expect(result.blocked).toBe(true);

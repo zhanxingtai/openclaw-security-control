@@ -63,8 +63,20 @@ check("GET panel → 200", get.status === 200, `status=${get.status}`);
 check("Content-Type text/html", (get.headers["content-type"] || "").includes("text/html"));
 check("CSP includes connect-src 'self'", (get.headers["content-security-policy"] || "").includes("connect-src 'self'"));
 check("response body has <html>", get.body.includes("<html"));
-check("response body has Security Monitor", get.body.includes("Security Monitor"));
-check("response body has 5 tabs", get.body.includes('data-tab="metrics"') && get.body.includes('data-tab="config"'));
+// Structural assertions. The old checks looked for the literal "Security
+// Monitor" (a title the header has not carried for some time — it is
+// "SST Security Control") and for "5 tabs" while only testing two of them, so
+// they could only ever fail or pass without testing anything. Assert the real
+// shape instead: the header title, exactly four tabs, and their labels.
+check("response body has the panel header", get.body.includes("<h1>SST Security Control</h1>"));
+const tabCount = (get.body.match(/data-tab="/g) || []).length;
+check("response body has 4 tabs", tabCount === 4, `data-tab count=${tabCount}`);
+check(
+  "default locale is English",
+  get.body.includes('<html lang="en">'),
+  get.body.match(/<html lang="[^"]*">/)?.[0] || "no lang attribute"
+);
+check("English tab labels render", get.body.includes(">Policy Hits</button>"));
 check("Cache-Control is no-store", (get.headers["cache-control"] || "") === "no-store");
 
 // Step 2: POST each RPC the panel calls
@@ -115,21 +127,116 @@ const sandboxPreflight = await request(`${baseUrl}/openclaw-security-monitor/pan
 check("sandbox OPTIONS → 204 with ACAO null", sandboxPreflight.status === 204 && sandboxPreflight.headers["access-control-allow-origin"] === "null", `status=${sandboxPreflight.status}`);
 check("no Access-Control-Allow-Credentials", sandboxPreflight.headers["access-control-allow-credentials"] === undefined && get.headers["access-control-allow-credentials"] === undefined);
 
-// Step 4: NDJSON sidecar pull
-console.log("\n[verify-panel-browser-flow] step 4: events.ndjson pull");
-const events = await request(`${baseUrl}/openclaw-security-monitor/events.ndjson`);
-check("GET events.ndjson → 200", events.status === 200, `status=${events.status} body=${events.body.slice(0, 60)}`);
+// Step 4: panel language negotiation
+console.log("\n[verify-panel-browser-flow] step 4: panel locale negotiation");
+const zh = await request(`${baseUrl}/openclaw-security-monitor/panel?lang=zh`);
+check("?lang=zh → 200", zh.status === 200, `status=${zh.status}`);
+check("?lang=zh renders zh-CN", zh.body.includes('<html lang="zh-CN">'));
+check("?lang=zh localizes the tabs", zh.body.includes(">威胁</button>"));
+const fr = await request(`${baseUrl}/openclaw-security-monitor/panel?lang=fr`);
+check("?lang=fr falls back to English", fr.body.includes('<html lang="en">'), `status=${fr.status}`);
 
-// Step 5: POST without Origin header (non-browser client — still accepted)
-console.log("\n[verify-panel-browser-flow] step 5: POST with no Origin header");
+// Step 4b: the header switcher round trip.
+//
+// The switcher writes the plugin's own panel-state.json, NOT the host
+// openclaw.json — a host-config write makes the gateway reload every plugin,
+// and a language switch used to take 8.4s to show up (you watched a greyed
+// "已保存 ✓" the whole time). This step exercises the whole loop over HTTP and
+// restores whatever preference the instance started with, so running it never
+// leaves somebody's panel in a language they didn't pick.
+console.log("\n[verify-panel-browser-flow] step 4b: locale switcher round trip");
+const rpcPost = async (method, params) => {
+  const res = await request(`${baseUrl}/openclaw-security-monitor/panel`, {
+    method: "POST",
+    body: JSON.stringify({ method, params }),
+  });
+  let payload = null;
+  try {
+    payload = JSON.parse(res.body);
+  } catch {}
+  return { status: res.status, payload };
+};
+
+const before = await rpcPost("security.panel.locale.get", {});
+const savedBefore = before.payload?.payload?.saved;
+check("security.panel.locale.get is registered", typeof savedBefore === "string", JSON.stringify(before.payload));
+
+if (typeof savedBefore === "string") {
+  const refused = await rpcPost("security.panel.locale.set", { locale: "fr" });
+  check(
+    "an unsupported locale is refused, not stored",
+    refused.payload?.payload?.ok === false,
+    JSON.stringify(refused.payload)
+  );
+
+  const switchTo = savedBefore === "zh" ? "en" : "zh";
+  const set = await rpcPost("security.panel.locale.set", { locale: switchTo });
+  check(`switching to ${switchTo} succeeds`, set.payload?.payload?.ok === true, JSON.stringify(set.payload));
+
+  // Header deliberately opposite: the stored choice must win.
+  const oppositeHeader = switchTo === "zh" ? "en-GB,en;q=0.9" : "zh-CN,zh;q=0.9";
+  const afterSwitch = await request(`${baseUrl}/openclaw-security-monitor/panel`, {
+    headers: { "Accept-Language": oppositeHeader },
+  });
+  const expectHtmlLang = switchTo === "zh" ? "zh-CN" : "en";
+  check(
+    `the stored choice beats Accept-Language (${oppositeHeader})`,
+    afterSwitch.body.includes(`<html lang="${expectHtmlLang}">`),
+    `data-current=${afterSwitch.body.match(/data-current="([^"]*)"/)?.[1]}`
+  );
+
+  const afterGet = await rpcPost("security.panel.locale.get", {});
+  check(
+    "the switcher outranks application.panelLocale",
+    afterGet.payload?.payload?.saved === switchTo && afterGet.payload?.payload?.effective === switchTo,
+    JSON.stringify(afterGet.payload?.payload)
+  );
+
+  const restore = await rpcPost("security.panel.locale.set", { locale: savedBefore });
+  check(
+    `restored the instance's original preference (${savedBefore})`,
+    restore.payload?.payload?.ok === true,
+    JSON.stringify(restore.payload)
+  );
+
+  // Only meaningful once nothing is pinned: auto hands the panel back to the
+  // browser. Asserted after the restore, and skipped if the operator had a
+  // preference of their own (restoring it is the whole point of the step above).
+  if (savedBefore === "auto") {
+    const zhHeader = await request(`${baseUrl}/openclaw-security-monitor/panel`, {
+      headers: { "Accept-Language": "zh-CN,zh;q=0.9" },
+    });
+    check("Accept-Language: zh yields the Chinese panel", zhHeader.body.includes('<html lang="zh-CN">'));
+  } else {
+    console.log(
+      `  – Accept-Language negotiation skipped: this instance pins ${savedBefore} (restored, not reset)`
+    );
+  }
+}
+
+// Step 5: NDJSON sidecar pull
+console.log("\n[verify-panel-browser-flow] step 5: events.ndjson pull");
+const events = await request(`${baseUrl}/openclaw-security-monitor/events.ndjson`);
+// That route is declared `auth: "gateway"` on purpose (external scrapers tail
+// it via operator scope; "plugin" would gate it to internal calls only), and
+// this script carries no gateway credentials — so 401 is the correct answer
+// here, and demanding 200 was asserting the wrong contract.
+check(
+  "GET events.ndjson → 200 (credentials) or 401 (none supplied)",
+  events.status === 200 || events.status === 401,
+  `status=${events.status} body=${events.body.slice(0, 60)}`
+);
+
+// Step 6: POST without Origin header (non-browser client — still accepted)
+console.log("\n[verify-panel-browser-flow] step 6: POST with no Origin header");
 const cross = await request(`${baseUrl}/openclaw-security-monitor/panel`, {
   method: "POST",
   body: JSON.stringify({ method: "security.metrics", params: {} }),
 });
 check("no-Origin POST → 200", cross.status === 200, `status=${cross.status}`);
 
-// Step 6: POST with Origin: null (sandboxed iframe)
-console.log("\n[verify-panel-browser-flow] step 6: POST with Origin: null (sandboxed iframe)");
+// Step 7: POST with Origin: null (sandboxed iframe)
+console.log("\n[verify-panel-browser-flow] step 7: POST with Origin: null (sandboxed iframe)");
 const sandboxedNoNonce = await request(`${baseUrl}/openclaw-security-monitor/panel`, {
   method: "POST",
   headers: { Origin: "null" },

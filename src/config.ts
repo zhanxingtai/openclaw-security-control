@@ -88,6 +88,9 @@ export const DEFAULT_CONFIG: SecurityMonitorConfig = {
     sessionTtlMs: 30 * 60 * 1000, // 30 minutes
     maxPreviousActions: 50,
     defaultAgentId: '',
+    // 面板语言。auto = 按 ?lang= / Accept-Language 协商（默认）；显式 en/zh
+    // 则忽略浏览器偏好，面板右上角的切换控件写入的就是这个键。
+    panelLocale: 'auto',
     runtimeHooks: {
       // Opt-in. The plugin probes NODE_OPTIONS at boot; when the runtime hook
       // is not preloaded, the bootstrap pipeline disables this flag. Users who
@@ -275,6 +278,8 @@ const applicationSchema: Record<string, Rule> = {
   },
   maxPreviousActions: (v, d) => (v !== undefined ? Number(v) : d ?? 50),
   defaultAgentId: str,
+  // 手改 openclaw.json 写进未收录的值时回落 auto，不让面板拿到非法语言。
+  panelLocale: en(['auto', 'en', 'zh']),
 };
 
 function mergeApplicationConfig(input: Record<string, unknown> | undefined) {

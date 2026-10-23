@@ -241,6 +241,12 @@ export class InterventionEngineImpl {
   ): { decision: SecurityDecision; matchedRules: PolicyRule[] } {
     // 评估前比对策略加载状态：运行期策略被删改后同样要留痕。
     this.syncPolicyLoadState();
+    // 策略没加载上时 0 条规则会让下面所有匹配都落空、最终评估成 allow —— 静默 fail-open。
+    // 只看 loadError，不看规则数：全部规则 enabled:false 是合法配置。
+    const loadError = this.loader.getLoadError();
+    if (loadError) {
+      return { decision: this.policyLoadFailureDecision(ctx, loadError), matchedRules: [] };
+    }
     // matchedRules 在 try 外声明并与 findMatches 共享引用：匹配中途抛错时
     // 兜底决策仍能拿到已命中的规则（fail_open_high_risk_only 的高危判定），
     // 而不是一律退化为空数组放行。
@@ -396,15 +402,51 @@ export class InterventionEngineImpl {
     err: unknown,
     matchedRules: PolicyRule[]
   ): SecurityDecision {
-    const strategy = this.effectiveFailStrategy();
     const message = err instanceof Error ? err.message : String(err);
     this.options.logger?.error?.(`[InterventionEngine] ${message}`);
+    return this.applyFailStrategy(ctx, matchedRules, {
+      closedReason: '干预决策组件异常，按安全策略阻断',
+      closedCode: 'INTERVENTION_ERROR',
+      highRiskReason: '检测到高危行为且干预决策组件异常，按策略阻断',
+      highRiskCode: 'INTERVENTION_ERROR_HIGH_RISK',
+      allowReason: '干预决策组件异常，按策略放行',
+    });
+  }
+
+  /**
+   * 策略加载失败时的兜底决策。RuleLoader 在沙箱越界 / 文件缺失 / 解析失败时会退回
+   * 0 规则的 empty-policy，不在这里兜底就会静默全放行。
+   */
+  private policyLoadFailureDecision(ctx: InterventionContext, loadError: string): SecurityDecision {
+    this.options.logger?.error?.(`[InterventionEngine] 策略未生效，按 failStrategy 兜底: ${loadError}`);
+    return this.applyFailStrategy(ctx, [], {
+      closedReason: '安全策略未加载成功，已按安全策略阻断',
+      closedCode: 'POLICY_LOAD_FAILED',
+      highRiskReason: '检测到高危行为且安全策略未加载成功，按策略阻断',
+      highRiskCode: 'POLICY_LOAD_FAILED_HIGH_RISK',
+      allowReason: '安全策略未加载成功，按策略放行',
+    });
+  }
+
+  /** failStrategy 分支的唯一实现：异常兜底与策略加载失败共用，只有文案与 blockCode 不同。 */
+  private applyFailStrategy(
+    ctx: InterventionContext,
+    matchedRules: PolicyRule[],
+    labels: {
+      closedReason: string;
+      closedCode: string;
+      highRiskReason: string;
+      highRiskCode: string;
+      allowReason: string;
+    }
+  ): SecurityDecision {
+    const strategy = this.effectiveFailStrategy();
 
     if (strategy === 'fail_closed') {
       return {
         decision: 'block',
-        blockReason: '干预决策组件异常，按安全策略阻断',
-        blockCode: 'INTERVENTION_ERROR',
+        blockReason: labels.closedReason,
+        blockCode: labels.closedCode,
         failStrategy: 'fail_closed',
       };
     }
@@ -422,8 +464,8 @@ export class InterventionEngineImpl {
       if (isHighRisk) {
         return {
           decision: 'block',
-          blockReason: '检测到高危行为且干预决策组件异常，按策略阻断',
-          blockCode: 'INTERVENTION_ERROR_HIGH_RISK',
+          blockReason: labels.highRiskReason,
+          blockCode: labels.highRiskCode,
           failStrategy: 'fail_open_high_risk_only',
         };
       }
@@ -431,7 +473,7 @@ export class InterventionEngineImpl {
 
     return {
       decision: 'allow',
-      reason: '干预决策组件异常，按策略放行',
+      reason: labels.allowReason,
       failStrategy: strategy,
     };
   }
