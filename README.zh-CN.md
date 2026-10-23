@@ -76,6 +76,7 @@ openclaw plugins config sst-security-control-openclaw --set \
 
 - 官网：[https://www.zhihuizhanxing.com](https://www.zhihuizhanxing.com)
 - 源码：[https://github.com/zhanxingtai/openclaw-security-control](https://github.com/zhanxingtai/openclaw-security-control)
+- X（Twitter）：[@StarSightTec](https://x.com/StarSightTec)
 - 微信公众号：
 
   ![微信公众号](assets/wechat-mp-qr.jpg)

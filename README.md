@@ -76,6 +76,7 @@ Events are NDJSON lines. The main event types are:
 
 - Website: [https://www.zhihuizhanxing.com](https://www.zhihuizhanxing.com)
 - Source: [https://github.com/zhanxingtai/openclaw-security-control](https://github.com/zhanxingtai/openclaw-security-control)
+- X: [@StarSightTec](https://x.com/StarSightTec)
 - WeChat Official Account:
 
   ![WeChat Official Account](assets/wechat-mp-qr.jpg)
