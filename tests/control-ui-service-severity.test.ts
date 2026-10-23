@@ -57,7 +57,23 @@ describe('ControlUiService .D severity dimension', () => {
     file = join(dir, 'events.jsonl');
   });
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    // Windows CI（GitHub Actions）偶发 ENOTEMPTY，症状是本文件最后两条用例
+    // 在 afterEach 里删不掉自己的临时目录。
+    //
+    // 排查结论：不是 Node 自己留了句柄——libuv 打开文件带 FILE_SHARE_DELETE，
+    // 本地实测"句柄不放开也删得掉"（脚本 /tmp/enotempty-proof.mjs 第 1 段）。
+    // 阻塞只可能来自外部进程：Windows 上以限制性共享模式短暂打开 %TEMP% 新建
+    // 文件的扫描器（Defender 实时保护是典型）。这解释了三个现象：
+    //   · Linux/macOS 免疫——POSIX unlink 语义允许删掉已打开的文件；
+    //   · 只在负载高的 CI 上现形，本地跑 3 次全过；
+    //   · 失败的是本文件最后两条用例，与它们上面两条结构完全相同的用例同批
+    //     通过——不是这两条用例的代码路径有问题。
+    //
+    // fs.rmSync 的 maxRetries/retryDelay 正是为 EBUSY/EMFILE/ENFILE/
+    // ENOTEMPTY/EPERM 这组 errno 设计的，而**默认是 0 次重试**：一次瞬时占用
+    // 就足以让整条用例判失败。删不掉是清理噪音，不是被测行为出错，所以在这里
+    // 重试，而不是去改断言或跳过用例。
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
   function write(lines: string[]) {
     writeFileSync(file, lines.join('\n') + '\n');
