@@ -1,5 +1,7 @@
-#!/usr/bin/env node
 // openclaw-hook: v1.0.1 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
+// ⚠ 本文件只被 --require 加载，不要加 shebang —— `#!` 一旦不在文件最开头
+// 就是语法错，而这个文件正是 NODE_OPTIONS 的预加载目标，语法错 = 整个宿主
+// 进程在启动期退出。详见 hooks/hook-mounter.js 顶部同款说明。
 /**
  * OpenClaw Security Monitor - Node.js Network HTTP Hook
  *
@@ -211,14 +213,21 @@ function getLogPath() {
   return raw;
 }
 
+/** 全级别走 stderr，理由同 runtime.js 的 log()：预加载不得占用 stdout。 */
 function log(level, message) {
   if (!DEBUG && level !== 'error') return;
-  const line = `[${MODULE_NAME}] ${level}: ${message}`;
-  if (level === 'error') {
-    console.error(line);
-  } else {
-    console.log(line);
-  }
+  console.error(`[${MODULE_NAME}] ${level}: ${message}`);
+}
+
+/**
+ * Node 的 TypeError 会把被赋值的整个函数源码塞进 err.message（"Cannot assign
+ * to read only property '_load' of function 'function Module(id = '', ...)'"），
+ * 几百行噪音。日志里只取首行并截断。
+ */
+function briefError(err) {
+  const text = err instanceof Error ? err.message : String(err);
+  const firstLine = text.split('\n')[0];
+  return firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine;
 }
 
 function generateUUID() {
@@ -1349,9 +1358,23 @@ function installModuleLoadHook() {
 
   try {
     const Module = require('module');
+
+    // runtime.js 先加载（hook-mounter 的 HOOK_FILES 顺序）并用 defineProperty
+    // 把 Module._load 锁成不可写，本 hook 的裸赋值就必然抛
+    // "Cannot assign to read only property '_load'"。这不损失什么：http/https/
+    // fetch 在 install() 里已经**直接**装好了，本钩子只是"稍后有人
+    // require('http')"时补装的兜底。所以这里体面退出而不是抛错。
+    if (Module._load && Module._load.__openclaw_hookModuleLoad) {
+      log(
+        'info',
+        'Module._load already hooked by runtime.js — skipping (http/https/fetch are hooked directly)'
+      );
+      return;
+    }
+
     const originalLoad = Module._load;
 
-    Module._load = function hookedLoad(request, parent, isMain) {
+    const hookedLoad = function hookedLoad(request, parent, isMain) {
       const result = originalLoad.apply(this, arguments);
       if (request === 'http' && result && !result.__openclaw_network_hooked) {
         installHttpHooks();
@@ -1361,10 +1384,31 @@ function installModuleLoadHook() {
       }
       return result;
     };
+    hookedLoad.__openclaw_hookModuleLoad = true;
+
+    // 与 runtime.js 保持一致：先 defineProperty 锁，失败再退回裸赋值。
+    // 直接裸赋值在"属性已被 runtime.js 锁死"和"宿主冻结 Module 导出"两种
+    // 情况下都会抛。
+    try {
+      Object.defineProperty(Module, '_load', {
+        value: hookedLoad,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+    } catch {
+      Module._load = hookedLoad;
+    }
 
     log('info', 'Module._load network hook installed');
   } catch (err) {
-    log('error', `failed to install Module._load hook: ${err.message}`);
+    // 非致命：http/https/fetch 已在 install() 里装好。降级到 warn 并截断
+    // 消息 —— Node 的 TypeError 会把整个 Module 函数源码塞进 err.message，
+    // 直接打出来是几百行噪音，还会让人以为 hook 挂了。
+    log(
+      'warn',
+      `Module._load hook not installed (non-fatal, http/https/fetch already hooked): ${briefError(err)}`
+    );
   }
 }
 

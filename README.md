@@ -1,12 +1,28 @@
 # sst-security-control-openclaw
 
-**English** · [简体中文](README.zh-CN.md)
+**English** · [简体中文](https://github.com/zhanxingtai/openclaw-security-control/blob/main/README.zh.md)
 
 An open-source runtime security plugin for OpenClaw. It provides local risk detection, security event logging, and blocking of high-risk operations.
 
 **Highlights**: batteries included. Runs locally out of the box — no account registration, no cloud connectivity.
 
 ## Installation
+
+### Plugin marketplace
+
+Published on the [ClawHub](https://clawhub.ai/) plugin marketplace — search `sst-security-control-openclaw` there, or install from the CLI:
+
+```bash
+# 1. Look up the package in the marketplace (optional)
+openclaw plugins search sst-security-control-openclaw
+
+# 2. Install from the marketplace
+openclaw plugins install clawhub:@zhanxing/sst-security-control-openclaw --accept-capabilities
+openclaw plugins enable sst-security-control-openclaw
+openclaw gateway restart
+```
+
+### Build from source
 
 ```bash
 # 1. Build the package
@@ -50,22 +66,27 @@ Key configuration options:
 |------|--------|------|
 | `intervention.mode` | `enforce` | `audit` (log only) or `enforce` (block) |
 | `application.enabled` | `true` | Application event collection switch |
-| `application.runtimeHooks.enabled` | `false` | Enable runtime hooks (requires NODE_OPTIONS setup) |
+| `application.runtimeHooks.enabled` | `false` | Enable runtime hooks (requires `NODE_OPTIONS`) |
 | `intervention.failStrategy` | `fail_closed` | Behavior when the intervention engine fails or times out (`fail_open` allow / `fail_closed` block) |
 | `collector.ndjsonPath` | `~/.openclaw/security-events.jsonl` | Event log path |
 
 ## Custom SPL Rules
 
-Blocking is driven by SPL declarative rules (YAML, `apiVersion: security.use/v1`). A ready-to-use rule set ships with the package; see [policies/security-policy.spl.yaml](policies/security-policy.spl.yaml) for rule examples. Before switching to `enforce` mode, copy the policy file to `~/.openclaw/security-policy.yaml` and review the rules.
+Blocking is driven by SPL declarative rules (YAML, `apiVersion: security.use/v1`). A ready-to-use rule set ships with the package; see [policies/security-policy.spl.yaml](https://github.com/zhanxingtai/openclaw-security-control/blob/main/policies/security-policy.spl.yaml) for rule examples. Before switching to `enforce` mode, copy the policy file to `~/.openclaw/security-policy.yaml` and review the rules.
 
 ## Security Events
 
-Events are NDJSON lines. The main event types are:
+Events are NDJSON lines. The `event_type` values this version actually emits, by layer:
 
-- `agent_session_start` / `agent_start` / `agent_stop`
-- `agent_tool_call` / `agent_tool_result`
-- `runtime_spawn_intent` / `runtime_spawn_denied`
-- `security_audit` (embedded guard hits, loop detection, token anomalies)
+| Layer | Event types | Requires Runtime Hooks |
+|-------|-------------|------------------------|
+| Application | `agent_session_start` / `agent_session_end`, `agent_start` / `agent_stop`, `agent_subagent_start` / `agent_subagent_progress` / `agent_subagent_end`, `agent_message`, `agent_tool_call` / `agent_tool_result`, `cron_changed`, `code_mode_exec`, `reasoning` | no |
+| Application (file) | `file_read` / `file_write` / `file_delete` / `file_privilege` — derived from tool names (`fs.readFile` → `file_read`) | no |
+| System (process) | `process_start`, `process_change` / `process_exit` / `process_snapshot` | `process_start`: **yes** |
+| System (cgroup) | `cgroup_snapshot` / `cgroup_anomaly` | no (needs `system.enabled`) |
+| System (network) | `network_http` | **yes** |
+| Asset | `asset_add` / `asset_change` / `asset_remove` / `asset_snapshot` | no |
+| Self-protection | `protection_degraded`, `tamper_detected` | no |
 
 ## Roadmap
 
@@ -91,4 +112,4 @@ General usage questions and feature requests go to GitHub Issues.
 
 ## License
 
-[Apache-2.0](LICENSE) — dependency declarations are in `package.json`.
+[Apache-2.0](https://github.com/zhanxingtai/openclaw-security-control/blob/main/LICENSE) — dependency declarations are in `package.json`.

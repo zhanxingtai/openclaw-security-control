@@ -34,4 +34,38 @@ describe('hook 文件语法兼容棘轮', () => {
       expect(() => acorn.parse(code, { ecmaVersion: SYNTAX_CEILING })).not.toThrow();
     });
   }
+
+  it('三件套不含 shebang —— `#!` 只能出现在文件最开头，否则整份文件语法错', () => {
+    // 棘轮：`#!` 是 JavaScript 里唯一"必须在字节 0"的语法，Node 只认字节 0
+    // 处的 shebang。只要有任何东西被插到它前面（BOM、宿主安装器改写、
+    // 编辑器、license header 注入），文件就变成 SyntaxError —— 而这三个
+    // 文件正是 NODE_OPTIONS 的预加载目标，语法错 = 宿主进程在加载任何
+    // 插件之前就退出，插件连把副本修回去的机会都没有。
+    // 被 require 的模块不需要 shebang（只有直接 execve 才需要），所以这里
+    // 直接钉死"不许有"。
+    for (const name of HOOK_FILES) {
+      const file = path.resolve(process.cwd(), 'hooks', name);
+      const code = fs.readFileSync(file, 'utf8');
+      expect(code.startsWith('#!')).toBe(false);
+      expect(code).not.toMatch(/^\s*#!/m);
+    }
+  });
+
+  it('三件套不往 stdout 写任何东西 —— 预加载不能占用别人的数据通道', () => {
+    // NODE_OPTIONS=--require 扩散到宿主里每一个 node 进程，包括把 stdout
+    // 当数据通道解析的机器进程（OpenClaw CLI 的 SQLite 只读 worker 就是：
+    // 它的 stdout 是一段 JSON）。预加载在别人进程最早期抢到的 stdout 等于
+    // 替别人改协议，一行非 JSON 日志就能让下游解析失败。2026-10-23 实测
+    // 命中：`hooks mounter: loaded=2 …` 走 console.log → CLI 报
+    // `SQLite read-only worker returned invalid JSON`。
+    //
+    // 白名单式检查只覆盖 stdout 写入点；提示/错误一律 console.error/warn。
+    for (const name of HOOK_FILES) {
+      const file = path.resolve(process.cwd(), 'hooks', name);
+      const code = fs.readFileSync(file, 'utf8').replace(/^\s*\/\*[\s\S]*?\*\//g, '');
+      expect(code, `${name} 不得写 stdout`).not.toMatch(
+        /console\.(log|info|debug|dir|table|trace)\s*\(|process\.stdout\.write\s*\(/
+      );
+    }
+  });
 });

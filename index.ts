@@ -37,8 +37,9 @@ import { fileURLToPath } from "url";
 import type { InterventionContext } from "./src/intervention/types.js";
 import { obfuscateDeep } from "./src/sensitive-obfuscate.js";
 import { HTML_LANG, PANEL_LOCALE_PREFERENCES, RAW_FALLBACK_PREFIXES, normalizePanelLocalePreference, parseLocale, serializeDictionary, translate, type PanelLocalePreference } from "./src/panel-i18n.js";
+import { PLUGIN_ID, resolvePreloadTarget } from "./src/hook-locations.js";
 
-export const PLUGIN_ID = "sst-security-control-openclaw";
+export { PLUGIN_ID };
 export const PLUGIN_NAME = "SST Security Control 安全监控插件";
 
 /**
@@ -436,7 +437,7 @@ function register(api: OpenClawPluginApi): void {
     const patterns = middleware.getConfig().assetMonitor?.sensitiveKeyPatterns;
     return {
       config: obfuscateDeep(config, patterns && patterns.length > 0 ? patterns : ["token", "key", "secret", "password", "credential"]),
-      schema: CONFIG_SCHEMA,
+      schema: withRuntimeHelpVars(CONFIG_SCHEMA),
     };
   };
   // Returns the raw plugins.entries[PLUGIN_ID].config block as it lives on
@@ -1145,7 +1146,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <!-- 持久状态条（区别于 config.save 流程的瞬时横幅）。面板加载时
      读一次 security.status 渲染，不轮询；仅当用户开过 runtimeHooks 而
      bootstrap 探测到 hook 未加载（静默降级）时显示。 -->
-<div id="hook-status-bar" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin:8px 16px 0;font-size:12px"></div>
+<div id="hook-status-bar" style="display:none;background:var(--warn);color:#000;padding:6px 10px;border-radius:4px;margin:8px 16px 0;font-size:12px;white-space:pre-wrap"></div>
 <div class="panel" id="panel"><div class="spinner">${T("spinner.loading")}</div></div>
 <div class="refresh" id="refresh"></div>
 
@@ -1960,7 +1961,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
     // CONFIG_SCHEMA carries dictionary KEYS (cfg.label.* / cfg.help.* / cfg.danger.*),
     // not prose, so a locale switch can never leave a stale Chinese string behind
     // in the schema itself. Absent key → empty string (optional fields).
-    function cfgText(key) { return key ? T(key) : ""; }
+    // vars fills in per-field runtime values (the NODE_OPTIONS preload paths),
+    // so help prose never hard-codes a path that only holds on some machines.
+    function cfgText(key, vars) { return key ? T(key, vars) : ""; }
 
     function readNested(obj, dotKey) {
       var parts = dotKey.split(".");
@@ -2011,7 +2014,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
         ? '<div class="meta" style="color:var(--danger);margin-top:2px">⚠ '+esc(dangerText)+'</div>'
         : '';
       var helpBlockHtml = f.help
-        ? '<div class="meta" style="color:var(--warn);margin-top:6px;white-space:pre-wrap;font-size:11px;line-height:1.5">'+esc(cfgText(f.help))+'</div>'
+        ? '<div class="meta" style="color:var(--warn);margin-top:6px;white-space:pre-wrap;font-size:11px;line-height:1.5">'+esc(cfgText(f.help, f.helpVars))+'</div>'
         : '';
       var input = '';
       if (f.type === "bool") {
@@ -2730,7 +2733,15 @@ button:disabled{opacity:.5;cursor:not-allowed}
     if (!bar || !st) return;
     if (st.runtimeHooksEnabled === true && st.runtimeHookLoaded === false) {
       bar.style.display = "block";
-      bar.textContent = T("status.hookNotLoaded");
+      // 有解析出的预加载路径就用带路径的文案直接把它印出来：这段警告最常见的
+      // 成因就是 NODE_OPTIONS 指了一条当前机器上并不存在的路径，而路径必须
+      // 现读现算（容器里的 home 与宿主机的 home 不是同一个）。
+      // 注意换行只能来自词典 —— 面板 JS 位于 index.ts 的模板字面量内，那里的
+      // 转义序列会在编译期被吃掉，产出无法解析的字符串字面量。
+      var hookPath = (st && typeof st.runtimeHookPath === "string") ? st.runtimeHookPath : "";
+      bar.textContent = hookPath
+        ? T("status.hookNotLoadedWithPath", { hookPath: hookPath })
+        : T("status.hookNotLoaded");
     }
   }).catch(function() { /* status 不可用时静默，面板照常工作 */ });
   render();
@@ -2913,9 +2924,36 @@ interface ConfigField {
   // `dangerReason` (cfg.danger.<section>.<key>) is reserved for short
   // warnings inside the danger-confirm modal.
   help?: string;
+  /** Values substituted into the `help` prose's {placeholders}. Injected per
+   *  request by withRuntimeHelpVars rather than baked into the module-level
+   *  schema: the paths depend on the runtime environment (a container's home
+   *  is not the operator's home), and CONFIG_SCHEMA is also exported for
+   *  tests that would then pin whatever machine happened to build them. */
+  helpVars?: Record<string, string>;
   danger?: boolean;
   dangerReason?: string;
 }
+/**
+ * 把运行期才能确定的值（NODE_OPTIONS 预加载路径）填进帮助文案的占位符。
+ *
+ * 此前这段路径是硬编码在词典里的字面量（`.../extensions/<id>/runtime.js`），
+ * 于是两件事同时错：它指向的文件根本不在安装包里（是插件每次启动现拷进去
+ * 的），而文案里的 `/home/node` 对宿主机直装用户又是错的。现在路径一律由
+ * src/hook-locations.ts 在请求时解析，词典只留 `{preloadTarget}` 占位符 ——
+ * 面板从此不可能印出一条在当前机器上不成立的命令。
+ */
+function withRuntimeHelpVars(schema: ConfigField[]): ConfigField[] {
+  const preloadTarget = resolvePreloadTarget();
+  // 只给数据目录这一条路径。安装目录（extensions/<id>/）曾经也印给过用户，
+  // 但它由宿主安装器拥有、随装卸来去：预加载目标放在那里一旦消失就是启动
+  // 失败，且无从重建。现在它在文案里只作为**反例**出现。
+  return schema.map((f) =>
+    f.section === "application" && f.key === "runtimeHooks.enabled"
+      ? { ...f, helpVars: { preloadTarget } }
+      : f
+  );
+}
+
 const CONFIG_SCHEMA: ConfigField[] = [
   { section: "collector", key: "ndjsonPath", label: "cfg.label.collector.ndjsonPath", type: "string",
     danger: true, dangerReason: "cfg.danger.collector.ndjsonPath" },

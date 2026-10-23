@@ -392,3 +392,71 @@ describe('reachability validator negative cases', () => {
     expect(problems).toMatch(/未注解 previousActions/);
   });
 });
+
+/**
+ * 默认配置下的可达性。
+ *
+ * 上面的用例问的是"runtime hooks 开启时每条规则能不能被评估到"，但漏了一维：
+ * `application.runtimeHooks.enabled` **默认 false**，而 process_start /
+ * network_http 只有 hook 预加载时才产生（store.ts 的 evaluateRuntimeEvent
+ * 入口依赖 RuntimeHookCollector，而后者在 !enabled 时首行 return）。
+ * 只认这两类事件的规则因此在**默认安装**下永远不命中 —— 默认的 enforce 阻断
+ * 覆盖不到它们。
+ *
+ * 这个数字被写进了 README（中英）与面板帮助文案（中英）共 6 处。规则增删
+ * 会让数字漂移，而漂移的方向是"文档宣称拦住了什么，实际没拦"，属于最坏的
+ * 那一类脱节。下面把清单钉死，并让文案里的数字跟着清单走。
+ */
+describe('默认配置下的 hook-only 规则', () => {
+  /** 只可能由 runtime hook 产生、且不经工具调用链路的事件类型。 */
+  const HOOK_ONLY_ACTION_TYPES = new Set(['process_start', 'network_http', 'network_connect', 'network_dns']);
+
+  const hookOnlyRuleIds = rules
+    .filter((rule) => {
+      const actionTypes = (rule.match.actionType ?? []).flatMap((t) => expandActionType(t));
+      if (actionTypes.length === 0) return false;
+      return actionTypes.every((t) => HOOK_ONLY_ACTION_TYPES.has(t));
+    })
+    .map((rule) => rule.id)
+    .sort();
+
+  it('清单与钉住的快照一致（改规则集必须同步改这份清单与文档数字）', () => {
+    // 2026-10-23 快照。这批里 block-* 的三条是随包策略唯一能在进程层硬阻断
+    // 的凭据/敏感文件/skill 二进制规则 —— 它们失活即意味着"钩子关了 =
+    // 这三类彻底没人管"，所以这份清单值得逐条盯。
+    expect(hookOnlyRuleIds).toEqual([
+      'block-process-credential-in-command-critical',
+      'block-process-credential-in-command-warn',
+      'block-process-sensitive-file',
+      'block-skill-binary-execution',
+      'data-leak-dump-exfil-001',
+      'data-leak-model-api-001',
+      'redact-credentials-exfil',
+      'warn-hook-bypass-attempt',
+      'warn-runtime-hook-inactive',
+    ]);
+  });
+
+  it('文案里若宣称了失活规则数，必须与实际清单一致', () => {
+    const total = rules.length;
+    const dormant = hookOnlyRuleIds.length;
+    const docs: Array<{ file: string; re: RegExp; dormantGroup: number; totalGroup: number }> = [
+      // "9 of the 91 bundled SPL rules go dormant" → [失活数, 总数]
+      { file: 'README.md', re: /(\d+) of the (\d+) bundled SPL rules/g, dormantGroup: 1, totalGroup: 2 },
+      // "随包的 91 条 SPL 规则里有 9 条会休眠" → 总数在前、失活数在后
+      { file: 'README.zh.md', re: /(\d+) 条 SPL 规则里有 (\d+) 条会休眠/g, dormantGroup: 2, totalGroup: 1 },
+      // 面板帮助文案与 README 都不刻意写这个数字（2026-10-23 精简：读者反馈
+      // 长解释反而看不懂），因此**不要求**任何一处必须出现它 —— 只有真写了
+      // 才比对。以后若重新写回这个数字，比对自动生效。
+    ];
+    for (const { file, re, dormantGroup, totalGroup } of docs) {
+      const text = readFileSync(resolve(file), 'utf8');
+      for (const match of text.matchAll(re)) {
+        expect(
+          { file, dormant: Number(match[dormantGroup]), total: Number(match[totalGroup]) },
+          `${file}: 「${match[0]}」与规则集实际清单不符（当前 ${dormant}/${total}）`,
+        ).toEqual({ file, dormant, total });
+      }
+    }
+  });
+});

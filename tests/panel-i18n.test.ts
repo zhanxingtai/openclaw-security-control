@@ -141,7 +141,16 @@ describe("panel i18n dictionary", () => {
   it("every {placeholder} is one the panel actually interpolates", () => {
     // An unfilled token renders literally as "Showing {shown} of {total}", so
     // the allowed set is pinned rather than wildcarded.
-    const allowed = new Set(["shown", "total", "mark", "unit", "n", "version", "deps", "path", "time", "url"]);
+    //
+    // preloadTarget comes from src/hook-locations.ts and reaches the prose
+    // through ConfigField.helpVars (see withRuntimeHelpVars); hookPath rides on
+    // security.status. They are listed here because the panel render path is
+    // covered by the security.config.get test below — that one asserts every
+    // placeholder the help text uses actually has a value bound to it.
+    const allowed = new Set([
+      "shown", "total", "mark", "unit", "n", "version", "deps", "path", "time", "url",
+      "preloadTarget", "hookPath",
+    ]);
     for (const locale of LOCALES) {
       for (const [key, value] of Object.entries(PANEL_DICT[locale])) {
         for (const token of value.matchAll(/\{(\w+)\}/g)) {
@@ -632,6 +641,37 @@ describe("panel HTML served per locale", () => {
     expect(JSON.parse(inlined!)).toEqual([...RAW_FALLBACK_PREFIXES]);
   });
 
+  it("runtimeHooks help text carries the real preload path, not a hard-coded one", async () => {
+    // 回归：帮助文案曾把 NODE_OPTIONS 路径写死成
+    // `.../extensions/<id>/runtime.js` —— 那条路径既不在安装包清单里（是插件
+    // 每次启动现拷进去的），在宿主机直装下也压根不是那个 home。改由
+    // src/hook-locations.ts 在请求时解析并经 helpVars 下发。
+    const result = (await gatewayMethods.get("security.config.get")?.({})) as {
+      schema: Array<{ section: string; key: string; help?: string; helpVars?: Record<string, string> }>;
+    };
+    const field = result.schema.find(
+      (f) => f.section === "application" && f.key === "runtimeHooks.enabled"
+    );
+    expect(field).toBeDefined();
+    expect(field!.help).toBe("cfg.help.application.runtimeHooks.enabled");
+
+    // 文案里用到的每个占位符都必须有值，否则面板会把它原样印出来。
+    const placeholders = new Set(
+      [...PANEL_DICT.en[field!.help!].matchAll(/\{(\w+)\}/g)].map((m) => m[1])
+    );
+    expect(placeholders.size).toBeGreaterThan(0);
+    for (const name of placeholders) {
+      expect(field!.helpVars?.[name], `helpVars 缺 ${name}`).toBeTruthy();
+    }
+
+    // 两种 locale 都不得残留未填充的占位符，且必须包含当前机器解析出的路径。
+    for (const locale of LOCALES) {
+      const rendered = translate(locale, field!.help!, field!.helpVars);
+      expect(rendered, `${locale} 残留未填充占位符`).not.toMatch(/\{\w+\}/);
+      expect(rendered, `${locale} 未包含预加载路径`).toContain(field!.helpVars!.preloadTarget);
+    }
+  });
+
   it("keeps exactly one script block, and it parses", async () => {
     // panel-auth-rce.test.ts extracts the panel with a non-greedy first-match
     // regex. A second inline block would be the one picked up and the panel
@@ -812,13 +852,17 @@ describe("panel HTML served per locale", () => {
   });
 
   it("zh Config page renders Chinese labels, help and dangerReason; en renders English", async () => {
+    // 用真实的 config.get 返回值（含 withRuntimeHelpVars 注入的 helpVars），
+    // 而不是裸 CONFIG_SCHEMA —— 后者没有占位符取值，会把 {preloadTarget}
+    // 原样印出来，而这正是本用例要守住的那类回归。
+    const real = (await gatewayMethods.get("security.config.get")?.({})) as { schema: unknown };
     const payload = {
       config: {
         collector: { ndjsonPath: "/tmp/events.jsonl" },
         application: { runtimeHooks: { enabled: false } },
         system: { enabled: false },
       },
-      schema: CONFIG_SCHEMA,
+      schema: real.schema,
     };
     const zhRes = await getPanel({ path: "/openclaw-security-monitor/panel?lang=zh" });
     const zhPanel = runPanel(zhRes.body, (method) => (method === "security.config.get" ? payload : {}));
@@ -827,7 +871,9 @@ describe("panel HTML served per locale", () => {
     expect(zhOut, "label").toContain('<span class="tool">本地 NDJSON 路径');
     expect(zhOut, "section title").toContain(">采集器</h2>");
     expect(zhOut, "dangerReason").toContain("⚠ 改路径后下次启动会在新位置创建文件");
-    expect(zhOut, "help text").toContain("还须让 gateway 启动环境设 NODE_OPTIONS");
+    expect(zhOut, "help text").toContain("打开本开关，然后把 NODE_OPTIONS 指向：");
+    // 帮助文案里的运行时占位符必须全部被 helpVars 填掉，不能原样漏给用户。
+    expect(zhOut, "help text 未填充的占位符").not.toMatch(/\{\w+\}/);
     expect(zhOut, "danger modal title").toContain(">⚠ 危险操作确认</h3>");
     expect(zhOut, "save button").toContain(">保存</button>");
     // The Config page is built entirely from dictionary keys; a missing entry
@@ -841,7 +887,8 @@ describe("panel HTML served per locale", () => {
     expect(enOut, "label").toContain('<span class="tool">Local NDJSON path');
     expect(enOut, "section title").toContain(">Collector</h2>");
     expect(enOut, "dangerReason").toContain("⚠ Changing the path creates the file at the new location");
-    expect(enOut, "help text").toContain("The gateway startup environment must still set NODE_OPTIONS");
+    expect(enOut, "help text").toContain("Turn this on, then point NODE_OPTIONS at:");
+    expect(enOut, "help text unfilled placeholder").not.toMatch(/\{\w+\}/);
     expect(enOut, "danger modal title").toContain(">⚠ Confirm dangerous change</h3>");
     expect(cjkIn(enOut), "the en Config page must be CJK-free").toEqual([]);
   });

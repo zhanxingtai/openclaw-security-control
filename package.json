@@ -8,7 +8,13 @@
   "openclaw": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.4"
+    },
+    "build": {
+      "openclawVersion": "2026.9.4"
+    }
   },
   "files": [
     "index.ts",
@@ -18,7 +24,7 @@
     "dist",
     "openclaw.plugin.json",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh.md"
   ],
   "scripts": {
     "build": "tsc",

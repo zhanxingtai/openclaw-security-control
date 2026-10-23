@@ -1,5 +1,7 @@
-#!/usr/bin/env node
 // openclaw-hook: v1.0.1 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
+// ⚠ 本文件只被 --require 加载，不要加 shebang —— `#!` 一旦不在文件最开头
+// 就是语法错，而这个文件正是 NODE_OPTIONS 的预加载目标，语法错 = 整个宿主
+// 进程在启动期退出。详见 hooks/hook-mounter.js 顶部同款说明。
 /**
  * OpenClaw Security Monitor - Node.js Runtime Hook
  *
@@ -251,14 +253,16 @@ function getLogPath() {
  * @property {string} [block_reason]
  */
 
+/**
+ * 全部级别一律走 stderr。NODE_OPTIONS=--require 会扩散到宿主里每一个 node
+ * 进程，其中包含把 stdout 当数据通道解析的机器进程（例如 OpenClaw CLI 的
+ * SQLite 只读 worker 要从 stdout 读 JSON）。预加载在别人进程最早期抢到的
+ * stdout 等于替别人改协议 —— 一行非 JSON 日志就能让下游解析失败
+ * （2026-10-23 实测：`SQLite read-only worker returned invalid JSON`）。
+ */
 function log(level, message) {
   if (!DEBUG && level !== 'error') return;
-  const line = `[${MODULE_NAME}] ${level}: ${message}`;
-  if (level === 'error') {
-    console.error(line);
-  } else {
-    console.log(line);
-  }
+  console.error(`[${MODULE_NAME}] ${level}: ${message}`);
 }
 
 function generateId() {
@@ -910,6 +914,13 @@ function installModuleLoadHook() {
       }
       return result;
     };
+
+    // 标记：network.js 安装前会检查它。两个 hook 抢同一个 Module._load，而
+    // hook-mounter 的加载顺序是 runtime.js 在前 —— 先装的把它锁成不可写，
+    // 后装的裸赋值必然抛 "Cannot assign to read only property '_load'"，
+    // 每次启动刷一条 error 还顺带 dump 整个 Module 源码。标记让后装的
+    // 体面退出，而不是靠捕获异常。
+    hookedLoad.__openclaw_hookModuleLoad = true;
 
     // F-01: lock Module._load so injected code cannot `delete Module._load`
     // and re-export the unwrapped original. Fall back to plain assignment

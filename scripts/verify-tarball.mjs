@@ -51,8 +51,8 @@ const REQUIRED = [
   'package/system/',
   'package/README.md',
   // 中文版 README 随包分发。没有这条断言，某天 copyFile 被漏掉时 CI 不会报错，
-  // 中文用户会在 tgz 里找不到 README.zh-CN.md。
-  'package/README.zh-CN.md',
+  // 中文用户会在 tgz 里找不到 README.zh.md。
+  'package/README.zh.md',
 ];
 
 // Entries that must not appear in the install bundle.
@@ -69,6 +69,14 @@ const FORBIDDEN = [
   'package/hookRegistry.js',
   'package/src/hookRegistry.js',
   'package/src/pluginContext.js',
+  // 遗留布局：hook 副本出现在包根。1.0.x 让 NODE_OPTIONS 指向包根的 runtime.js，
+  // 而那个文件是插件每次启动拷进**安装目录**的，不在包清单内 —— 宿主安装器
+  // 因此每次装/升级都提示删除它，而删掉又让 --require 找不到文件、gateway
+  // 起不来（插件也无从重建）。hook 只能出现在 package/hooks/ 下。
+  // 文件名单的"必含"侧由 scripts/build.js 的 REQUIRED_HOOK_FILES 拥有。
+  'package/hook-mounter.js',
+  'package/runtime.js',
+  'package/network.js',
 ];
 
 let exitCode = 0;

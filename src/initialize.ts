@@ -7,15 +7,18 @@
 //   1. seedDefaultPolicy            — copy bundled policy template to
 //                                     ~/.openclaw/security-policy.{yaml,json}
 //                                     when the file is missing.
-//   2. ensureBundledHooks           — copy the bundled runtime hooks into
-//                                     the OpenClaw extensions dir when the
-//                                     user opted in to runtime hooks. This
-//                                     is purely a deployment convenience so
-//                                     NODE_OPTIONS can reference a stable
-//                                     path; the plugin loads the hooks from
-//                                     the tarball when the dir is not writable.
+//   2. ensureBundledHooks           — copy the bundled runtime hooks into the
+//                                     plugin's own data dir
+//                                     ($OPENCLAW_HOME/<id>/hooks/) unconditionally,
+//                                     so NODE_OPTIONS can reference a path that
+//                                     always exists and that the host installer
+//                                     never touches. Unconditional on purpose:
+//                                     gating the copy on runtimeHooks.enabled
+//                                     made "set NODE_OPTIONS first" a boot
+//                                     deadlock. Path facts live in
+//                                     src/hook-locations.ts (single authority).
 //   3. probeRuntimeHookLoaded        — detect whether NODE_OPTIONS actually
-//                                     preloaded the Node hook. If not, turn
+//                                     preloaded one of our hooks. If not, turn
 //                                     `application.runtimeHooks.enabled` off
 //                                     so the plugin does not pretend to have
 //                                     coverage it does not.
@@ -34,14 +37,28 @@
 
 import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "fs";
 import { createHash } from "node:crypto";
+import { Script } from "node:vm";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve, join, basename, isAbsolute } from "path";
 import { fileURLToPath } from "url";
-import { homedir } from "os";
 import type { SecurityMonitorConfig } from "./types.js";
 import type { OpenClawPluginApi } from "./openclaw-sdk/plugin-entry.js";
+import {
+  HOOK_BASENAMES,
+  PREFERRED_PRELOAD_BASENAME,
+  PLUGIN_ID,
+  findBundledDir,
+  isInside,
+  matchHookRequires,
+  resolveOpenClawHome,
+  resolveLegacyDir,
+  resolvePluginDataDir,
+  resolvePreloadDir,
+  resolvePreloadTarget,
+} from "./hook-locations.js";
 
-export const PLUGIN_ID = "sst-security-control-openclaw";
+// 再导出以保持既有 import 路径可用（index.ts / 测试都从这里取）。
+export { PLUGIN_ID };
 
 export interface BootstrapLogger {
   info?: (message: string) => void;
@@ -63,6 +80,10 @@ export interface BootstrapReport {
    *  are not surprised when a toggled-on feature silently stops producing
    *  events after a save + restart. */
   forcedDisabled?: ForcedDisable[];
+  /** 预加载目标绝对路径（面板直接印给用户，不再手写死字符串）。 */
+  preloadTarget?: string;
+  /** NODE_OPTIONS 仍指向的遗留安装目录副本路径；已提示迁移则仍在用。 */
+  legacyPreloadTargetInUse?: string;
 }
 
 /** A single field that bootstrap will clamp to false. `path` is a dotted
@@ -74,19 +95,7 @@ export interface ForcedDisable {
 }
 
 /** Resolve a bundled assets subdirectory regardless of how the plugin is loaded. */
-function findBundledDir(subdir: string): string | undefined {
-  try {
-    const entryDir = dirname(fileURLToPath(import.meta.url));
-    for (const offset of ["", "..", "../.."]) {
-      const root = offset ? resolve(entryDir, offset) : entryDir;
-      const candidate = resolve(root, subdir);
-      if (existsSync(candidate)) return candidate;
-    }
-  } catch {
-    /* import.meta.url may not be available under legacy loaders; tolerate. */
-  }
-  return undefined;
-}
+export { findBundledDir };
 
 /**
  * Seed ~/.openclaw/security-policy.{yaml,json} from the bundled template when
@@ -134,77 +143,318 @@ export function seedDefaultPolicy(
 }
 
 /**
- * Copy the bundled runtime hooks into the OpenClaw extensions directory when
- * the user opted in to `application.runtimeHooks.enabled`. The plugin does
- * NOT auto-mutate `NODE_OPTIONS` (that requires patching the host entrypoint,
- * which is out of scope for a strictly spec-compliant plugin). If the
- * extensions dir is not writable we skip silently — the host must set
- * `NODE_OPTIONS` itself, or live with the hooks running from the tarball
- * cache dir if NODE_OPTIONS was already configured.
+ * Copy the bundled runtime hooks into the plugin's own data directory. The
+ * plugin does NOT auto-mutate `NODE_OPTIONS` (that requires patching the host
+ * entrypoint, which is out of scope for a strictly spec-compliant plugin).
+ *
+ * 目标目录是 `$OPENCLAW_HOME/<id>/hooks/`，**不是**安装目录
+ * `$OPENCLAW_HOME/extensions/<id>/`。这不是审美选择：
+ *
+ *   extensions/<id>/ 由宿主安装器拥有。它按"目录实有内容 vs 包清单"对账，
+ *   而 hook 副本不在包清单里（包内只有 hooks/），于是每次装/升级都被判成
+ *   无法解释的外来文件并提示清理；反过来，用户照提示删掉它，NODE_OPTIONS
+ *   的 --require 就指向不存在的文件，gateway 起不来，插件也没机会把副本
+ *   拷回来 —— 自举死锁。
+ *
+ * 数据目录不属于安装器：升级、覆盖式安装、卸载都不动它，删除插件目录因此
+ * 不再能杀死进程。
+ *
+ * **不看 runtimeHooks.enabled，无条件 seed。** 这一条是被自举死锁反向逼出来
+ * 的：如果只在开关打开时写副本，那么"先配 NODE_OPTIONS 再开开关"这条路
+ * 必然起不来 —— 目标文件要等一次成功的启动才会出现，而启动要 `--require`
+ * 成功才行。于是从另一扇门把同一个死锁请了回来：默认状态（开关 false）
+ * 的用户照文档把 NODE_OPTIONS 指到数据目录，gateway 当场死，他们连进去
+ * 把开关打开的机会都没有。
+ * 代价只是没启用的人也多出三个文件（几十 KB，写在非宿主目录，不产生安装
+ * 器告警）；换来的是 NODE_OPTIONS 的设置顺序彻底不再重要。
+ *
+ * 遗留的 extensions/<id>/*.js：**仍被 NODE_OPTIONS 引用时才继续刷新**，引用
+ * 一改走就立刻停手。理由是安全修复必须送达 —— 早先"修复随多次重装仍送不到
+ * 容器"那次事故正是靠这个指纹比对解决的，存量部署若在迁移前就停止刷新，
+ * 等于把同一个问题重新引入。（不再被引用时它们对用户已经无害，删不删由宿主
+ * 提示和用户决定：**绝不能由插件代删** —— 主动删一个还被 NODE_OPTIONS 引用
+ * 的文件，等于当场把服务打死。）
+ *
+ * 目录不可写时静默跳过 —— 宿主可以自己设 NODE_OPTIONS 指向安装包内的
+ * hooks/，零残留写法同样被 probeRuntimeHookLoaded 认可。
  */
 export function ensureBundledHooks(
   config: SecurityMonitorConfig,
   logger?: BootstrapLogger
 ): boolean {
-  if (!config.application?.runtimeHooks?.enabled) return false;
   const hooksDir = findBundledDir("hooks");
   if (!hooksDir) return false;
+  const optedIn = config.application?.runtimeHooks?.enabled === true;
 
-  // OpenClaw extensions dir is conventionally $OPENCLAW_HOME/extensions;
-  // when OPENCLAW_HOME is unset, fall back to ~/.openclaw/extensions so
-  // the host can find hooks from its loader path. Both are best-effort —
-  // if we cannot write, we do not throw.
-  const home = process.env.OPENCLAW_HOME
-    ? resolve(process.env.OPENCLAW_HOME)
-    : resolve(homedir(), ".openclaw");
-  const extensionsDir = process.env.OPENCLAW_EXTENSIONS_DIR
-    ? resolve(process.env.OPENCLAW_EXTENSIONS_DIR)
-    : resolve(home, "extensions", PLUGIN_ID);
-  // Restrict to paths under the OpenClaw data home or /usr/lib/openclaw
-  // to prevent env injection from writing hooks to arbitrary system locations.
-  const resolvedExt = resolve(extensionsDir);
+  const preloadDir = resolvePreloadDir();
+  const installed = installHooksInto(hooksDir, preloadDir, logger, optedIn);
+  // 模块类型锚点只播到数据目录：插件完全拥有这个目录，播错了不会碰到任何
+  // 别人的文件。遗留目录是宿主安装器拥有的，只刷新那三个 .js。
+  installHooksPackageJson(hooksDir, preloadDir, logger);
+  const legacy = probeLegacyHookPathInUse();
+  if (legacy) {
+    // 存量部署：NODE_OPTIONS 仍指着安装目录里的副本，那份必须跟得上版本，
+    // 否则升级后的安全修复到不了用户的进程。
+    installHooksInto(hooksDir, resolveLegacyDir(), logger, optedIn);
+  }
+  return installed;
+}
+
+/**
+ * 归一化 hook 源码，让被 `--require` 的文件不再对"首字节"敏感。
+ *
+ * `#!` 是 JavaScript 里唯一必须出现在文件最开头的语法，而 Node 只认字节 0
+ * 处的 shebang。实测（Node v24）：
+ *   - 首行是 `#!`                        → 正常加载；
+ *   - 首行是空行/注释、`#!` 落到第 2 行   → SyntaxError: Invalid or
+ *     unexpected token，**报错行号正是 2**（本次线上故障的原始形态）；
+ *   - 首字节是 UTF-8 BOM                 → SyntaxError（Node 在剥 BOM
+ *     之前就判 shebang，BOM 在前同样致命）。
+ *
+ * 而这三个文件是 NODE_OPTIONS 的预加载目标：语法错 = 宿主进程在加载任何
+ * 插件之前就退出，插件连"把副本修回去"的机会都没有（自举死锁的又一种
+ * 形态）。归一化做两件事，把这一整类失败消掉：
+ *   1. 去掉 UTF-8 BOM；
+ *   2. 删掉所有以 `#!` 开头的行 —— CJS 里行首 `#` 只能开私有字段名，
+ *      `#!` 必然是语法错误；删掉之后，文件无论被谁在前面插过内容都合法。
+ *
+ * 顺带把 CRLF 归一成 LF：预加载副本要跑在容器里，LF 是那边的事实标准；
+ * 而且行尾差异会让"源与副本是不是同一份"的指纹比对在跨平台时反复不一致。
+ *
+ * 幂等：normalize(normalize(x)) === normalize(x)，落盘与指纹两边同口径，
+ * 不会每次启动都判定"需要重写"。
+ */
+export function normalizeHookContent(source: string): string {
+  const withoutBom = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source;
+  return withoutBom
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#!/.test(line))
+    .join("\n");
+}
+
+/**
+ * 原子落盘：写同目录临时文件再 rename。
+ *
+ * 预加载目标是被**别的进程**在启动期读的（`NODE_OPTIONS=--require`），而
+ * 写入发生在 gateway 的 register() 里 —— 那时 CLI 及其 worker 随时可能正
+ * 在并发拉起进程。裸 `writeFileSync` 会先把目标截断再逐块写出去，读到
+ * 中间态的进程看到的就是一份"语法坏掉的 hook"，恰好复现本次要根治的启动
+ * 崩溃。同目录保证 rename 不跨文件系统（跨了会退化成 copy，原子性就没了）。
+ */
+function writeFileAtomic(target: string, content: string): void {
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, content, "utf8");
+    renameSync(tmp, target);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* 临时文件删不掉不该盖掉真正的错误 */
+    }
+    throw err;
+  }
+}
+
+/**
+ * 读一个 hook 文件并归一化。读不到返回 undefined（调用方按"需要重装"处理）。
+ */
+function readHookContent(filePath: string): string | undefined {
+  try {
+    return normalizeHookContent(readFileSync(filePath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 按 Node 的 CommonJS 形态编译一次，验"这份文件能不能被 --require"。
+ *
+ * 用 CJS 包装形态而不是裸 Script：顶层 `return` 在真模块里合法、在裸 Script
+ * 里非法，包一层才不会误判（Node 自己就是这么包 CJS 模块的）。
+ */
+function isParsableAsCommonJs(content: string, filename: string): boolean {
+  try {
+    new Script(
+      `(function (exports, require, module, __filename, __dirname) {${content}\n});`,
+      { filename }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 随包 hook 解析失败时的占位入口。
+ *
+ * 预加载入口语法错 = 宿主进程在启动期直接退出（SyntaxError），插件连运行
+ * 机会都没有 → 用户看到的是"服务起不来 + 一个看不懂的报错"，而真正的
+ * 原因（随包文件坏了）藏在没人会去看的地方。与其留一份 SyntaxError 的
+ * 文件把整个服务打死，不如留一个"能加载、但什么都不做"的入口：覆盖从
+ * "整个宿主挂掉"降级为"这一层没有覆盖"，服务还能起来、面板还能打开。
+ *
+ * 只有**入口**（hook-mounter.js）坏掉时整层才算失效，才留全局标记让探针
+ * 判成未生效；兄弟文件（runtime.js / network.js）坏掉只影响那一层，入口
+ * 仍然在工作，不该因此把整层判死。
+ */
+function degradedHookStub(hookName: string): string {
+  const marker =
+    hookName === PREFERRED_PRELOAD_BASENAME
+      ? "globalThis.__openclaw_security_hook_degraded = true;"
+      : "";
+  return `// openclaw-security-monitor: degraded placeholder (${hookName})
+//
+// 随包 runtime hook 解析失败，这里是占位文件：能被 --require 加载，但不做
+// 任何事情。真正的错误见宿主日志里同一时刻的 hook install 告警。
+${marker}
+console.warn('[openclaw-security-monitor] runtime hook degraded: bundled ${hookName} is not parsable');
+`;
+}
+
+/**
+ * 把随包 hook 拷进 targetDir，逐个按内容指纹决定是否覆盖。
+ * 返回"本次是否真的写了文件"。
+ *
+ * `recommendPreload` 只控制那行 "recommend NODE_OPTIONS=..." 日志：开关
+ * 没打开时照样落盘（见 ensureBundledHooks 的注释），但不该怂恿用户去改
+ * 一个他们没要求启用的功能的环境变量。
+ *
+ * 落盘是**原子的**：写临时文件 + rename。预加载目标是被别的进程
+ * （`NODE_OPTIONS=--require`）在启动期读的，而本函数跑在 gateway 的
+ * register() 里 —— 此时 CLI 及其 worker 可能正在并发拉起进程。裸
+ * `writeFileSync` 不是原子的，它们正好读到写了一半的文件时，就会看到
+ * 一份"语法坏掉的 hook"，也就是本次要根治的那个启动崩溃本身。
+ *
+ * 落盘的是**归一化后的内容**，不是逐字节拷贝。逐字节拷贝会把随包源里的
+ * 任何污染原样带进预加载目录（shebang 不在首字节 / BOM），而预加载目录
+ * 里的文件一旦语法错，宿主进程就在加载任何插件之前退出。
+ */
+export function installHooksInto(
+  hooksDir: string,
+  targetDir: string,
+  logger?: BootstrapLogger,
+  recommendPreload = true
+): boolean {
+  // 防止环境变量注入把 hook 写到任意系统位置。旧实现用字符串 startsWith
+  // 判包含，`/home/node/.openclaw-evil` 能蒙混过关；现按 isInside 判。
+  const home = resolveOpenClawHome();
   const allowedBase = [home, '/usr/lib/openclaw'];
-  if (!allowedBase.some((base) => resolvedExt.startsWith(base))) {
-    logger?.warn?.(`[${PLUGIN_ID}] extensionsDir ${extensionsDir} is outside allowed base paths; skipping hook installation`);
+  if (!allowedBase.some((base) => isInside(targetDir, base))) {
+    logger?.warn?.(`[${PLUGIN_ID}] hook target dir ${targetDir} is outside allowed base paths; skipping`);
     return false;
   }
   try {
-    mkdirSync(extensionsDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
     let installed = false;
-    // hook-mounter.js is the recommended preload entry point (gracefully
-    // degrades when sibling hook files are missing). It ships alongside the
-    // other two so older deployments that still point NODE_OPTIONS at
-    // runtime.js / network.js directly still work.
-    const HOOK_FILES = ["runtime.js", "network.js", "hook-mounter.js"];
-    for (const hookName of HOOK_FILES) {
+    for (const hookName of HOOK_BASENAMES) {
       const source = resolve(hooksDir, hookName);
       if (!existsSync(source)) continue;
-      const target = resolve(extensionsDir, hookName);
+      const target = resolve(targetDir, hookName);
+      // 源与目标同路径（布局退化时的自指）：拷贝自己等于把源清空，跳过。
+      if (source === target) continue;
       // Upgrade when the target is missing OR when its content fingerprint
       // differs from the bundled source. Without this check, ensureBundledHooks
       // would silently keep stale hook files after plugin upgrades — leading
       // to the same bug we saw when the OPENCLAW_MONITOR_LOG_PATH fallback
       // fix never reached the container despite multiple plugin reinstalls.
-      if (existsSync(target) && readHookFingerprint(target) === readHookFingerprint(source)) {
+      const sourceFingerprint = readHookFingerprint(source);
+      if (sourceFingerprint === undefined) {
+        logger?.warn?.(`[${PLUGIN_ID}] bundled hook ${source} is unreadable; skipping`);
         continue;
       }
-      copyFileSync(source, target);
+      if (existsSync(target) && readHookFingerprint(target) === sourceFingerprint) {
+        continue;
+      }
+      const content = readHookContent(source);
+      if (content === undefined) continue;
+      if (!isParsableAsCommonJs(content, target)) {
+        // 不落那份坏文件：预加载入口语法错 = 宿主在加载任何插件之前就退出。
+        // 落一份"能加载但什么都不做"的占位入口，把"整个服务挂掉"降级成
+        // "这一层没有覆盖"，并在日志里点名随包文件。
+        //
+        // 但**绝不拿占位文件去顶掉一份还能用的旧副本**：存量部署（尤其还在
+        // 遗留路径上的）手上那份是被 Node 正常加载过的，拿它换掉等于用
+        // "有覆盖"换"零覆盖"，是纯粹的倒退。留着旧副本 + 告警，让它继续跑。
+        const existing = existsSync(target) ? readHookContent(target) : undefined;
+        if (existing !== undefined && isParsableAsCommonJs(existing, target)) {
+          logger?.warn?.(
+            `[${PLUGIN_ID}] bundled hook ${source} is not parsable as CommonJS — ` +
+              `kept the existing working copy at ${target} (coverage stays on). ` +
+              `Reinstall the plugin package to restore the bundled fix.`
+          );
+          continue;
+        }
+        writeFileAtomic(target, degradedHookStub(hookName));
+        installed = true;
+        logger?.warn?.(
+          `[${PLUGIN_ID}] bundled hook ${source} is not parsable as CommonJS — ` +
+            `wrote a degraded placeholder to ${target} instead. Putting the real file in ` +
+            `NODE_OPTIONS would kill the host process at startup (SyntaxError).`
+        );
+        continue;
+      }
+      writeFileAtomic(target, content);
       installed = true;
-      if (hookName === "hook-mounter.js") {
+      if (hookName === PREFERRED_PRELOAD_BASENAME && recommendPreload) {
         logger?.info?.(
-          `[${PLUGIN_ID}] installed hook-mounter to ${target} — recommend NODE_OPTIONS=--require ${target}`
+          `[${PLUGIN_ID}] installed ${hookName} to ${target} — recommend NODE_OPTIONS=--require ${target}`
         );
       }
     }
     if (installed) {
       logger?.info?.(
-        `[${PLUGIN_ID}] installed bundled runtime hooks to ${extensionsDir}`
+        `[${PLUGIN_ID}] installed bundled runtime hooks to ${targetDir}`
       );
     }
     return installed;
   } catch (err) {
     logger?.warn?.(
-      `[${PLUGIN_ID}] failed to install bundled hooks: ${err instanceof Error ? err.message : String(err)}`
+      `[${PLUGIN_ID}] failed to install bundled hooks into ${targetDir}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return false;
+  }
+}
+
+/**
+ * 把随包的 hooks/package.json 播种到**插件数据目录**（模块类型锚点）。
+ *
+ * 数据目录里没有 package.json 时，模块类型由**最近的祖先** package.json
+ * 决定：宿主若在 ~/.openclaw/package.json 里写了 "type": "module"，三件套
+ * 就会被当成 ESM —— ESM 里 `require` 未定义，预加载一进去就抛
+ * "require is not defined in ES module scope"，同样让宿主进程在启动期退出。
+ * 随包的 hooks/package.json 声明了 "type": "commonjs"，必须一起带走
+ * （tests/hook-preload-deployment.test.ts 早就按这个前提手工拷过它，
+ * 但生产播种路径一直没带 —— 这次一并补上）。
+ *
+ * **只对数据目录调用，且绝不覆盖已存在的 package.json。** 两条都来自同一
+ * 个坑：1.0.x 布局下插件**就装在** `extensions/<id>/`，于是
+ * `findBundledDir("hooks")` 解析到的 hooksDir 恰好是 `extensions/<id>/hooks`，
+ * 而遗留目录就是 `extensions/<id>/` —— 播种目标落在插件**自己的清单**上。
+ * 覆盖它等于把宿主要读的 manifest（main: index.js / type: module）换成
+ * hooks 的（main: runtime.js / type: commonjs），插件直接加载不起来；
+ * 而"文件不存在时就新建"同样致命：那会把整个 `extensions/<id>/` 的模块
+ * 类型钉成 commonjs，连插件自己的 index.js 一起废掉。
+ * 遗留目录是兼容期的**只读维护对象**，只刷新那三个 .js，不新增任何文件。
+ */
+function installHooksPackageJson(
+  hooksDir: string,
+  targetDir: string,
+  logger?: BootstrapLogger
+): boolean {
+  const source = resolve(hooksDir, "package.json");
+  const target = resolve(targetDir, "package.json");
+  if (!existsSync(source)) return false;
+  try {
+    const content = readFileSync(source, "utf8");
+    // 已存在就是别人的（宿主 / 插件自己的 manifest），一律不碰。
+    if (existsSync(target)) return false;
+    writeFileAtomic(target, content);
+    logger?.info?.(`[${PLUGIN_ID}] pinned ${targetDir} as CommonJS (hooks/package.json)`);
+    return true;
+  } catch (err) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] failed to install hooks package.json into ${targetDir}: ${err instanceof Error ? err.message : String(err)}`
     );
     return false;
   }
@@ -229,47 +479,109 @@ export function ensureBundledHooks(
  * 必须哈希整个文件而不是头部若干字节：只读前 N 字节会漏掉文件尾部的修复，
  * 正是当初"修复送不到容器"事故的成因。
  *
+ * 哈希前先走 normalizeHookContent：源与副本同口径（都归一化过），否则
+ * 归一化前后的差异会被算成"内容变了"，导致每次启动都重写一遍。
+ *
  * Returns undefined if the file is unreadable so the caller upgrades.
  */
 function readHookFingerprint(filePath: string): string | undefined {
-  try {
-    const source = readFileSync(filePath, "utf8");
-    // 归一化而非删除：带 tag 与不带 tag 的文件在同一位置留下同样的占位，
-    // 这样"只 bump 了 tag"不会改变指纹（tag 已不承载语义）。
-    const normalized = source.replace(/^\/\/ openclaw-hook:.*$/m, "// openclaw-hook");
-    return createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 16);
-  } catch {
-    return undefined;
-  }
+  const content = readHookContent(filePath);
+  if (content === undefined) return undefined;
+  // 归一化而非删除：带 tag 与不带 tag 的文件在同一位置留下同样的占位，
+  // 这样"只 bump 了 tag"不会改变指纹（tag 已不承载语义）。
+  const normalized = content.replace(/^\/\/ openclaw-hook:.*$/m, "// openclaw-hook");
+  return createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 16);
 }
 
 /**
- * Detect whether the runtime hook was actually preloaded into the Node.js
- * runtime. We use the `NODE_OPTIONS` env var as a proxy: if it points at a
- * script we recognize, we trust it; otherwise the runtime hook collector
- * would never see anything and we should disable the feature instead of
- * silently misreporting.
+ * 预加载入口是否处于降级状态（随包文件解析失败 → 落盘的是占位入口）。
+ *
+ * 占位入口能被 --require 加载，所以 NODE_OPTIONS 探针会认为"hook 已在"，
+ * 但那一层其实什么也没干。这个全局标记把真相透出来：探针据此判成未生效，
+ * 面板如实显示"hook 未生效"，而不是谎报已生效。
+ */
+export function isRuntimeHookDegraded(): boolean {
+  return (globalThis as Record<string, unknown>).__openclaw_security_hook_degraded === true;
+}
+
+/**
+ * Detect whether one of our hooks was actually preloaded into the Node.js
+ * runtime. We use the `NODE_OPTIONS` env var as a proxy: if it references a
+ * hook file we own, we trust it; otherwise the runtime hook collector would
+ * never see anything and we should disable the feature instead of silently
+ * misreporting.
+ *
+ * 判定走"文件名 + 路径归属"（matchHookRequires），不再用正则猜路径形状。旧
+ * 正则只认路径里带 `runtime` 的写法，于是三个文件里唯一被推荐给 NODE_OPTIONS
+ * 的 hook-mounter.js 反而被判成"不是我们的 hook" → 误杀 → 强制关停
+ * runtimeHooks.enabled → 下次启动连副本都不再刷新。详见 hook-locations.ts。
  */
 export function probeRuntimeHookLoaded(logger?: BootstrapLogger): boolean {
-  const nodeOptions = process.env.NODE_OPTIONS || "";
-  if (!nodeOptions) {
+  // 降级占位入口会在全局留标记：它能被 --require 加载，所以 NODE_OPTIONS
+  // 探针会认为"hook 已在" —— 但那一层其实什么也没干。判成未生效，面板
+  // 才会如实显示"hook 未生效"，而不是谎报已生效。
+  if (isRuntimeHookDegraded()) {
     logger?.warn?.(
-      `[${PLUGIN_ID}] NODE_OPTIONS not set — runtime hook coverage disabled ` +
-        `(set NODE_OPTIONS='--require /path/to/runtime.js' to enable)`
+      `[${PLUGIN_ID}] runtime hook is running in DEGRADED mode (the bundled hook was not ` +
+        `parsable) — coverage disabled until the plugin package is reinstalled`
     );
     return false;
   }
-  // Best-effort: NODE_OPTIONS may list multiple --require flags separated by
-  // spaces. Look for any entry that looks like our hook.
-  const requires = nodeOptions.match(/--require\s+(\S+)/g) || [];
-  const matches = requires.some((entry) => /sst-security-control-openclaw.*runtime|openclaw-security-monitor.*runtime|hooks\/runtime/i.test(entry));
-  if (!matches) {
+  const nodeOptions = process.env.NODE_OPTIONS || "";
+  if (!nodeOptions.trim()) {
     logger?.warn?.(
-      `[${PLUGIN_ID}] NODE_OPTIONS does not reference the bundled runtime hook — coverage disabled`
+      `[${PLUGIN_ID}] NODE_OPTIONS not set — runtime hook coverage disabled ` +
+        `(set NODE_OPTIONS='--require ${resolvePreloadTarget()}' to enable)`
+    );
+    return false;
+  }
+  if (matchHookRequires(nodeOptions).length === 0) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] NODE_OPTIONS does not reference any of our hooks (${HOOK_BASENAMES.join(" / ")}) — coverage disabled`
     );
     return false;
   }
   return true;
+}
+
+/**
+ * NODE_OPTIONS 是否仍指向遗留安装目录里的 hook 副本。
+ *
+ * 存量部署（照 1.0.x 面板文案配的）指向 `$OPENCLAW_HOME/extensions/<id>/*.js`。
+ * 那份副本不在包清单里，安装器每次装/升级都会提示它"未删除"，而删掉它会让
+ * gateway 起不来 —— 正是要根治的故障。这里只**识别**并提示迁移，绝不代替
+ * 用户去删：删一个还被 NODE_OPTIONS 引着的文件，等于当场把服务打死。
+ */
+export function probeLegacyHookPathInUse(): string | undefined {
+  return matchHookRequires(process.env.NODE_OPTIONS || "").find((m) => m.inLegacyDir)?.resolved;
+}
+
+/**
+ * 迁移提示只打一次：用户可能有意留在遗留路径（探针仍然认它，功能不受影响），
+ * 每次启动都刷一遍只会把面板警告变成噪音。marker 记录上次提示过的路径，换了
+ * 路径才再提示一次；写不动 marker（只读数据目录）就退化成每次都提示。
+ */
+function warnLegacyHookPathOnce(legacyTarget: string, logger?: BootstrapLogger): void {
+  const dataDir = resolvePluginDataDir();
+  const markerPath = resolve(dataDir, "hook-path-migrated.txt");
+  try {
+    if (existsSync(markerPath) && readFileSync(markerPath, "utf8").trim() === legacyTarget) return;
+  } catch {
+    /* marker 读不到就当没打过，提示一次不算错 */
+  }
+  logger?.warn?.(
+    `[${PLUGIN_ID}] NODE_OPTIONS 仍指向遗留安装目录的 hook 副本 ${legacyTarget}。` +
+      `该副本不在安装包清单内，宿主每次装/升级都会提示删除它，而删除会让 gateway` +
+      `因 --require 找不到文件而无法启动（插件也无从重建）。请把启动环境的 NODE_OPTIONS` +
+      `改指向插件数据目录（改完即可安全删除那 3 个遗留文件）：` +
+      `NODE_OPTIONS='--require ${resolvePreloadTarget()}'`
+  );
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(markerPath, legacyTarget, "utf8");
+  } catch {
+    /* marker 只是去重，写不成就下次再提示一次 */
+  }
 }
 
 /**
@@ -340,9 +652,15 @@ export function applyBootstrapResults(
   if (!report.runtimeHookLoaded) {
     if (next.application?.runtimeHooks?.enabled) {
       next.application.runtimeHooks.enabled = false;
+      // 两种成因共用一句文案：宿主没引用我们的 hook，或者引用到的副本处于
+      // 降级状态（随包文件解析失败 → 预加载入口被换成占位文件）。后者在
+      // 宿主日志里有专门的告警行，这里只负责让面板别谎报"已生效"。
+      const reason = isRuntimeHookDegraded()
+        ? `预加载 hook 处于降级状态（随包文件解析失败，副本已被替换为占位入口）；请重新安装插件包后再启用`
+        : `宿主 NODE_OPTIONS 未引用 bundled runtime hook；需在启动环境加 NODE_OPTIONS='--require ${resolvePreloadTarget()}'（绝对路径写法见该字段帮助）`;
       forcedDisabled.push({
         path: "application.runtimeHooks.enabled",
-        reason: "宿主 NODE_OPTIONS 未引用 bundled runtime hook；需在启动环境加 NODE_OPTIONS='--require ~/.openclaw/extensions/sst-security-control-openclaw/runtime.js'（绝对路径写法见该字段帮助）",
+        reason,
       });
     }
   }
@@ -382,7 +700,7 @@ export function applyBootstrapResults(
 export function resolveHostConfigPath(): string {
   if (process.env.OPENCLAW_EXTERNAL_CONFIG_PATH) return process.env.OPENCLAW_EXTERNAL_CONFIG_PATH;
   if (process.env.OPENCLAW_CONFIG_PATH) return process.env.OPENCLAW_CONFIG_PATH;
-  const home = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
+  const home = resolveOpenClawHome();
   return join(home, "openclaw.json");
 }
 
@@ -524,6 +842,7 @@ export function initializePlugin(
     runtimeHookLoaded: true,
     pythonPsutil: true,
     entryDefaultsWritten: false,
+    preloadTarget: resolvePreloadTarget(),
   };
 
   try {
@@ -562,6 +881,18 @@ export function initializePlugin(
       `[${PLUGIN_ID}] runtime hook probe failed: ${err instanceof Error ? err.message : String(err)}`
     );
     report.runtimeHookLoaded = false;
+  }
+
+  try {
+    const legacyTarget = probeLegacyHookPathInUse();
+    if (legacyTarget) {
+      report.legacyPreloadTargetInUse = legacyTarget;
+      warnLegacyHookPathOnce(legacyTarget, logger);
+    }
+  } catch (err) {
+    logger?.warn?.(
+      `[${PLUGIN_ID}] legacy hook path probe failed: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   try {

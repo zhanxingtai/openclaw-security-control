@@ -182,6 +182,12 @@ const EN = {
   // 持久状态条
   "status.hookNotLoaded":
     "⚠ Runtime hook is not active: the host NODE_OPTIONS does not preload the security hook, so runtime process/network protection is currently off (this is a silent downgrade, not an explicit opt-out). See application.runtimeHooks.enabled on the Config tab.",
+  // 带路径变体：这条警告最常见的成因就是 NODE_OPTIONS 指了一条不存在的路径，
+  // 而路径必须现读现算（容器里的 home 与宿主机 home 不是同一个），因此由
+  // 后端 security.status 现算后经 {hookPath} 下发。拿不到路径时回落到上面
+  // 那条无占位符的文案，避免面板把 {hookPath} 原样印出来。
+  "status.hookNotLoadedWithPath":
+    "⚠ Runtime hook is not active: the host NODE_OPTIONS does not preload the security hook, so runtime process/network protection is currently off (this is a silent downgrade, not an explicit opt-out).\nNODE_OPTIONS='--require {hookPath}'",
 
   // Metrics 页脚 / 完整面板按钮 / toast
   "footer.visitSite": "Visit Site",
@@ -298,19 +304,21 @@ const EN = {
     "?lang= in the URL still wins over both.",
   ].join("\n"),
   "cfg.help.application.runtimeHooks.enabled": [
-    "⚙ Enabled does not mean active. The bundled hooks are already copied to on first enable:",
-    "  ~/.openclaw/extensions/sst-security-control-openclaw/",
-    "The gateway startup environment must still set NODE_OPTIONS to reference runtime.js.",
-    "The path must be absolute inside the runtime environment (the home directory in a container depends on the image, commonly /home/node):",
+    "Covers executions that never go through an agent tool call (process / network layer).",
     "",
-    "  # docker run / docker-compose",
-    "  -e NODE_OPTIONS='--require /home/node/.openclaw/extensions/sst-security-control-openclaw/runtime.js'",
+    "Turn this on, then point NODE_OPTIONS at:",
     "",
-    "  # direct install on the host",
-    "  NODE_OPTIONS='--require $HOME/.openclaw/extensions/sst-security-control-openclaw/runtime.js'",
+    "  {preloadTarget}",
     "",
-    "⚠ 'openclaw gateway restart' alone will not make NODE_OPTIONS take effect;",
-    "  the container must be rebuilt / the host process restarted. Verify: the log shows runtimeHookLoaded=true",
+    "  # docker: -e NODE_OPTIONS='--require {preloadTarget}'",
+    "  # host:   NODE_OPTIONS='--require {preloadTarget}'",
+    "",
+    "hook-mounter.js loads the other two and only warns if one is missing.",
+    "",
+    "⚠ The path must be absolute inside the runtime environment (a container's home depends on the image).",
+    "⚠ After installing or upgrading, let the gateway start successfully once before pointing at it: the copy is written by a running gateway, and --require on a missing file stops the process.",
+    "⚠ Restarting the gateway alone is not enough — rebuild the container or restart the host process. Verify: the log shows runtimeHookLoaded=true",
+    "⚠ Gateway will not start and the log shows \"SyntaxError: Invalid or unexpected token\" pointing at hook-mounter.js → the preload copy is corrupt. Recovery: (1) drop the --require from NODE_OPTIONS and restart (the gateway comes up and the plugin rewrites the copy), (2) point NODE_OPTIONS back at the path above.",
   ].join("\n"),
   "cfg.help.application.runtimeHooks.networkEnabled": [
     "Defaults to true. Runtime Hooks intercept both child_process and fetch; turn this off when you",
@@ -514,6 +522,9 @@ const ZH: Record<DictKey, string> = {
   // 持久状态条
   "status.hookNotLoaded":
     "⚠ Runtime hook 未生效：宿主 NODE_OPTIONS 未预加载安全 hook，运行时进程/网络防护当前不生效（配置未主动关闭，属静默降级）。详见 Config 页 application.runtimeHooks.enabled 说明。",
+  // 带路径变体，路径由后端现算（见 en 侧同名键的注释）。
+  "status.hookNotLoadedWithPath":
+    "⚠ Runtime hook 未生效：宿主 NODE_OPTIONS 未预加载安全 hook，运行时进程/网络防护当前不生效（配置未主动关闭，属静默降级）。\nNODE_OPTIONS='--require {hookPath}'",
 
   // Metrics 页脚 / 完整面板按钮 / toast
   "footer.visitSite": "访问官网",
@@ -609,19 +620,21 @@ const ZH: Record<DictKey, string> = {
     "URL 里的 ?lang= 仍然优先于两者。",
   ].join("\n"),
   "cfg.help.application.runtimeHooks.enabled": [
-    "⚙ 启用 ≠ 立即生效。bundled hooks 首次启用时已拷到",
-    "  ~/.openclaw/extensions/sst-security-control-openclaw/",
-    "还须让 gateway 启动环境设 NODE_OPTIONS 引用 runtime.js。",
-    "路径须为运行环境内的绝对路径（容器内 home 取决于镜像，常见为 /home/node）：",
+    "覆盖不经工具调用的执行（进程层 / 网络层）。",
     "",
-    "  # docker run / docker-compose",
-    "  -e NODE_OPTIONS='--require /home/node/.openclaw/extensions/sst-security-control-openclaw/runtime.js'",
+    "打开本开关，然后把 NODE_OPTIONS 指向：",
     "",
-    "  # 宿主机直装",
-    "  NODE_OPTIONS='--require $HOME/.openclaw/extensions/sst-security-control-openclaw/runtime.js'",
+    "  {preloadTarget}",
     "",
-    "⚠ 仅 openclaw gateway restart 不会让 NODE_OPTIONS 生效，",
-    "  须重建容器 / 重启宿主进程。验证：日志出现 runtimeHookLoaded=true",
+    "  # docker: -e NODE_OPTIONS='--require {preloadTarget}'",
+    "  # 宿主机: NODE_OPTIONS='--require {preloadTarget}'",
+    "",
+    "hook-mounter.js 会加载另外两个，缺文件只告警。",
+    "",
+    "⚠ 路径须为运行环境内的绝对路径（容器内 home 取决于镜像）。",
+    "⚠ 装/升级后先让 gateway 成功启动一次再指过去：副本由运行中的 gateway 写出，--require 一个不存在的文件会直接停掉进程。",
+    "⚠ 仅重启 gateway 不生效，须重建容器 / 重启宿主进程。验证：日志出现 runtimeHookLoaded=true",
+    "⚠ gateway 起不来、日志报 \"SyntaxError: Invalid or unexpected token\" 且指向 hook-mounter.js → 预加载副本坏了。恢复：① 先把 NODE_OPTIONS 里的 --require 去掉再重启（gateway 即可起来，插件会把副本重写好），② 再把 NODE_OPTIONS 指回上面的路径。",
   ].join("\n"),
   "cfg.help.application.runtimeHooks.networkEnabled":
     "默认 true。Runtime Hooks 同时拦截 child_process + fetch；只想要进程拦截、不想要网络拦截时关闭。必须先启用「启用 Runtime Hooks」。关闭/开启在 gateway 重启后生效（本进程已加载 network hook 的场景同样生效，无需重建容器）。",

@@ -1,12 +1,28 @@
 # sst-security-control-openclaw
 
-[English](README.md) · **简体中文**
+[English](https://github.com/zhanxingtai/openclaw-security-control/blob/main/README.md) · **简体中文**
 
 面向 OpenClaw 的开源运行安全插件，提供本地风险检测、安全事件记录及高风险操作阻断。
 
 **特性**：开箱即用，默认本地独立运行，无需注册账号，不连接云端服务。
 
 ## 安装
+
+### 插件市场安装
+
+插件已上架 [ClawHub](https://clawhub.ai/) 插件市场，搜索 `sst-security-control-openclaw` 即可找到，也可直接用命令行安装：
+
+```bash
+# 1. 在插件市场中检索（可选）
+openclaw plugins search sst-security-control-openclaw
+
+# 2. 从插件市场安装
+openclaw plugins install clawhub:@zhanxing/sst-security-control-openclaw --accept-capabilities
+openclaw plugins enable sst-security-control-openclaw
+openclaw gateway restart
+```
+
+### 源码构建安装
 
 ```bash
 # 1. 构建安装包
@@ -56,16 +72,21 @@ openclaw plugins config sst-security-control-openclaw --set \
 
 ## 自定义 SPL 规则
 
-阻断策略为 SPL 声明式规则（YAML，`apiVersion: security.use/v1`），随包提供开箱规则集，规则示例见 [policies/security-policy.spl.yaml](policies/security-policy.spl.yaml)。切换到 `enforce` 模式前，建议将策略文件复制到 `~/.openclaw/security-policy.yaml` 并审核规则。
+阻断策略为 SPL 声明式规则（YAML，`apiVersion: security.use/v1`），随包提供开箱规则集，规则示例见 [policies/security-policy.spl.yaml](https://github.com/zhanxingtai/openclaw-security-control/blob/main/policies/security-policy.spl.yaml)。切换到 `enforce` 模式前，建议将策略文件复制到 `~/.openclaw/security-policy.yaml` 并审核规则。
 
 ## 安全事件
 
-事件为 NDJSON 行，主要事件类型包括：
+事件为 NDJSON 行。本版本实际会写出的 `event_type`，按层分：
 
-- `agent_session_start` / `agent_start` / `agent_stop`
-- `agent_tool_call` / `agent_tool_result`
-- `runtime_spawn_intent` / `runtime_spawn_denied`
-- `security_audit`（内嵌守卫命中、循环检测、令牌异常）
+| 层 | 事件类型 | 需要运行时 hooks |
+|----|---------|-------------------|
+| 应用 | `agent_session_start` / `agent_session_end`、`agent_start` / `agent_stop`、`agent_subagent_start` / `agent_subagent_progress` / `agent_subagent_end`、`agent_message`、`agent_tool_call` / `agent_tool_result`、`cron_changed`、`code_mode_exec`、`reasoning` | 否 |
+| 应用（文件） | `file_read` / `file_write` / `file_delete` / `file_privilege` —— 由工具名归一化而来（`fs.readFile` → `file_read`） | 否 |
+| 系统（进程） | `process_start`、`process_change` / `process_exit` / `process_snapshot` | `process_start`：**是** |
+| 系统（cgroup） | `cgroup_snapshot` / `cgroup_anomaly` | 否（需 `system.enabled`） |
+| 系统（网络） | `network_http` | **是** |
+| 资产 | `asset_add` / `asset_change` / `asset_remove` / `asset_snapshot` | 否 |
+| 自保护 | `protection_degraded`、`tamper_detected` | 否 |
 
 ## 后续计划
 
@@ -91,4 +112,4 @@ openclaw plugins config sst-security-control-openclaw --set \
 
 ## 许可证
 
-[Apache-2.0](LICENSE) — 依赖声明见 `package.json`。
+[Apache-2.0](https://github.com/zhanxingtai/openclaw-security-control/blob/main/LICENSE) — 依赖声明见 `package.json`。

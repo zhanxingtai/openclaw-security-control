@@ -25,6 +25,7 @@ import { RuntimeHookCollector } from './runtime-hook-collector.js';
 import { AssetCollector } from './asset-collector.js';
 import { redactEventForEmit } from './redact.js';
 import { normalizeConfig } from './config.js';
+import { resolvePreloadTarget } from './hook-locations.js';
 import { InterventionEngineImpl } from './intervention/InterventionEngine.js';
 import { ActionHistory } from './intervention/ActionHistory.js';
 import { GENERATED_HOOK_BLOCKED_FLAGS } from './intervention/generated-flag-defaults.js';
@@ -1323,7 +1324,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     });
   }
 
-  getStatus(): { enabled: boolean; runtimeHookLoaded: boolean | null; runtimeHooksEnabled: boolean | null; stats: Record<string, unknown> } {
+  getStatus(): { enabled: boolean; runtimeHookLoaded: boolean | null; runtimeHooksEnabled: boolean | null; runtimeHookPath: string; stats: Record<string, unknown> } {
     return {
       enabled: this.enabled,
       // 面板持久状态条数据源。runtimeHookLoaded 是 bootstrap 探测
@@ -1331,6 +1332,9 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       // （bootstrap 强制降级前的值），用于区分"静默失效"与"用户主动关闭"。
       runtimeHookLoaded: this.runtimeHookProbeLoaded ?? null,
       runtimeHooksEnabled: this.runtimeHooksUserEnabled ?? this.config.application?.runtimeHooks?.enabled ?? null,
+      // NODE_OPTIONS 该指向哪条绝对路径。现读现算（纯环境派生），面板在
+      // 提示条上直接把它印出来，用户不必去猜容器里的 home 是不是 /home/node。
+      runtimeHookPath: resolvePreloadTarget(),
       stats: {
         collector: this.collector.getStats(),
         application: this.applicationCollector.getStats?.(),

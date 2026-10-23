@@ -15,6 +15,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import * as yaml from 'js-yaml';
 import { assertVersionConsistency } from './version-check.mjs';
+import {
+  assertPublishMetadata,
+  buildInstallOpenClawMeta,
+} from './clawhub-metadata.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -281,9 +285,12 @@ function packageInstall() {
     type: rootPkg.type,
     main: 'application/index.js',
     types: 'application/index.d.ts',
-    openclaw: {
-      extensions: ['./index.js'],
-    },
+    // ClawHub 的上架校验读的是**归档根**的 package.json，也就是即将写进 tgz
+    // 的这一份。历史上这里只搬了 extensions，compat/build/install 连同
+    // repository/bugs/homepage 一起丢在仓库根，于是上架报
+    // "package.json / Package manifest / Missing metadata"——仓库根看着齐全，
+    // 发布的包里没有。搬运规则见 scripts/clawhub-metadata.mjs。
+    openclaw: buildInstallOpenClawMeta(rootPkg, pluginManifest, './index.js'),
     files: [
       'application',
       'application/node_modules',
@@ -294,8 +301,8 @@ function packageInstall() {
       'openclaw.plugin.json',
       'README.md',
       // 中文版 README 随包分发：npm 包页只渲染 README.md（英文），
-      // 中文用户拿到 tgz 后没有 README.zh-CN.md 就只能读英文安装步骤。
-      'README.zh-CN.md',
+      // 中文用户拿到 tgz 后没有 README.zh.md 就只能读英文安装步骤。
+      'README.zh.md',
       // 维护者文档（docs/INSTALL.md、docs/CHANGELOG.md 等）不进 tgz；
       // 用户面向安装步骤在 README。其余维护者文档保留在仓库供审计，
       // 但不出现在公开 npm tarball。
@@ -307,10 +314,18 @@ function packageInstall() {
     keywords: rootPkg.keywords,
     author: rootPkg.author,
     license: rootPkg.license,
+    // 上架页要跳转仓库 / 提 issue，靠的就是这三个；漏了不影响装，但
+    // ClawHub 目录页上会是三个空位。
+    repository: rootPkg.repository,
+    bugs: rootPkg.bugs,
+    homepage: rootPkg.homepage,
     peerDependencies: rootPkg.peerDependencies,
+    peerDependenciesMeta: rootPkg.peerDependenciesMeta,
     dependencies: rootPkg.dependencies,
     engines: rootPkg.engines,
   };
+  // 打包前拦：metadata 缺一项就打 tgz，等于把错误产物送到用户的上传动作上。
+  assertPublishMetadata(installPkg, 'install 端 package.json（ClawHub 上架清单）');
   fs.writeFileSync(
     path.join(installDir, 'package.json'),
     JSON.stringify(installPkg, null, 2) + '\n'
@@ -335,7 +350,7 @@ function packageInstall() {
   );
 
   copyFile(path.join(rootDir, 'README.md'), path.join(installDir, 'README.md'));
-  copyFile(path.join(rootDir, 'README.zh-CN.md'), path.join(installDir, 'README.zh-CN.md'));
+  copyFile(path.join(rootDir, 'README.zh.md'), path.join(installDir, 'README.zh.md'));
   // 合规材料：Apache-2.0 要求随分发附带许可文本。
   copyFile(path.join(rootDir, 'LICENSE'), path.join(installDir, 'LICENSE'));
   // Ship the canonical intervention policy as policies/security-policy.yaml so
@@ -506,11 +521,22 @@ function assertInstallTarballIntegrity(tarballPath, installDir) {
   // tgz 实际是 install/ 目录内容的镜像。关键路径必须存在（编译入口、
   // 插件清单、策略）。注：策略在 install 阶段重命名为 security-policy.yaml
   // （去掉 .spl 中缀,OpenClaw runtime 加载用此名）。
+  // 预加载文件名单钉死在此：NODE_OPTIONS 只能 --require 一个随包分发的文件，
+  // 而 hooks/package.json 的 "type": "commonjs" 是它们能被 --require 的前提 ——
+  // 少了它，根 package.json 的 "type": "module" 会把 hooks/*.js 当 ESM，
+  // Node 启动期直接 ERR_REQUIRE_ESM。
+  // 与 src/hook-locations.ts 的 HOOK_BASENAMES 一一对应（由
+  // tests/hook-locations.test.ts 断言两侧相等，防止各自演进失配）。
+  // 注意不能改成"现读 hooks/ 目录"：断言跑在 install/ 被裁剪成只剩 tgz 之后，
+  // 那时目录已不存在，会让必含检查静默退化成空集。
+  const REQUIRED_HOOK_FILES = ['hook-mounter.js', 'runtime.js', 'network.js'];
   const required = [
     'package/application/index.js',              // 编译入口（dist/ index.js 拷贝）
     'package/package.json',                      // install 端 package.json（runtime 用）
     'package/openclaw.plugin.json',              // 插件清单
     'package/policies/security-policy.yaml',     // shipped SPL 策略（install 阶段 rename）
+    'package/hooks/package.json',                // hooks 的 commonjs 类型声明（--require 前提）
+    ...REQUIRED_HOOK_FILES.map((f) => `package/hooks/${f}`),
   ];
   const missing = required.filter(
     (p) => !entries.some((e) => e === p || e.startsWith(p + '/') || e === p)
@@ -537,7 +563,36 @@ function assertInstallTarballIntegrity(tarballPath, installDir) {
     log('  提示：检查 copyDir 的 exclude 规则；若新增了拷贝路径，确认它没有绕开统一过滤。');
     process.exit(1);
   }
-  log(`tarball integrity OK: ${path.basename(tarballPath)} 含 ${required.length} 项关键文件、0 个测试/缓存产物（${entries.length} entries）`);
+  // 双向契约：归档里 hooks/*.js 的实际名单必须与 REQUIRED_HOOK_FILES 完全一致。
+  // 只查"必含"看不见"多带"——多出来的 hook 没人 require，等于白占包体；而名单
+  // 与 src/hook-locations.ts 失配更糟：插件会去找一个包内不存在的文件。
+  const actualHookJs = entries
+    .filter((e) => /^package\/hooks\/[^/]+\.js$/.test(e))
+    .map((e) => e.slice('package/hooks/'.length))
+    .sort();
+  const hookListMismatch = actualHookJs.join(",") !== [...REQUIRED_HOOK_FILES].sort().join(",");
+  if (hookListMismatch) {
+    log(`FAIL: tarball ${path.basename(tarballPath)} hooks/*.js 名单与 REQUIRED_HOOK_FILES 不一致`);
+    log(`  归档内: ${actualHookJs.join(", ") || "(空)"}`);
+    log(`  期望  : ${REQUIRED_HOOK_FILES.join(", ")}`);
+    log('  提示：新增/删除 hook 文件时同步改 scripts/build.js 的 REQUIRED_HOOK_FILES 与');
+    log('  src/hook-locations.ts 的 HOOK_BASENAMES（tests/hook-locations.test.ts 会比对两者）。');
+    process.exit(1);
+  }
+  // 遗留布局反断言：包根下不得再出现 hook 副本。1.0.x 把它们拷进
+  // extensions/<id>/（安装目录），宿主安装器按"目录实有内容 vs 包清单"对账时
+  // 会把这几个文件判成无法解释的外来文件、每次装/升级都提示删除；而删掉它们
+  // 又会让 NODE_OPTIONS --require 找不到文件，gateway 起不来。把 hook 放回
+  // 包根等于把那个自举死锁重新写回安装流程。
+  const legacyHookAtRoot = REQUIRED_HOOK_FILES.filter((f) => entries.includes(`package/${f}`));
+  if (legacyHookAtRoot.length > 0) {
+    log(`FAIL: tarball ${path.basename(tarballPath)} 包根含遗留布局的 hook 副本：`);
+    for (const f of legacyHookAtRoot) log(`  - package/${f}`);
+    log('  提示：hook 只应随包分发在 package/hooks/ 下（并由 src/hook-locations.ts 指向该目录）；');
+    log('  运行期副本写到插件数据目录 $OPENCLAW_HOME/<id>/hooks/，不要写进安装目录。');
+    process.exit(1);
+  }
+  log(`tarball integrity OK: ${path.basename(tarballPath)} 含 ${required.length} 项关键文件、hook 名单一致、0 个测试/缓存产物（${entries.length} entries）`);
 }
 
 function main() {
