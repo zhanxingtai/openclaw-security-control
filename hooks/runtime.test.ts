@@ -64,8 +64,60 @@ describe('Node.js runtime hook', () => {
     expect(event.risk_flags).toContain('shell_involved');
   });
 
-  it('redacts tokens in command lines', () => {
-    const redacted = hook.redactCommandLine(
+  it('reports the spawning call site, not the hook internals', () => {
+    // The hook used to filter its own frames by a hard-coded install path
+    // that no longer matched, so `caller` always pointed at the monitor
+    // looking at itself instead of the code that spawned the process.
+    const caller = hook.getCallerLocation();
+    expect(caller).not.toBeNull();
+    const callerFile = String(caller?.file).replace(/\\/g, '/');
+    expect(callerFile).not.toContain('hooks/runtime.js');
+
+    const event = hook.buildEvent({
+      api: 'child_process.exec',
+      command_line: 'ls -la /tmp',
+      executable: 'ls',
+      args: ['-la', '/tmp'],
+      shell_involved: false,
+    });
+    const eventCallerFile = String(event.caller?.file).replace(/\\/g, '/');
+    expect(eventCallerFile).not.toContain('hooks/runtime.js');
+  });
+
+  it('emits a stable event id under both the legacy and standard field names', () => {
+    const event = hook.buildEvent({
+      api: 'child_process.exec',
+      command_line: 'ls -la /tmp',
+      executable: 'ls',
+      args: ['-la', '/tmp'],
+      shell_involved: false,
+    });
+
+    expect(event.id).toBeTruthy();
+    // The collector reads the standard field name to identify the event, so
+    // a replayed sidecar line can be de-duplicated.
+    expect(event.event_id).toBe(event.id);
+  });
+
+  it('reports missing context as null rather than an empty string', () => {
+    const event = hook.buildEvent({
+      api: 'child_process.exec',
+      command_line: 'ls -la /tmp',
+      executable: 'ls',
+      args: ['-la', '/tmp'],
+      shell_involved: false,
+    });
+
+    // "" reads downstream as "present but empty" — a third meaning next to
+    // null and "field absent".
+    expect(event.agent_id).toBeNull();
+    expect(event.session_id).toBeNull();
+    expect(event.run_id).toBeNull();
+    expect(event.tool_call_id).toBeNull();
+    expect(event.tool_name).toBeNull();
+  });
+
+  it('redacts tokens in command lines', () => {    const redacted = hook.redactCommandLine(
       'curl -H "Authorization: Bearer secret-token" https://example.com'
     );
     expect(redacted).toContain('Authorization: Bearer ***');
@@ -140,6 +192,74 @@ describe('Node.js runtime hook', () => {
         e.command_line.includes('echo spawn-test')
     );
     expect(match).toBeDefined();
+  });
+
+  it('records the child process pid alongside the spawner pid', async () => {
+    const { spawn } = require('child_process');
+    const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+    await new Promise<void>((resolve) => {
+      child.on('exit', () => resolve());
+      child.on('error', () => resolve());
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const events = readEvents();
+    const start = events.find(
+      (e) =>
+        e.event_type === 'process_start' &&
+        typeof e.command_line === 'string' &&
+        e.command_line.includes('-e process.exit(0)')
+    );
+    expect(start).toBeDefined();
+    // 发起方是当前进程；子进程 pid 是另一个进程。
+    expect(start?.spawner_pid).toBe(process.pid);
+    expect(typeof start?.child_pid).toBe('number');
+    expect(start?.child_pid).not.toBe(process.pid);
+  });
+
+  it('emits a process_exit event when the child terminates', async () => {
+    const { spawn } = require('child_process');
+    const child = spawn(process.execPath, ['-e', 'process.exit(3)']);
+    await new Promise<void>((resolve) => {
+      child.on('exit', () => resolve());
+      child.on('error', () => resolve());
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    const events = readEvents();
+    const exit = events.find((e) => e.event_type === 'process_exit');
+    expect(exit).toBeDefined();
+    expect(exit?.exit_code).toBe(3);
+    expect(typeof exit?.child_pid).toBe('number');
+    expect(exit?.spawner_pid).toBe(process.pid);
+    // 退出事件排在起点事件之后。
+    const startIndex = events.findIndex(
+      (e) =>
+        e.event_type === 'process_start' &&
+        typeof e.command_line === 'string' &&
+        e.command_line.includes('-e process.exit(3)')
+    );
+    const exitIndex = events.findIndex((e) => e.event_type === 'process_exit');
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(exitIndex).toBeGreaterThan(startIndex);
+  });
+
+  it('keeps the blocked command recorded even though it never spawns', async () => {
+    // 拦截判定必须在 spawn 之前，被拦下的命令不能有 child_pid，但必须留痕。
+    const { spawn } = require('child_process');
+    process.env.OPENCLAW_RUNTIME_ENFORCE = '1';
+    process.env.OPENCLAW_RUNTIME_BLOCKED_FLAGS = 'shell_involved';
+    try {
+      spawn('echo', ['should-be-blocked'], { shell: true });
+    } catch {
+      // expected: the hook denies the command
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const events = readEvents();
+    const blocked = events.find((e) => e.event_type === 'process_start' && e.blocked === true);
+    expect(blocked).toBeDefined();
+    expect(blocked?.child_pid).toBeUndefined();
   });
 
   it('reads OpenClaw context from global variables', () => {
@@ -507,8 +627,10 @@ describe('Node.js runtime hook', () => {
   });
 
   // NODE_OPTIONS 全量注入 + 显式豁免打标。子进程显式剥离
-  // NODE_OPTIONS 即可绕过预加载 —— 现在强制注入并对绕过行为打
-  // self_protection_bypass 标签。
+  // NODE_OPTIONS 即可绕过预加载 —— 现在强制注入并对绕过行为打标。
+  // 只有"子进程最终真的裸跑"（explicit_skip）才算 self_protection_bypass；
+  // hook 已经把 NODE_OPTIONS 补回去的情形（env_stripped）改用
+  // hook_env_reinjected 留痕，不再冒充高危绕过。
   describe('hook propagation into child env', () => {
     const hookFile = path.resolve(process.cwd(), 'hooks/runtime.js');
 
@@ -575,7 +697,7 @@ describe('Node.js runtime hook', () => {
       expect(options.env).toBeUndefined();
     });
 
-    it('flags the emitted process event with self_protection_bypass on env strip', async () => {
+    it('flags the emitted process event with hook_env_reinjected on env strip', async () => {
       const { spawn } = require('child_process');
       const childEnv: Record<string, string> = { ...process.env, OPENCLAW_MONITOR_LOG_PATH: logFile } as Record<string, string>;
       delete childEnv.NODE_OPTIONS;
@@ -600,9 +722,19 @@ describe('Node.js runtime hook', () => {
           e.api === 'child_process.spawn' &&
           e.bypass_reason === 'env_stripped' &&
           Array.isArray(e.risk_flags) &&
-          (e.risk_flags as string[]).includes('self_protection_bypass')
+          (e.risk_flags as string[]).includes('hook_env_reinjected')
       );
       expect(match).toBeDefined();
+      // env_stripped 已被 hook 补回 NODE_OPTIONS，覆盖没丢，不该再冒充
+      // 高危绕过（此前宿主自己的探活命令因此刷出 200+ 条假告警）。
+      expect(
+        events.some(
+          (e) =>
+            e.bypass_reason === 'env_stripped' &&
+            Array.isArray(e.risk_flags) &&
+            (e.risk_flags as string[]).includes('self_protection_bypass')
+        )
+      ).toBe(false);
     });
 
     it('does not inject when the sentinel is set, and flags explicit_skip', async () => {
@@ -644,7 +776,7 @@ describe('Node.js runtime hook', () => {
       expect(process.env[hook.HOOK_MARKER_ENV as string]).toBe('1');
     });
 
-    it('execFile also propagates the hook and flags env_stripped (same bypass surface as spawn)', async () => {
+    it('execFile also propagates the hook and records env_stripped as hook_env_reinjected', async () => {
       const { execFile } = require('child_process');
       const childEnv: Record<string, string> = { ...process.env, OPENCLAW_MONITOR_LOG_PATH: logFile } as Record<string, string>;
       delete childEnv.NODE_OPTIONS;
@@ -669,7 +801,7 @@ describe('Node.js runtime hook', () => {
           e.api === 'child_process.execFile' &&
           e.bypass_reason === 'env_stripped' &&
           Array.isArray(e.risk_flags) &&
-          (e.risk_flags as string[]).includes('self_protection_bypass')
+          (e.risk_flags as string[]).includes('hook_env_reinjected')
       );
       expect(match).toBeDefined();
     });

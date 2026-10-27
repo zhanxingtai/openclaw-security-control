@@ -50,7 +50,7 @@ describe('runtime hook 探测失败告警', () => {
     await store.emitRuntimeHookProbeWarningIfNeeded();
 
     const events = readEvents(ndjsonPath);
-    const warn = events.find((e) => e.event_type === 'runtime_hook_unloaded') as
+    const warn = events.find((e) => e.event_type === 'x_openclaw_runtime_hook_unloaded') as
       | (SecurityEvent & { severity?: string; risk_flags?: string[] })
       | undefined;
     expect(warn).toBeDefined();
@@ -66,7 +66,7 @@ describe('runtime hook 探测失败告警', () => {
     store.setRuntimeHookProbeState(false, false);
     await store.emitRuntimeHookProbeWarningIfNeeded();
     const events = readEvents(ndjsonPath);
-    expect(events.some((e) => e.event_type === 'runtime_hook_unloaded')).toBe(false);
+    expect(events.some((e) => e.event_type === 'x_openclaw_runtime_hook_unloaded')).toBe(false);
 
     const status = store.getStatus();
     expect(status.runtimeHookLoaded).toBe(false);
@@ -77,7 +77,7 @@ describe('runtime hook 探测失败告警', () => {
     store.setRuntimeHookProbeState(true, true);
     await store.emitRuntimeHookProbeWarningIfNeeded();
     const events = readEvents(ndjsonPath);
-    expect(events.some((e) => e.event_type === 'runtime_hook_unloaded')).toBe(false);
+    expect(events.some((e) => e.event_type === 'x_openclaw_runtime_hook_unloaded')).toBe(false);
     expect(store.getStatus().runtimeHookLoaded).toBe(true);
   });
 
@@ -88,6 +88,6 @@ describe('runtime hook 探测失败告警', () => {
     // 未上报时回退到生效配置里的开关值
     expect(status.runtimeHooksEnabled).toBe(false);
     const events = readEvents(ndjsonPath);
-    expect(events.some((e) => e.event_type === 'runtime_hook_unloaded')).toBe(false);
+    expect(events.some((e) => e.event_type === 'x_openclaw_runtime_hook_unloaded')).toBe(false);
   });
 });

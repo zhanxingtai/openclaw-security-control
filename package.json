@@ -1,6 +1,6 @@
 {
   "name": "@zhanxing/sst-security-control-openclaw",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "面向 OpenClaw 的开源运行安全插件，提供本地风险检测、安全事件记录及高风险操作策略控制。",
   "type": "module",
   "main": "index.ts",
@@ -9,11 +9,20 @@
     "extensions": [
       "./index.ts"
     ],
+    "plugin": {
+      "id": "sst-security-control-openclaw",
+      "label": "SST Security Control 安全监控插件"
+    },
     "compat": {
       "pluginApi": ">=2026.9.4"
     },
     "build": {
       "openclawVersion": "2026.9.4"
+    },
+    "install": {
+      "clawhubSpec": "clawhub:@zhanxing/sst-security-control-openclaw",
+      "defaultChoice": "clawhub",
+      "minHostVersion": ">=2026.9.4"
     }
   },
   "files": [
@@ -21,6 +30,7 @@
     "src",
     "hooks",
     "policies",
+    "schemas",
     "dist",
     "openclaw.plugin.json",
     "README.md",
@@ -31,6 +41,7 @@
     "build:ci": "node scripts/build.js",
     "build:prod": "node scripts/build.js --no-test",
     "pack": "node scripts/build.js --no-test",
+    "gen:schema": "node scripts/gen-event-schema.mjs",
     "dev": "tsc --watch",
     "lint": "eslint src --ext .ts",
     "test": "vitest run",

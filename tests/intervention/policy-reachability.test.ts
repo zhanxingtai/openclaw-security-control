@@ -50,6 +50,8 @@ const RUNTIME_RISK_FLAGS: readonly string[] = [
   'db_dump',
   'download_execute',
   'file_deletion',
+  // ：env 被剥离但 hook 已补回去时打标（不是绕过，只是留痕）。
+  'hook_env_reinjected',
   'mass_deletion',
   'network_tool',
   'pipe_to_shell',
@@ -441,9 +443,9 @@ describe('默认配置下的 hook-only 规则', () => {
     const total = rules.length;
     const dormant = hookOnlyRuleIds.length;
     const docs: Array<{ file: string; re: RegExp; dormantGroup: number; totalGroup: number }> = [
-      // "9 of the 91 bundled SPL rules go dormant" → [失活数, 总数]
+      // "9 of the 92 bundled SPL rules go dormant" → [失活数, 总数]
       { file: 'README.md', re: /(\d+) of the (\d+) bundled SPL rules/g, dormantGroup: 1, totalGroup: 2 },
-      // "随包的 91 条 SPL 规则里有 9 条会休眠" → 总数在前、失活数在后
+      // "随包的 92 条 SPL 规则里有 9 条会休眠" → 总数在前、失活数在后
       { file: 'README.zh.md', re: /(\d+) 条 SPL 规则里有 (\d+) 条会休眠/g, dormantGroup: 2, totalGroup: 1 },
       // 面板帮助文案与 README 都不刻意写这个数字（2026-10-23 精简：读者反馈
       // 长解释反而看不懂），因此**不要求**任何一处必须出现它 —— 只有真写了

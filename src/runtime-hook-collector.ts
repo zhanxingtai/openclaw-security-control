@@ -10,6 +10,7 @@ import type {
 } from "./types.js";
 import { generateUUID } from './uuid.js';
 import { pidBindingStore } from './utils/pid-binding-store.js';
+import { hasAgentAttribution, matchHostInternalProbe } from './host-internal-probe.js';
 
 // Keep an inline minimal interface so the test mock and the real
 // implementation share the same surface.
@@ -29,6 +30,9 @@ interface ParsedRuntimeEvent {
   id?: string;
   // Legacy timestamp field accepted for backward compatibility.
   timestamp?: string;
+  // Source timestamp: hook writes an ISO string for command events, epoch
+  // milliseconds for network events. Both are accepted.
+  ts?: number | string;
   runtime?: string;
   api?: string;
   command_line?: string;
@@ -40,6 +44,14 @@ interface ParsedRuntimeEvent {
   shell?: string;
   cwd?: string;
   pid?: number;
+  /** 发起方 pid（谁调用了 spawn）。 */
+  spawner_pid?: number;
+  /** 被拉起的子进程 pid。 */
+  child_pid?: number;
+  /** 子进程退出码（process_exit）。 */
+  exit_code?: number | null;
+  /** 子进程被信号终止时的信号名（process_exit）。 */
+  exit_signal?: string | null;
   ppid?: number;
   target_pid?: number;
   caller?: SecurityEvent['caller'];
@@ -49,6 +61,8 @@ interface ParsedRuntimeEvent {
   tool_call_id?: string;
   tool_name?: string;
   risk_flags?: string[];
+  /** hook 传播被绕过的具体原因：'explicit_skip' | 'env_stripped'。 */
+  bypass_reason?: string;
   blocked?: boolean;
   block_reason?: string;
   block_code?: string;
@@ -56,7 +70,6 @@ interface ParsedRuntimeEvent {
   event_type?: string;
   event_id?: string;
   comm?: string;
-  ts?: number;
   host_id?: string;
   container_id?: string;
   pod_name?: string;
@@ -114,6 +127,12 @@ export class RuntimeHookCollector implements ILayerCollector {
     parseErrors: 0,
     /** 因队列积压跳过评估的事件数。 */
     eventsEvaluationSkipped: 0,
+    /** 读侧幂等去重丢弃的重复事件数。 */
+    eventsDeduplicated: 0,
+    /** 被判定为宿主内部只读探针而排除的事件数。 */
+    eventsExcludedHostProbes: 0,
+    /** 各探针类别的排除计数（探针名 → 条数）。 */
+    hostInternalProbes: {} as Record<string, number>,
   };
   private hooks: RuntimeHookEventHooks;
   // 事件评估→落盘串行队列：chain 规则依赖事件顺序（先脱库后外传），
@@ -123,6 +142,48 @@ export class RuntimeHookCollector implements ILayerCollector {
   private dispatchBacklog = 0;
   /** 积压告警每次积压只打一次；排空后重新武装。 */
   private backlogWarned = false;
+
+  /**
+   * 读侧幂等：已落盘事件的身份指纹（键 → 最近一次出现的毫秒时间戳）。
+   *
+   * runtime hook 侧自带 300ms 的进程内去重窗口（hooks/runtime.js），但那层
+   * 只在**写侧**、只在**单个进程内**生效。collector 重启后回放 sidecar、
+   * sidecar 被重复读取、或同一条命令被多个进程各写一次时，规范落盘里仍会
+   * 出现成百上千条逐字节相同的事件：实测 8044 条 process_start 只对应 861
+   * 个不同进程，85% 的事件是重复，重复事件把评估队列顶到上限，44% 的事件
+   * 因此丢失了 intervention 决策。
+   *
+   * 这里按"源端事件身份"在**读侧**再做一层幂等：同一条源端事件只落盘一次。
+   * 两把钥匙：
+   *   - 源端 id（hook 的 `id`/`event_id`）：唯一标识，回放场景精确命中；
+   *   - 命令窗口指纹（命令行 + pid + ppid + 调用点）：短窗口内同一进程从
+   *     同一调用点发出的同一条命令视为重复，与 hook 侧的窗口语义对齐，覆
+   *     盖"hook 逐条写、id 各不相同"的场景。
+   */
+  private seenEventIds = new Map<string, number>();
+  private seenCommandWindows = new Map<string, number>();
+  /** 源端 id 指纹保留时长（毫秒）。 */
+  private static readonly EVENT_ID_TTL_MS = 10 * 60 * 1000;
+  /** 命令窗口指纹保留时长（毫秒），与 hook 侧 DEDUP_WINDOW_MS 对齐。 */
+  private static readonly COMMAND_WINDOW_TTL_MS = 300;
+  /** 指纹表上限，保证内存有界。 */
+  private static readonly MAX_FINGERPRINTS = 50_000;
+
+  /**
+   * 宿主自有内部 worker 的命令行标记（1.1.0 起）。
+   *
+   * 宿主网关在空闲期周期性拉起自己的只读子进程。实测一份 105 分钟的
+   * 采样里，43 条 process_start 有 26 条属于这一类（占文件体积 17%），
+   * 其中 20 条命令行逐字节相同、只差 pid 与时间戳。
+   *
+   * 这里只列宿主派生子进程时带的**语义标记**，不列宿主内部模块路径：
+   * 标记是宿主与自己的 worker 之间的契约，比 `dist/…/xxx.worker.js`
+   * 这类内部实现路径稳定得多。
+   */
+  private static readonly HOST_INTERNAL_COMMAND_MARKERS = [
+    '--openclaw-sqlite-readonly-child',
+    '--openclaw-database-verify-child',
+  ];
 
   constructor(
     collector: EventCollectorLike,
@@ -451,6 +512,68 @@ export class RuntimeHookCollector implements ILayerCollector {
     }
   }
 
+  /**
+   * 判断这条源端事件是否已经落盘过。
+   *
+   * 指纹取不到（源端既没有 id 也没有时间戳）时返回 false——宁可重复也不
+   * 误杀，审计事件不允许被静默丢弃。
+   */
+  private isDuplicateEvent(parsed: ParsedRuntimeEvent): boolean {
+    const sourceId = parsed.event_id || parsed.id;
+    if (sourceId) {
+      const key = `id:${sourceId}`;
+      if (this.seenWithin(this.seenEventIds, key, RuntimeHookCollector.EVENT_ID_TTL_MS)) {
+        return true;
+      }
+    }
+
+    if (!this.isCommandEvent(parsed) && !this.isProcessExitEvent(parsed)) {
+      return false;
+    }
+
+    // 命令窗口指纹：同一进程在短窗口内发出的同一条命令。键里带调用点，
+    // 与 hook 侧 isRecentDuplicate 的语义保持一致——同一个调用点上的
+    // 同一条命令是重复，换个调用点则是另一次动作，不能混为一谈。
+    const cmd = parsed.command_line || parsed.command_line_raw || '';
+    if (!cmd) return false;
+    const caller = parsed.caller;
+    const callerKey = caller
+      ? `${caller.file || ''}:${caller.line || ''}:${caller.column || ''}`
+      : '';
+    // 退出事件按子进程 pid 区分：同一条命令可能被连续 spawn 多次，每个
+    // 子进程都有自己的退出事件，不能互相去重。
+    const scope = this.isProcessExitEvent(parsed) ? `|${parsed.child_pid ?? ''}` : '';
+    const windowKey = `w:${parsed.pid ?? ''}|${parsed.ppid ?? ''}|${callerKey}|${cmd}${scope}`;
+    if (this.seenWithin(this.seenCommandWindows, windowKey, RuntimeHookCollector.COMMAND_WINDOW_TTL_MS)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 指纹命中即视为重复；未命中则登记并返回 false。
+   * 过期条目按 TTL 惰性淘汰，表满时先清过期项再丢最早的一条。
+   */
+  private seenWithin(store: Map<string, number>, key: string, ttlMs: number): boolean {
+    const now = Date.now();
+    const seenAt = store.get(key);
+    if (seenAt !== undefined && now - seenAt < ttlMs) {
+      return true;
+    }
+    store.set(key, now);
+    if (store.size > RuntimeHookCollector.MAX_FINGERPRINTS) {
+      for (const [k, ts] of store) {
+        if (now - ts >= ttlMs) store.delete(k);
+      }
+      while (store.size > RuntimeHookCollector.MAX_FINGERPRINTS) {
+        const oldest = store.keys().next();
+        if (oldest.done) break;
+        store.delete(oldest.value);
+      }
+    }
+    return false;
+  }
+
   private handleLine(line: string): void {
     if (!line.trim()) return;
 
@@ -463,15 +586,21 @@ export class RuntimeHookCollector implements ILayerCollector {
       return;
     }
 
-    if (parsed.event_type !== 'network_http' && !this.isCommandEvent(parsed)) {
+    if (
+      parsed.event_type !== 'network_http' &&
+      !this.isCommandEvent(parsed) &&
+      !this.isProcessExitEvent(parsed)
+    ) {
       // Ignore unrelated runtime log lines.
       return;
     }
 
     // Skip periodic/internal noise matched by configured regex patterns.
-    if (this.isCommandEvent(parsed)) {
+    // process_exit 也带命令行：它的起点事件被排除时，退出事件同样排除，
+    // 否则事件流里会留下一串没有起点的孤儿退出。
+    if (this.isCommandEvent(parsed) || this.isProcessExitEvent(parsed)) {
       const cmd = parsed.command_line || parsed.command_line_raw || '';
-      if (this.shouldExcludeCommand(cmd)) {
+      if (this.shouldExcludeCommand(cmd, parsed)) {
         return;
       }
     }
@@ -484,6 +613,12 @@ export class RuntimeHookCollector implements ILayerCollector {
     }
 
     this.stats.eventsReceived += 1;
+
+    // 读侧幂等：同一条源端事件只落盘一次。
+    if (this.isDuplicateEvent(parsed)) {
+      this.stats.eventsDeduplicated += 1;
+      return;
+    }
 
     const event = this.normalizeEvent(parsed);
     this.dispatchEvent(event);
@@ -575,6 +710,20 @@ export class RuntimeHookCollector implements ILayerCollector {
   }
 
   /**
+   * 子进程退出事件（runtime hook 侧补的进程生命周期尾巴）。
+   *
+   * 此前运行时层只记录 process_start：审计链上只有"发起了"，没有"跑完了、
+   * 结果如何"（采样里 process_exit 为 0 条）。
+   */
+  private isProcessExitEvent(parsed: ParsedRuntimeEvent): boolean {
+    return (
+      parsed.event_type === 'process_exit' ||
+      parsed.type === 'application.process_exit' ||
+      parsed.type === 'process_exit'
+    );
+  }
+
+  /**
    * Determine whether a network_http event should be dropped because it matches
    * a user-supplied regex pattern. This prevents the monitor from
    * recursively capturing its own traffic.
@@ -596,17 +745,109 @@ export class RuntimeHookCollector implements ILayerCollector {
     });
   }
 
+  /**
+   * 空串与 null 在事件流里必须统一：hook 侧 `ctx.xxx || ''` 会把"没有"
+   * 写成空串，collector 侧原样透传后，下游看到的是 `""` / `null` / 字段
+   * 缺失三种语义。统一成 null，缺失的键保持缺失。
+   */
+  private normalizeOptionalString(value: string | undefined): string | null {
+    if (value === undefined || value === null) return null;
+    return value.length > 0 ? value : null;
+  }
+
+  /**
+   * 解析源端时间戳。hook 写的是 ISO 串（`ts`），网络事件写的是 epoch 毫秒
+   * （`ts`），老版本命令事件写的是 ISO 串（`timestamp`）。全部认。
+   */
+  private resolveSourceTimestamp(parsed: ParsedRuntimeEvent): number {
+    const raw = parsed.ts ?? parsed.timestamp;
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return raw;
+    }
+    if (typeof raw === 'string' && raw.length > 0) {
+      const parsedMs = Date.parse(raw);
+      if (Number.isFinite(parsedMs)) return parsedMs;
+    }
+    return Date.now();
+  }
+
   private normalizeEvent(parsed: ParsedRuntimeEvent): SecurityEvent {
     if (parsed.event_type === 'network_http' || parsed.type === 'network.http_request') {
       return this.normalizeNetworkEvent(parsed);
     }
+    if (this.isProcessExitEvent(parsed)) {
+      return this.normalizeProcessExitEvent(parsed);
+    }
     return this.normalizeCommandEvent(parsed);
   }
 
-  private normalizeNetworkEvent(parsed: ParsedRuntimeEvent): SecurityEvent {
-    const ts = parsed.ts || Date.now();
+  /**
+   * 子进程退出事件。
+   *
+   * 字段与 process_start 对齐（同一套归属信息：会话 / run / agent / 工具
+   * 调用），另加退出码与信号、以及被终止的子进程 pid。`pid` 仍然是发起方
+   * （兼容旧语义），`spawner_pid` 显式表达同一件事，`child_pid` 指向真正
+   * 跑起来又跑完的那个进程。
+   */
+  private normalizeProcessExitEvent(parsed: ParsedRuntimeEvent): SecurityEvent {
+    const ts = this.resolveSourceTimestamp(parsed);
     const comm = parsed.comm || 'openclaw';
-    const eventId = parsed.event_id || generateUUID();
+    const eventId = parsed.event_id || parsed.id || generateUUID();
+    const exe = parsed.executable;
+    const processName =
+      parsed.process_name ||
+      (exe ? exe.split(/[\\/]/).pop() : undefined) ||
+      (parsed.command_line ? parsed.command_line.split(/\s+/, 1)[0] : undefined);
+
+    return {
+      comm,
+      event_id: eventId,
+      event_type: 'process_exit',
+      layer: 'system',
+      ts,
+      schema_version: 1,
+      // pid 保持"发起方"语义（与 process_start 一致），spawner_pid 显式
+      // 表达同一件事，child_pid 才是被终止的子进程。
+      pid: parsed.pid ?? process.pid,
+      spawner_pid: parsed.spawner_pid ?? parsed.pid ?? process.pid,
+      child_pid: parsed.child_pid,
+      exit_code: typeof parsed.exit_code === 'number' ? parsed.exit_code : undefined,
+      exit_signal: parsed.exit_signal ?? undefined,
+      session_id: this.normalizeOptionalString(parsed.session_id),
+      run_id: this.normalizeOptionalString(parsed.run_id),
+      task_id: null,
+      turn_id: null,
+      agent_id: this.normalizeOptionalString(parsed.agent_id),
+      host_id: this.environment.hostId,
+      container_id: this.environment.containerId,
+      pod_name: this.environment.podName,
+      namespace: this.environment.namespace,
+      source: 'openclaw.runtime-hooks.v1',
+      collection_method: 'runtime',
+      collector: {
+        hook_name: 'process_exit',
+        middleware_name: 'sst-security-control-openclaw',
+        collector_name: this.name,
+      },
+      runtime: parsed.runtime,
+      api: parsed.api,
+      cmdline: parsed.command_line,
+      exe,
+      process_name: processName,
+      shell_involved: parsed.shell_involved,
+      shell: parsed.shell,
+      cwd: parsed.cwd,
+      ppid: parsed.ppid,
+      caller: parsed.caller,
+      tool_call_id: this.normalizeOptionalString(parsed.tool_call_id),
+      tool_name: this.normalizeOptionalString(parsed.tool_name),
+    };
+  }
+
+  private normalizeNetworkEvent(parsed: ParsedRuntimeEvent): SecurityEvent {
+    const ts = this.resolveSourceTimestamp(parsed);
+    const comm = parsed.comm || 'openclaw';
+    const eventId = parsed.event_id || parsed.id || generateUUID();
     const blocked = parsed.blocked === true;
     // The hook's `source` is a string after the spec migration. Older payloads
     // may still send an object — pull hook_name from it for the collector block.
@@ -617,6 +858,17 @@ export class RuntimeHookCollector implements ILayerCollector {
 
     const localIp = parsed.local_ip ?? parsed.src_ip;
     const localPort = parsed.local_port ?? parsed.src_port;
+    // 载荷截断：1.1.0 之前 content 由 runtime hook 原样透传，不受
+    // application.maxContentLength 约束（实测落盘 4099 字符，而配置
+    // 声明 2000），且 content_length 照抄 hook 值，无法区分"完整响应"
+    // 与"被截断的响应"。现在 content 按配置截断，content_length 恒为
+    // 原始长度，截断与否由 content_truncated 表达。
+    const maxContentLen = this.config.maxContentLength ?? 2000;
+    const rawContent = typeof parsed.content === 'string' ? parsed.content : undefined;
+    const contentTruncated = rawContent !== undefined && rawContent.length > maxContentLen;
+    const content = rawContent !== undefined
+      ? (contentTruncated ? rawContent.slice(0, maxContentLen) : rawContent)
+      : undefined;
     const remoteIp = parsed.remote_ip ?? parsed.dst_ip;
     const remotePort = parsed.remote_port ?? parsed.dst_port;
 
@@ -626,13 +878,13 @@ export class RuntimeHookCollector implements ILayerCollector {
       event_type: parsed.event_type || 'network_http',
       layer: 'system',
       ts,
-      schema_version: '1.0.0',
+      schema_version: 1,
       pid: parsed.pid ?? process.pid,
-      session_id: parsed.session_id ?? null,
-      run_id: parsed.run_id ?? null,
+      session_id: this.normalizeOptionalString(parsed.session_id),
+      run_id: this.normalizeOptionalString(parsed.run_id),
       task_id: null,
       turn_id: null,
-      agent_id: parsed.agent_id ?? null,
+      agent_id: this.normalizeOptionalString(parsed.agent_id),
       host_id: parsed.host_id || this.environment.hostId,
       container_id: parsed.container_id || this.environment.containerId,
       pod_name: parsed.pod_name || this.environment.podName,
@@ -644,8 +896,9 @@ export class RuntimeHookCollector implements ILayerCollector {
         middleware_name: 'sst-security-control-openclaw',
         collector_name: this.name,
       },
-      content: parsed.content,
-      content_length: parsed.content_length,
+      content,
+      content_length: rawContent?.length ?? parsed.content_length,
+      content_truncated: contentTruncated || undefined,
       service: parsed.service || 'http',
       direction: parsed.direction || 'send',
       latency_ms: parsed.latency_ms,
@@ -664,12 +917,18 @@ export class RuntimeHookCollector implements ILayerCollector {
       remote_port: remotePort,
       blocked,
       block_reason: parsed.block_reason,
-      tool_call_id: parsed.tool_call_id,
-      tool_name: parsed.tool_name,
+      tool_call_id: this.normalizeOptionalString(parsed.tool_call_id),
+      tool_name: this.normalizeOptionalString(parsed.tool_name),
     };
 
-    // Attach response body if it differs from the canonical content.
-    if (parsed.response_body && parsed.response_body !== parsed.body) {
+    // Attach response body only when it carries something the canonical
+    // content field does not already have — otherwise the same payload is
+    // written twice and the event stream doubles in size for no gain.
+    if (
+      parsed.response_body &&
+      parsed.response_body !== parsed.body &&
+      parsed.response_body !== parsed.content
+    ) {
       event.response_body = parsed.response_body;
     }
 
@@ -688,7 +947,10 @@ export class RuntimeHookCollector implements ILayerCollector {
   }
 
   private normalizeCommandEvent(parsed: ParsedRuntimeEvent): SecurityEvent {
-    const ts = parsed.timestamp ? new Date(parsed.timestamp).getTime() : Date.now();
+    // 源端时间戳优先：hook 写的是 `ts`（ISO 串），老版本写的是 `timestamp`。
+    // 两者都取不到才回落到本地时间——回落意味着时间戳不再代表"事件何时
+    // 发生"，审计回溯会失真，所以必须尽量保住源端值。
+    const ts = this.resolveSourceTimestamp(parsed);
     const comm = 'openclaw';
     const blocked = parsed.blocked === true;
     // process_name (spec) is prefered over deriving from cmdline; the runtime
@@ -701,19 +963,26 @@ export class RuntimeHookCollector implements ILayerCollector {
 
     const event: SecurityEvent = {
       comm,
-      event_id: generateUUID(),
+      // 源端 id 优先：它是这条命令的稳定身份，回放/重传时据此幂等去重，
+      // 同时让审计链能追溯到 runtime hook 写出的那一条。
+      event_id: parsed.event_id || parsed.id || generateUUID(),
       // Emitted as process_start per the event data standard; legacy
       // command_execution inputs are normalized here as well.
       event_type: 'process_start',
       layer: 'system',
       ts,
-      schema_version: '1.0.0',
+      schema_version: 1,
       pid: parsed.pid ?? process.pid,
-      session_id: parsed.session_id ?? null,
-      run_id: parsed.run_id ?? null,
+      // 发起方 pid（谁调用了 spawn）。子进程 pid 只有 spawn 返回后才知道，
+      // hook 侧会把它回填到 child_pid——此前它从来没被采集过，审计链上
+      // 只有"谁发起的"，没有"哪个进程真的跑起来了"。
+      spawner_pid: parsed.spawner_pid ?? parsed.pid ?? process.pid,
+      child_pid: parsed.child_pid,
+      session_id: this.normalizeOptionalString(parsed.session_id),
+      run_id: this.normalizeOptionalString(parsed.run_id),
       task_id: null,
       turn_id: null,
-      agent_id: parsed.agent_id ?? null,
+      agent_id: this.normalizeOptionalString(parsed.agent_id),
       host_id: this.environment.hostId,
       container_id: this.environment.containerId,
       pod_name: this.environment.podName,
@@ -737,10 +1006,14 @@ export class RuntimeHookCollector implements ILayerCollector {
       target_pid: parsed.target_pid,
       caller: parsed.caller,
       risk_flags: parsed.risk_flags,
+      // 绕过/补注入的具体原因。hook 侧区分 'explicit_skip'（子进程真的
+      // 裸跑）与 'env_stripped'（hook 已补回 NODE_OPTIONS，覆盖没丢），
+      // 不带原因的话下游只能看到一个笼统的 flag。
+      bypass_reason: parsed.bypass_reason,
       blocked,
       block_reason: parsed.block_reason,
-      tool_call_id: parsed.tool_call_id,
-      tool_name: parsed.tool_name,
+      tool_call_id: this.normalizeOptionalString(parsed.tool_call_id),
+      tool_name: this.normalizeOptionalString(parsed.tool_name),
     };
 
     // Bind 派生子进程 PID → 父 agent session, 供后续 network/file event lookup。
@@ -766,9 +1039,45 @@ export class RuntimeHookCollector implements ILayerCollector {
     return event;
   }
 
-  private shouldExcludeCommand(command: string): boolean {
+  private shouldExcludeCommand(command: string, parsed?: ParsedRuntimeEvent): boolean {
+    if (!command) {
+      return false;
+    }
+    // 内置规则：宿主自己派生的内部 worker（默认开启）。
+    //
+    // 判据刻意只匹配宿主派生子进程时带的**标记参数**，不匹配宿主内部的
+    // 模块路径：宿主改版换掉 `dist/infra/xxx.worker.js` 这类文件名时，
+    // 内置规则会失配——表现是噪声回来，而不是误杀别的进程。失配方向是
+    // 安全的一侧（少采而不是多删）。
+    if (this.config.excludeHostInternalProcesses !== false) {
+      if (RuntimeHookCollector.HOST_INTERNAL_COMMAND_MARKERS.some((marker) =>
+        command.includes(marker)
+      )) {
+        return true;
+      }
+    }
+    // 内置规则：宿主自身的只读维护探针（默认开启）。
+    //
+    // 两道闸门同时成立才排除：**调用方**（事件没有任何 agent 归属，说明
+    // 它不是某个 agent 动作的产物）+ **命令模式**（命令行逐字命中一条
+    // 已知的只读探针形态）。详见 src/host-internal-probe.ts。
+    //
+    // 排除发生在策略评估之前，所以这些事件不会再触发
+    // `warn-hook-bypass-attempt` 之类的规则——宿主自己的探活进程本来就不
+    // 该被 hook 覆盖，被判成"自保护被绕过"是误报。
+    if (this.config.excludeHostInternalProbeCommands !== false) {
+      if (parsed && !hasAgentAttribution(parsed)) {
+        const probe = matchHostInternalProbe(command);
+        if (probe) {
+          this.stats.eventsExcludedHostProbes += 1;
+          this.stats.hostInternalProbes[probe] =
+            (this.stats.hostInternalProbes[probe] || 0) + 1;
+          return true;
+        }
+      }
+    }
     const patterns = this.config.excludeCommandLines || [];
-    if (patterns.length === 0 || !command) {
+    if (patterns.length === 0) {
       return false;
     }
     return patterns.some((pattern) => {

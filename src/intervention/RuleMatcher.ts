@@ -122,6 +122,7 @@ export class RuleMatcher {
     const map = match.paramsRegex;
     if (!map) return true;
     const compiledMap = rx.paramsRegex;
+    const exceptMap = rx.paramsRegexExcept;
     const params = ctx.params || {};
 
     // 热路径用 for-in 遍历，避免每次评估分配 Object.entries。
@@ -131,6 +132,7 @@ export class RuleMatcher {
       // 这里做防御性跳过，保持"跳过该规则"语义。
       const compiled = compiledMap?.[key];
       if (!compiled) return false;
+      const except = exceptMap?.[key];
       // 递归提取 key 指向值（含嵌套对象/数组）中的全部字符串逐值
       // 匹配，任一候选命中即算该 key 命中。不再 JSON.stringify——为字符串
       // 设计的锚点正则此前无法命中藏进嵌套结构的命令，还会因引号/转义
@@ -138,14 +140,14 @@ export class RuleMatcher {
       const value = this.getNestedValue(params, key);
       if (typeof value === 'string') {
         // 热路径：字符串值先直测原始值，未命中才归一化（见 testStringWithCandidates）。
-        if (!this.testStringWithCandidates(compiled, value)) return false;
+        if (!this.testStringWithCandidatesEx(compiled, except, value)) return false;
         continue;
       }
       const strings = this.collectMatchStrings(value);
       if (strings.length === 0) return false;
       let matched = false;
       for (let s = 0; s < strings.length && !matched; s++) {
-        matched = this.testStringWithCandidates(compiled, strings[s]);
+        matched = this.testStringWithCandidatesEx(compiled, except, strings[s]);
       }
       if (!matched) return false;
     }
@@ -351,14 +353,50 @@ export class RuleMatcher {
    * 未命中且值为 path 形态时再测归一化候选。
    */
   private static testStringWithCandidates(compiled: RegExp[], s: string): boolean {
-    for (let i = 0; i < compiled.length; i++) {
-      if (compiled[i].test(s)) return true;
-    }
+    return this.testStringWithCandidatesEx(compiled, undefined, s);
+  }
+
+  /**
+   * 逐条 pattern 判定一个字符串是否命中该 key。
+   *
+   * `except` 是条目级专属豁免（与 paramsRegex 下标一一对应）：某条 pattern
+   * 命中但它自己的豁免也命中同一段文本时，这条 pattern 视为未命中——同 key
+   * 的其它 pattern 不受影响。
+   *
+   * 豁免与 pattern 必须在同一段文本上比较：pattern 命中原串而豁免只命中
+   * 归一化候选（反之亦然）都算"该文本未被豁免"，避免归一化路径把豁免绕开
+   * 或凭空生效。
+   */
+  private static testStringWithCandidatesEx(
+    compiled: RegExp[],
+    except: RegExp[][] | undefined,
+    s: string
+  ): boolean {
+    if (this.testTextAgainstPatterns(compiled, except, s)) return true;
     const candidates = this.pathCandidates(s);
     for (let c = 0; c < candidates.length; c++) {
-      for (let i = 0; i < compiled.length; i++) {
-        if (compiled[i].test(candidates[c])) return true;
+      if (this.testTextAgainstPatterns(compiled, except, candidates[c])) return true;
+    }
+    return false;
+  }
+
+  /** 同一段文本上：任一 pattern 命中且未被本条专属豁免命中 → 命中。 */
+  private static testTextAgainstPatterns(
+    compiled: RegExp[],
+    except: RegExp[][] | undefined,
+    text: string
+  ): boolean {
+    for (let i = 0; i < compiled.length; i++) {
+      if (!compiled[i].test(text)) continue;
+      const own = except?.[i];
+      if (own && own.length > 0) {
+        let exempted = false;
+        for (let e = 0; e < own.length; e++) {
+          if (own[e].test(text)) { exempted = true; break; }
+        }
+        if (exempted) continue;
       }
+      return true;
     }
     return false;
   }

@@ -167,7 +167,20 @@ describe("NODE_OPTIONS 预加载数据目录下的 hook", () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toBe('{"worker":"sqlite-readonly","rows":3}');
     expect(() => JSON.parse(r.stdout)).not.toThrow();
-    // 诊断信息确实产生了，只是去了 stderr —— 这才是"挪走"而不是"静音"。
+    // 默认静默：mounter 的统计行只是诊断信息，而 NODE_OPTIONS 扩散到宿主里
+    // 每一个 node 进程，一行成功日志会在容器里重复若干遍（安装输出噪音）。
+    expect(r.stderr).not.toContain("hooks mounter:");
+  });
+
+  it("调试开关打开时诊断信息走 stderr，仍不碰 stdout", async () => {
+    // 诊断信息不是被删掉了，是被收进开关里：打开开关后它必须出现在 stderr
+    // （而不是 stdout）——否则又回到 2026-10-23 那个 SQLite worker 事故。
+    const worker = `process.stdout.write(JSON.stringify({ worker: "sqlite-readonly", rows: 3 }))`;
+    const r = await spawnNodeWithPreload(path.join(preloadDir, "hook-mounter.js"), worker, {
+      OPENCLAW_HOOK_MOUNT_DEBUG: "1",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('{"worker":"sqlite-readonly","rows":3}');
     expect(r.stderr).toContain("hooks mounter: loaded=2");
   });
 

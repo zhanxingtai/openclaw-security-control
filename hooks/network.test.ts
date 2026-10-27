@@ -724,6 +724,9 @@ describe('Node.js network hook', () => {
         OPENCLAW_MONITOR_LOG_PATH: testLogFile,
         OPENCLAW_NETWORK_HOOK_STARTUP_GRACE_MS: '0',
         OPENCLAW_NETWORK_HOOK_ENABLED: toggleValue,
+        // 丢包计数是 DEBUG 才输出的诊断行（默认静默，见 hooks/hook-log-noise.test.ts），
+        // 而"事件被丢弃"这件事唯一的证据就是这行计数 —— 所以取证时把开关打开。
+        OPENCLAW_HOOK_DEBUG: '1',
       };
       const script = `
         const http = require('http');

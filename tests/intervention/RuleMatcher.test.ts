@@ -412,6 +412,94 @@ describe('RuleMatcher', () => {
     expect(RuleMatcher.match(blocked, rule).matched).toBe(true);
   });
 
+  // 条目级专属豁免（paramsRegex[*][i].except）：豁免只作用于它所属的那条
+  // pattern，同 key 的其它 pattern 不受牵连——与规则级 paramsNotRegex 的
+  // "整条规则一票否决"语义不同。
+  it('per-pattern except only exempts its own pattern', () => {
+    const rule: PolicyRule = {
+      ...baseRule,
+      match: {
+        ...baseRule.match,
+        paramsRegex: {
+          command: [
+            'audit-file\\.jsonl',
+            { pattern: 'node_modules/', except: ['npm\\s+install'] },
+          ],
+        },
+      },
+    };
+    // 命中第一条（无豁免）→ 规则命中，哪怕第二条被豁免
+    const auditRead: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { command: 'npm install && cat audit-file.jsonl' },
+    };
+    expect(RuleMatcher.match(auditRead, rule).matched).toBe(true);
+
+    // 只命中被豁免的那条 → 规则不命中
+    const npmOnly: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { command: 'npm install node_modules/foo' },
+    };
+    expect(RuleMatcher.match(npmOnly, rule).matched).toBe(false);
+
+    // 豁免不命中时，被豁免的那条照常生效
+    const plainNodeModules: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { command: 'ls node_modules/foo' },
+    };
+    expect(RuleMatcher.match(plainNodeModules, rule).matched).toBe(true);
+  });
+
+  it('per-pattern except does not leak across keys', () => {
+    const rule: PolicyRule = {
+      ...baseRule,
+      match: {
+        ...baseRule.match,
+        paramsRegex: {
+          // command 维度的豁免写在第 2 条 pattern 上；path 维度只有 1 条。
+          // 若豁免按"扁平下标"错位到 path 的第 1 条，path 会被误豁免。
+          command: ['alpha', { pattern: 'beta', except: ['gamma'] }],
+          path: ['gamma'],
+        },
+      },
+    };
+    const ctx: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { command: 'alpha beta gamma', path: 'gamma' },
+    };
+    // command 维度靠 'alpha' 命中（第 2 条被豁免），path 维度独立命中 → 规则命中
+    expect(RuleMatcher.match(ctx, rule).matched).toBe(true);
+  });
+
+  it('per-pattern except survives path normalization consistently', () => {
+    const rule: PolicyRule = {
+      ...baseRule,
+      match: {
+        ...baseRule.match,
+        paramsRegex: {
+          path: [{ pattern: '^/etc/passwd$', except: ['^/etc/hostname$'] }],
+        },
+      },
+    };
+    const exempt: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { path: '/etc/hostname' },
+    };
+    expect(RuleMatcher.match(exempt, rule).matched).toBe(false);
+
+    const blocked: InterventionContext = {
+      actionType: 'agent_tool_call',
+      toolName: 'file_read',
+      params: { path: '/etc/passwd' },
+    };
+    expect(RuleMatcher.match(blocked, rule).matched).toBe(true);
+  });
+
   it('paramsNotRegex applies to any nested string value', () => {
     const rule: PolicyRule = {
       ...baseRule,

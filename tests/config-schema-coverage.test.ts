@@ -30,6 +30,9 @@ const JSON_ONLY_KEYS: Record<string, string> = {
   "application.runtimeHooks.blockedFlags": "拦截 flag 列表（策略数组，随策略文件演进）",
   "application.runtimeHooks.excludeCommandLines": "排除命令行模式（正则数组，误配漏采集）",
   "application.runtimeHooks.excludeNetworkUrls": "排除 URL 模式（正则数组，误配漏采集）",
+  "application.runtimeHooks.excludeHostInternalProcesses": "宿主内部 worker 排除开关（开关会静默少采子进程，JSON-only）",
+  "application.runtimeHooks.excludeHostInternalProbeCommands": "宿主只读探针排除开关（开关会静默少采宿主自身探活事件，JSON-only）",
+  "application.runtimeHooks.maxContentLength": "runtime 采集事件单字段长度上限（调优参数）",
   // ── network：整层未实现占位（network.enabled 不进 UI；其余子项亦为占位），
   //    网络拦截请走 Runtime Hooks ──
   "network.enabled": "网络层总开关未实现（占位，未来功能；手改 JSON 仍触发 dangerous 警告）",

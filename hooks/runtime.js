@@ -1,4 +1,4 @@
-// openclaw-hook: v1.0.1 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
+// openclaw-hook: v1.0.2 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
 // ⚠ 本文件只被 --require 加载，不要加 shebang —— `#!` 一旦不在文件最开头
 // 就是语法错，而这个文件正是 NODE_OPTIONS 的预加载目标，语法错 = 整个宿主
 // 进程在启动期退出。详见 hooks/hook-mounter.js 顶部同款说明。
@@ -28,7 +28,13 @@ const path = require('path');
 const os = require('os');
 
 const MODULE_NAME = 'openclaw-security-monitor-runtime-hook';
-const DEBUG = process.env.OPENCLAW_RUNTIME_HOOK_DEBUG === 'true' || process.env.OPENCLAW_RUNTIME_HOOK_DEBUG === '1';
+// 诊断开关。OPENCLAW_HOOK_DEBUG 是总开关（network.js / hook-mounter.js 也认），
+// 单 hook 的 OPENCLAW_RUNTIME_HOOK_DEBUG 保留，两者任一为真即开。
+const DEBUG =
+  process.env.OPENCLAW_RUNTIME_HOOK_DEBUG === 'true' ||
+  process.env.OPENCLAW_RUNTIME_HOOK_DEBUG === '1' ||
+  process.env.OPENCLAW_HOOK_DEBUG === 'true' ||
+  process.env.OPENCLAW_HOOK_DEBUG === '1';
 const MAX_COMMAND_LINE_LENGTH = parseInt(process.env.OPENCLAW_RUNTIME_HOOK_MAX_CMD_LENGTH || '4096', 10);
 const MAX_ARGUMENTS_TOTAL_LENGTH = parseInt(process.env.OPENCLAW_RUNTIME_HOOK_MAX_ARGS_LENGTH || '4096', 10);
 
@@ -162,9 +168,10 @@ const HOOK_ENV_PIN = '__OPENCLAW_SECURITY_HOOK_ENV__';
 // loss (the "strip NODE_OPTIONS to bypass the preload" bypass). We therefore
 // force-inject this hook into the child env (idempotent append, never
 // overwriting the caller's own NODE_OPTIONS) unless the caller explicitly
-// opts out via the __skipHookPropagation sentinel. Both the opt-out and the
-// strip-and-reinject paths raise a self_protection_bypass flag on the
-// emitted process event.
+// opts out via the __skipHookPropagation sentinel. The opt-out path raises a
+// self_protection_bypass flag on the emitted process event (the child really
+// runs unhooked); the strip-and-reinject path is repaired by the hook and is
+// recorded as hook_env_reinjected instead.
 //
 // HOOK_MARKER_ENV doubles as the marker the Python process monitor reads to
 // tell hooked node processes from unhooked ones (install() sets it on the
@@ -281,6 +288,56 @@ function getTimestamp() {
 }
 
 /**
+ * 同一进程里可能加载了不止一份 hook：插件被装了两份（扩展目录与
+ * npm/projects 各有一份）、或者旧实例没退场又起了一个新实例。
+ * 后加载的那份会跳过 install()（全局标记），可它的模块帧仍可能出现在
+ * 栈上——此时"调用方"会被算成 hook 自己，审计轨迹就成了监控在看自己。
+ *
+ * 把加载过的 hook 文件登记到全局表，任何一份都能认出其他份的帧。
+ */
+const HOOK_FILE_REGISTRY = '__OPENCLAW_SECURITY_HOOK_FILES__';
+
+/** hook 自己的内部函数名。用于"文件名相同 + 函数名是内部函数"这条兜底判据。 */
+const HOOK_INTERNAL_FUNCTIONS = new Set([
+  'getCallerLocation',
+  'buildEvent',
+  'emit',
+  'emitEvent',
+  'computeRiskFlags',
+  'shouldBlock',
+  'isRecentDuplicate',
+  'commandEventDedupKey',
+  'wrapSpawn',
+  'wrapExec',
+  'wrapExecFile',
+  'wrapFork',
+  'safeApplyHookPropagation',
+  'applyHookPropagation',
+  'detectShellInvocation',
+  'resolveShell',
+  'truncateCommandLine',
+  'getGlobalContext',
+]);
+
+function registerHookFile(filePath) {
+  try {
+    const registry = globalThis[HOOK_FILE_REGISTRY] || (globalThis[HOOK_FILE_REGISTRY] = new Set());
+    registry.add(String(filePath).replace(/\\/g, '/'));
+  } catch {
+    /* 冻结的 globalThis：登记不了也不影响主流程 */
+  }
+}
+
+function isRegisteredHookFile(normalized) {
+  try {
+    const registry = globalThis[HOOK_FILE_REGISTRY];
+    return registry instanceof Set && registry.has(normalized);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extract the first non-library caller from the current stack.
  * @returns {{function: string, file: string, line: number, column: number} | null}
  */
@@ -325,7 +382,7 @@ function getCallerLocation() {
     const matchWithName = line.match(/^\s+at\s+(.*?)\s+\((.*?):(\d+):(\d+)\)$/);
     if (matchWithName) {
       const [, fnName, filePath, lineNo, colNo] = matchWithName;
-      if (filePath && !filePath.includes('/hooks/node/runtime.js') && !filePath.startsWith('node:')) {
+      if (filePath && !isOwnHookFile(filePath, fnName) && !filePath.startsWith('node:')) {
         return {
           function: fnName || '<anonymous>',
           file: filePath,
@@ -337,7 +394,7 @@ function getCallerLocation() {
     const matchWithoutName = line.match(/^\s+at\s+(.*?):(\d+):(\d+)$/);
     if (matchWithoutName) {
       const [, filePath, lineNo, colNo] = matchWithoutName;
-      if (filePath && !filePath.includes('/hooks/node/runtime.js') && !filePath.startsWith('node:')) {
+      if (filePath && !isOwnHookFile(filePath) && !filePath.startsWith('node:')) {
         return {
           function: '<anonymous>',
           file: filePath,
@@ -351,10 +408,47 @@ function getCallerLocation() {
   return null;
 }
 
+/**
+ * Is this stack frame part of the hook itself?
+ *
+ * The old check compared against a hard-coded `/hooks/node/runtime.js` path
+ * left over from an earlier install layout. The file now ships as
+ * `hooks/runtime.js`, so the filter never matched and `caller` always
+ * resolved to the hook's own `emit` frame — the audit trail recorded the
+ * monitor looking at itself instead of the code that spawned the process.
+ * Compare against this module's own path instead.
+ *
+ * 但"本模块的路径"这一条在实测部署里也不够用：
+ *   - 插件被装了两份（扩展目录 + npm/projects 各一份）时，同一个进程会
+ *     先后加载两份 hook。后加载的那份会跳过 install()（全局标记），可它
+ *     的模块帧仍可能出现在栈上——此时"调用方"就被算成了 hook 自己。
+ *   - 部署布局把 hook 放在扩展根目录（不在 hooks/ 下），"文件名相同且在
+ *     hooks/ 下"这条兜底匹配不上。
+ *
+ * 所以再叠两层判据：全局登记表（任何一份 hook 都能认出其他份的帧），
+ * 以及"文件名相同 + 帧函数名是 hook 内部函数"这条强信号。
+ */
+function isOwnHookFile(filePath, fnName) {
+  if (!filePath) return false;
+  const normalized = filePath.replace(/\\/g, '/');
+  if (isRegisteredHookFile(normalized)) return true;
+  const own = __filename.replace(/\\/g, '/');
+  if (normalized === own) return true;
+  const ownBase = own.split('/').pop();
+  if (normalized.endsWith('/' + ownBase)) {
+    // 同一份 hook 换了个路径形式（符号链接、副本）：路径里有 hooks/ 就认。
+    if (normalized.includes('/hooks/')) return true;
+    // 否则用帧函数名兜底：应用代码几乎不可能既叫 runtime.js，函数名又
+    // 正好是 wrappedSpawn / emit 这类 hook 内部函数名。
+    if (fnName && HOOK_INTERNAL_FUNCTIONS.has(fnName)) return true;
+  }
+  return false;
+}
+
 function isInterestingCaller(filePath, fnName) {
   if (!filePath) return false;
   const normalized = filePath.replace(/\\/g, '/');
-  if (normalized.includes('/hooks/node/runtime.js')) return false;
+  if (isOwnHookFile(normalized, fnName)) return false;
   // Node.js core modules do not provide useful user-code location.
   if (normalized.startsWith('node:')) return false;
   if (normalized.includes('internal/')) return false;
@@ -389,12 +483,21 @@ function redactCommandLine(cmdline) {
 }
 
 function getGlobalContext() {
+  // Missing context must be null, not '': an empty string reads downstream as
+  // "present but empty", which is a third meaning next to "null" and
+  // "field absent".
+  const pick = (...values) => {
+    for (const value of values) {
+      if (value) return value;
+    }
+    return null;
+  };
   return {
-    session_id: global.__OPENCLAW_SESSION_ID__ || process.env.OPENCLAW_SESSION_ID || '',
-    run_id: global.__OPENCLAW_RUN_ID__ || process.env.OPENCLAW_RUN_ID || '',
-    agent_id: global.__OPENCLAW_AGENT_ID__ || process.env.OPENCLAW_AGENT_ID || '',
-    tool_call_id: global.__OPENCLAW_TOOL_CALL_ID__ || process.env.OPENCLAW_TOOL_CALL_ID || '',
-    tool_name: global.__OPENCLAW_TOOL_NAME__ || process.env.OPENCLAW_TOOL_NAME || '',
+    session_id: pick(global.__OPENCLAW_SESSION_ID__, process.env.OPENCLAW_SESSION_ID),
+    run_id: pick(global.__OPENCLAW_RUN_ID__, process.env.OPENCLAW_RUN_ID),
+    agent_id: pick(global.__OPENCLAW_AGENT_ID__, process.env.OPENCLAW_AGENT_ID),
+    tool_call_id: pick(global.__OPENCLAW_TOOL_CALL_ID__, process.env.OPENCLAW_TOOL_CALL_ID),
+    tool_name: pick(global.__OPENCLAW_TOOL_NAME__, process.env.OPENCLAW_TOOL_NAME),
   };
 }
 
@@ -453,11 +556,16 @@ function buildEvent(options) {
   const redacted = truncateCommandLine(redactCommandLine(raw));
 
   /** @type {CommandExecutionEvent} */
+  const eventId = generateId();
   const event = {
     // Renamed to process_start to match the platform data standard (进程类事件).
     event_type: 'process_start',
     type: 'application.process_start',
-    id: generateId(),
+    id: eventId,
+    // Same value under the standard field name: the collector uses it as the
+    // event identity, so a replayed sidecar line can be de-duplicated instead
+    // of landing in the audit trail once per replay.
+    event_id: eventId,
     ts: getTimestamp(),
     comm: options.executable ? path.basename(options.executable) : 'node',
     runtime: 'node',
@@ -476,6 +584,9 @@ function buildEvent(options) {
     shell_involved: options.shell_involved ?? false,
     cwd: process.cwd(),
     pid: process.pid,
+    // 发起方 pid：调用 spawn 的那个进程。子进程 pid 只有 spawn 返回后才知道，
+    // 由 attachChildLifecycle 回填到 child_pid。
+    spawner_pid: process.pid,
     ppid: process.ppid,
     caller: getCallerLocation(),
     risk_flags: computeRiskFlags(options, redacted),
@@ -519,9 +630,24 @@ function computeRiskFlags(options, redacted) {
   const flags = [];
   const cmd = redacted.toLowerCase();
 
-  // The caller explicitly skipped hook propagation or supplied a
-  // NODE_OPTIONS-free env (hook would have been dropped) — flag the bypass.
-  if (options.bypass_reason) flags.push('self_protection_bypass');
+  // hook 传播是否被绕过，要看子进程**最终有没有带上 hook**：
+  //
+  //   - 'explicit_skip'：调用方显式要求跳过传播 → 子进程真的会裸跑 →
+  //     覆盖真的丢了 → 这才是 self_protection_bypass。
+  //   - 'env_stripped'：调用方给了显式 env 但没带 NODE_OPTIONS → hook 已经
+  //     **把它补回去了**（子进程照样带 hook 跑），覆盖没丢。此前两种情形
+  //     一律打 self_protection_bypass，结果宿主自己的探活命令（execa 之类
+  //     总是显式传 env）每次都被判成"绕过自保护"，再命中
+  //     warn-hook-bypass-attempt 规则：实测 96 小时里 214 条假告警，
+  //     真正的绕过信号被淹没在噪声里。
+  //
+  // 补回去的情形改用 hook_env_reinjected 留痕——信号还在，但不再冒充
+  // 高危绕过。
+  if (options.bypass_reason === 'explicit_skip') {
+    flags.push('self_protection_bypass');
+  } else if (options.bypass_reason) {
+    flags.push('hook_env_reinjected');
+  }
 
   // 代码驱动 flag（非纯正则 cmdline 匹配）：保持代码判定，不进 pattern 表。
   if (options.shell_involved) flags.push('shell_involved');
@@ -557,7 +683,11 @@ const MAX_DEDUP_CACHE_SIZE = 100;
 
 function commandEventDedupKey(event) {
   const caller = event.caller || {};
-  return `${event.command_line}|${event.pid}|${event.ppid}|${caller.file || ''}:${caller.line || ''}:${caller.column || ''}`;
+  // process_exit 按子进程 pid 区分：同一条命令可能被连续 spawn 多次，每个
+  // 子进程都有自己的退出事件，不能互相去重。process_start 仍然只按
+  // 「命令 + 发起方 + 调用点」去重——同一个调用点上的同一条命令是重复。
+  const scope = event.event_type === 'process_exit' ? String(event.child_pid ?? '') : '';
+  return `${event.event_type}|${event.command_line}|${event.pid}|${event.ppid}|${scope}|${caller.file || ''}:${caller.line || ''}:${caller.column || ''}`;
 }
 
 function isRecentDuplicate(event) {
@@ -606,23 +736,107 @@ function emitEvent(event) {
   }
 }
 
-function emit(api, command_line, executable, args, shell_involved, shell, bypass_reason) {
-  const event = buildEvent({
-    api,
-    command_line,
-    executable,
-    args,
-    shell_involved,
-    shell,
-    bypass_reason,
-  });
+/**
+ * 构造命令事件并做拦截判定。
+ *
+ * 判定与写盘必须拆开：拦截判定要在 spawn **之前**做（否则拦不住），而子
+ * 进程 pid 只有 spawn 返回之后才知道（要回填到 child_pid）。所以这里只
+ * 返回"事件 + 是否该拦"，写盘由调用方在合适的时机做。
+ */
+function prepareCommandEvent(options) {
+  const event = buildEvent(options);
   const blockReason = shouldBlock(event);
   if (blockReason) {
     event.blocked = true;
     event.block_reason = blockReason;
-    emitEvent(event);
-    throw new Error(blockReason);
   }
+  return { event, blockReason };
+}
+
+/**
+ * 记录子进程的生命周期尾巴：回填子进程 pid，并挂上退出监听。
+ *
+ * 运行时层此前只记录 process_start，子进程的**结束**从来没有出现在事件
+ * 流里（采样里 process_exit 为 0 条）——审计链上只有"发起了"，没有
+ * "跑完了、结果如何"。这里在子进程退出时补一条 process_exit。
+ */
+function attachChildLifecycle(event, child) {
+  if (!child || typeof child !== 'object') return () => {};
+  if (typeof child.pid === 'number' && child.pid > 0) {
+    event.child_pid = child.pid;
+  }
+  if (typeof child.on !== 'function') {
+    // 同步 API（execSync / spawnSync）：子进程在返回时已经结束，结果对象
+    // 里带着退出码与信号。退出事件必须排在 process_start 之后落盘，所以
+    // 这里只把补写动作交给调用方（它在写完 process_start 之后调用）。
+    const status = typeof child.status === 'number' ? child.status : undefined;
+    const signal = child.signal;
+    return () => {
+      if (status === undefined) return;
+      try {
+        emitProcessExit(event, status, signal);
+      } catch (err) {
+        log('debug', `failed to emit process_exit: ${err && err.message}`);
+      }
+    };
+  }
+  try {
+    child.on('exit', (code, signal) => {
+      try {
+        emitProcessExit(event, code, signal);
+      } catch (err) {
+        log('debug', `failed to emit process_exit: ${err && err.message}`);
+      }
+    });
+  } catch (err) {
+    log('debug', `failed to attach exit listener: ${err && err.message}`);
+  }
+  return () => {};
+}
+
+/**
+ * 子进程退出事件。继承 process_start 的归属信息（会话 / 工具调用），
+ * 这样"哪个 agent 起的进程、它是怎么结束的"能对上。
+ */
+function emitProcessExit(startEvent, code, signal) {
+  const ctx = getGlobalContext();
+  const eventId = generateId();
+  const event = {
+    event_type: 'process_exit',
+    type: 'application.process_exit',
+    id: eventId,
+    event_id: eventId,
+    ts: getTimestamp(),
+    comm: startEvent.comm,
+    runtime: 'node',
+    api: startEvent.api,
+    command_line: startEvent.command_line,
+    executable: startEvent.executable,
+    process_name: startEvent.process_name,
+    layer: 'system',
+    collection_method: 'runtime',
+    source: 'openclaw.runtime-hooks.v1',
+    collector: {
+      hook_name: 'process_exit',
+      middleware_name: 'openclaw-security-monitor',
+      collector_name: 'security-runtime-middleware',
+    },
+    shell_involved: startEvent.shell_involved ?? false,
+    cwd: startEvent.cwd,
+    // pid 仍是发起方（兼容旧语义），spawner_pid 显式表达同一件事。
+    pid: startEvent.pid,
+    spawner_pid: startEvent.spawner_pid ?? startEvent.pid,
+    child_pid: startEvent.child_pid,
+    ppid: startEvent.ppid,
+    exit_code: typeof code === 'number' ? code : null,
+    exit_signal: signal || null,
+    caller: startEvent.caller,
+  };
+  event.session_id = ctx.session_id ?? null;
+  event.run_id = ctx.run_id ?? null;
+  event.agent_id = ctx.agent_id ?? null;
+  event.tool_call_id = ctx.tool_call_id ?? null;
+  event.tool_name = ctx.tool_name ?? null;
   emitEvent(event);
 }
 
@@ -737,28 +951,57 @@ function detectShellInvocation(command, args, options) {
   return { shell_involved: false, shell: undefined };
 }
 
+/**
+ * 把"拦截/执行失败"的错误交给调用方：优先走回调槽，没有回调就抛出去。
+ * spawn / fork 没有回调语义，只能同步抛出。
+ */
+function routeSpawnError(err, ...callbackSlots) {
+  for (const slot of callbackSlots) {
+    if (typeof slot === 'function') {
+      slot(err);
+      return true;
+    }
+  }
+  return false;
+}
+
 function wrapExec(original, apiName) {
   return function wrappedExec(command, options, callback) {
     const opts = isOptionsObject(options) ? options : undefined;
     const bypassReason = safeApplyHookPropagation(opts);
-    try {
-      const shell = (opts && opts.shell) || '/bin/sh';
-      emit(apiName, command, command.trim().split(/\s+/)[0], undefined, true, shell, bypassReason);
-    } catch (err) {
+    const shell = (opts && opts.shell) || '/bin/sh';
+    const prepared = prepareCommandEvent({
+      api: apiName,
+      command_line: command,
+      executable: command.trim().split(/\s+/)[0],
+      shell_involved: true,
+      shell,
+      bypass_reason: bypassReason,
+    });
+    if (prepared.blockReason) {
       // Runtime enforcement blocked the command. Route the error to the
       // callback when one is available; otherwise rethrow so the caller
       // observes a synchronous denial.
-      if (typeof options === 'function') {
-        options(err);
-        return undefined;
-      }
-      if (typeof callback === 'function') {
-        callback(err);
-        return undefined;
-      }
+      emitEvent(prepared.event);
+      const err = new Error(prepared.blockReason);
+      if (routeSpawnError(err, options, callback)) return undefined;
       throw err;
     }
-    return original.apply(this, arguments);
+    let result;
+    try {
+      result = original.apply(this, arguments);
+    } catch (err) {
+      // The command itself failed (ENOENT and friends). The attempt still
+      // belongs in the audit trail.
+      emitEvent(prepared.event);
+      throw err;
+    }
+    const flushExit = attachChildLifecycle(prepared.event, result);
+    emitEvent(prepared.event);
+    // 同步 API 的子进程在返回时已经退出：补写的 process_exit 必须排在
+    // process_start 之后落盘。
+    flushExit();
+    return result;
   };
 }
 
@@ -769,28 +1012,38 @@ function wrapExecFile(original, apiName) {
     // propagation applies here too.
     const opts = isOptionsObject(options) ? options : isOptionsObject(args) ? args : undefined;
     const bypassReason = safeApplyHookPropagation(opts);
-    try {
-      const normalizedArgs = Array.isArray(args) ? args : [];
-      const cmdline = [file, ...normalizedArgs].join(' ');
-      const detection = detectShellInvocation(file, normalizedArgs, opts);
-      emit(apiName, cmdline, file, normalizedArgs, detection.shell_involved, detection.shell, bypassReason);
-    } catch (err) {
+    const normalizedArgs = Array.isArray(args) ? args : [];
+    const cmdline = [file, ...normalizedArgs].join(' ');
+    const detection = detectShellInvocation(file, normalizedArgs, opts);
+    const prepared = prepareCommandEvent({
+      api: apiName,
+      command_line: cmdline,
+      executable: file,
+      args: normalizedArgs,
+      shell_involved: detection.shell_involved,
+      shell: detection.shell,
+      bypass_reason: bypassReason,
+    });
+    if (prepared.blockReason) {
       // Runtime enforcement blocked the command. Prefer the callback argument.
-      if (typeof args === 'function') {
-        args(err);
-        return undefined;
-      }
-      if (typeof options === 'function') {
-        options(err);
-        return undefined;
-      }
-      if (typeof callback === 'function') {
-        callback(err);
-        return undefined;
-      }
+      emitEvent(prepared.event);
+      const err = new Error(prepared.blockReason);
+      if (routeSpawnError(err, args, options, callback)) return undefined;
       throw err;
     }
-    return original.apply(this, arguments);
+    let result;
+    try {
+      result = original.apply(this, arguments);
+    } catch (err) {
+      emitEvent(prepared.event);
+      throw err;
+    }
+    const flushExit = attachChildLifecycle(prepared.event, result);
+    emitEvent(prepared.event);
+    // 同步 API 的子进程在返回时已经退出：补写的 process_exit 必须排在
+    // process_start 之后落盘。
+    flushExit();
+    return result;
   };
 }
 
@@ -800,17 +1053,37 @@ function wrapSpawn(original, apiName) {
     // options object. Resolve the real options slot for propagation.
     const opts = isOptionsObject(options) ? options : isOptionsObject(args) ? args : undefined;
     const bypassReason = safeApplyHookPropagation(opts);
-    try {
-      const normalizedArgs = Array.isArray(args) ? args : [];
-      const cmdline = [command, ...normalizedArgs].join(' ');
-      const detection = detectShellInvocation(command, normalizedArgs, opts);
-      emit(apiName, cmdline, command, normalizedArgs, detection.shell_involved, detection.shell, bypassReason);
-    } catch (err) {
+    const normalizedArgs = Array.isArray(args) ? args : [];
+    const cmdline = [command, ...normalizedArgs].join(' ');
+    const detection = detectShellInvocation(command, normalizedArgs, opts);
+    const prepared = prepareCommandEvent({
+      api: apiName,
+      command_line: cmdline,
+      executable: command,
+      args: normalizedArgs,
+      shell_involved: detection.shell_involved,
+      shell: detection.shell,
+      bypass_reason: bypassReason,
+    });
+    if (prepared.blockReason) {
       // Runtime enforcement blocked the command. spawn has no callback, so
       // throw synchronously to deny execution.
+      emitEvent(prepared.event);
+      throw new Error(prepared.blockReason);
+    }
+    let result;
+    try {
+      result = original.apply(this, arguments);
+    } catch (err) {
+      emitEvent(prepared.event);
       throw err;
     }
-    return original.apply(this, arguments);
+    const flushExit = attachChildLifecycle(prepared.event, result);
+    emitEvent(prepared.event);
+    // 同步 API 的子进程在返回时已经退出：补写的 process_exit 必须排在
+    // process_start 之后落盘。
+    flushExit();
+    return result;
   };
 }
 
@@ -818,15 +1091,34 @@ function wrapFork(original) {
   return function wrappedFork(modulePath, args, options) {
     const opts = isOptionsObject(options) ? options : isOptionsObject(args) ? args : undefined;
     const bypassReason = safeApplyHookPropagation(opts);
-    try {
-      const normalizedArgs = Array.isArray(args) ? args : [];
-      const cmdline = [modulePath, ...normalizedArgs].join(' ');
-      emit('child_process.fork', cmdline, 'node', [modulePath, ...normalizedArgs], false, undefined, bypassReason);
-    } catch (err) {
+    const normalizedArgs = Array.isArray(args) ? args : [];
+    const cmdline = [modulePath, ...normalizedArgs].join(' ');
+    const prepared = prepareCommandEvent({
+      api: 'child_process.fork',
+      command_line: cmdline,
+      executable: 'node',
+      args: [modulePath, ...normalizedArgs],
+      shell_involved: false,
+      bypass_reason: bypassReason,
+    });
+    if (prepared.blockReason) {
       // Runtime enforcement blocked the fork. Deny execution synchronously.
+      emitEvent(prepared.event);
+      throw new Error(prepared.blockReason);
+    }
+    let result;
+    try {
+      result = original.apply(this, arguments);
+    } catch (err) {
+      emitEvent(prepared.event);
       throw err;
     }
-    return original.apply(this, arguments);
+    const flushExit = attachChildLifecycle(prepared.event, result);
+    emitEvent(prepared.event);
+    // 同步 API 的子进程在返回时已经退出：补写的 process_exit 必须排在
+    // process_start 之后落盘。
+    flushExit();
+    return result;
   };
 }
 
@@ -1001,6 +1293,7 @@ function uninstall() {
 }
 
 // Auto-install when this module is required via -r.
+registerHookFile(__filename);
 install();
 
 module.exports = {

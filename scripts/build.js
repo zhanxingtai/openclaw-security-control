@@ -290,13 +290,14 @@ function packageInstall() {
     // repository/bugs/homepage 一起丢在仓库根，于是上架报
     // "package.json / Package manifest / Missing metadata"——仓库根看着齐全，
     // 发布的包里没有。搬运规则见 scripts/clawhub-metadata.mjs。
-    openclaw: buildInstallOpenClawMeta(rootPkg, pluginManifest, './index.js'),
+    openclaw: buildInstallOpenClawMeta(rootPkg, './index.js'),
     files: [
       'application',
       'application/node_modules',
       'system',
       'hooks',
       'policies',
+      'schemas',
       'index.js',
       'openclaw.plugin.json',
       'README.md',
@@ -338,15 +339,14 @@ function packageInstall() {
     "export * from './application/index.js';\nexport { default } from './application/index.js';\n"
   );
 
-  // Copy plugin manifest to the plugin root.
-  const rootManifest = {
-    ...pluginManifest,
-    main: 'index.js',
-    entry: 'index.js',
-  };
+  // Copy plugin manifest to the plugin root, verbatim.
+  // 清单里不注入 main/entry：`main`/`entry` 不是宿主清单的合法顶层字段
+  // （ClawHub 的 manifest-unknown-fields 校验会判非法）。宿主按
+  // package.json#openclaw.extensions 解析入口，那一份由 buildInstallOpenClawMeta
+  // 搬运成 "./index.js"，指向 install/index.js 再导出挂件。
   fs.writeFileSync(
     path.join(installDir, 'openclaw.plugin.json'),
-    JSON.stringify(rootManifest, null, 2) + '\n'
+    JSON.stringify(pluginManifest, null, 2) + '\n'
   );
 
   copyFile(path.join(rootDir, 'README.md'), path.join(installDir, 'README.md'));
@@ -385,6 +385,16 @@ function packageInstall() {
       copyFile(policySchemaV2Src, path.join(installDir, 'policies', 'spl-policy-v2.schema.json'));
       log('copied spl-policy-v2.schema.json (security.use/v2 当前合同)');
     }
+  }
+
+  // 事件 JSON Schema 随包分发：security-events.jsonl 每行都带
+  // schema_version，但此前全仓没有任何事件 schema 可对——版本号是空的
+  // 承诺。消费方（SIEM / 自建工具）需要这份文件才能校验落盘数据。
+  const eventSchemaSrc = path.join(rootDir, 'schemas', 'security-event-v1.schema.json');
+  if (fs.existsSync(eventSchemaSrc)) {
+    fs.mkdirSync(path.join(installDir, 'schemas'), { recursive: true });
+    copyFile(eventSchemaSrc, path.join(installDir, 'schemas', 'security-event-v1.schema.json'));
+    log('copied security-event-v1.schema.json (事件落盘格式合同)');
   }
 
   // risk-flags.json 随包分发：SPLRuleLoader 加载期校验 riskFlagsAny/All 拼写
@@ -607,6 +617,11 @@ function main() {
   log('Running TypeScript compiler');
   run('node node_modules/typescript/bin/tsc --noEmitOnError');
 
+  // 事件 JSON Schema 由 src/types.ts 生成。放在构建里而不是让人手记着跑，
+  // 是为了保证"随包分发的 schema"永远不会落后于类型定义——schema 是公开
+  // 合同，漂移了就等于对消费方撒谎。
+  run('node scripts/gen-event-schema.mjs');
+
   // 检测模式单源生成（spl.yaml → hooks/monitor/SelfProtection
   // 产物 + flag 默认名单 TS）。生成失败（双侧编译/子集 lint/字典校验不过）
   // 即构建失败。
@@ -628,12 +643,11 @@ function main() {
   }
 
   // Copy plugin manifest into dist/ so OpenClaw can discover the plugin.
-  // Paths inside dist/ are relative to dist/, so rewrite entry/main to index.js.
-  const distManifest = {
-    ...JSON.parse(fs.readFileSync(path.join(rootDir, 'openclaw.plugin.json'), 'utf8')),
-    main: 'index.js',
-    entry: 'index.js',
-  };
+  // 逐字复制：main/entry 不是宿主清单的合法字段，注入它们会被 ClawHub 的
+  // manifest-unknown-fields 校验判非法（见 install/ 端清单的同款注释）。
+  const distManifest = JSON.parse(
+    fs.readFileSync(path.join(rootDir, 'openclaw.plugin.json'), 'utf8')
+  );
   fs.writeFileSync(
     path.join(distDir, 'openclaw.plugin.json'),
     JSON.stringify(distManifest, null, 2) + '\n'

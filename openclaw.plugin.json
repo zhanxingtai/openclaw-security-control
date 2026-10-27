@@ -1,71 +1,13 @@
 {
   "id": "sst-security-control-openclaw",
   "name": "sst-security-control-openclaw",
-  "displayName": "SST Security Control 安全监控插件",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "为 OpenClaw 提供运行安全检测、风险识别和高风险操作控制。支持本地独立运行，默认不注册、不联网、不上传安全数据。",
-  "schema_version": 1,
-  "host_compat": [
-    {
-      "host_id": "openclaw",
-      "min_version": "2026.9.4"
-    }
+  "categories": [
+    "security"
   ],
-  "capabilities": [
-    "intercept.tool_call",
-    "intercept.message_write",
-    "intercept.agent_run",
-    "collect.process",
-    "collect.network",
-    "collect.asset",
-    "rpc.gateway_method",
-    "http.route.register"
-  ],
-  "secrets": {
-    "collected": false
-  },
-  "main": "index.js",
-  "entry": "index.js",
   "activation": {
     "onStartup": true
-  },
-  "openclaw": {
-    "install": {
-      "clawhubSpec": {
-        "specVersion": "2026.8.2",
-        "owner": "zhanxing",
-        "package": "sst-security-control-openclaw",
-        "category": "security-monitoring",
-        "tier": "community",
-        "minHostVersion": "2026.9.4",
-        "maxHostVersion": "",
-        "license": "Apache-2.0",
-        "source": {
-          "type": "git",
-          "url": "https://github.com/zhanxingtai/openclaw-security-control",
-          "ref": "main"
-        },
-        "permissions": [
-          "operator.read",
-          "operator.write",
-          "operator.admin"
-        ],
-        "capabilities": [
-          "intercept.tool_call",
-          "intercept.message_write",
-          "intercept.agent_run",
-          "collect.process",
-          "collect.network",
-          "collect.asset",
-          "rpc.gateway_method",
-          "http.route.register"
-        ],
-        "supportChannels": {
-          "issues": "https://github.com/zhanxingtai/openclaw-security-control/issues",
-          "docs": "https://github.com/zhanxingtai/openclaw-security-control/tree/main/docs"
-        }
-      }
-    }
   },
   "uiHints": {
     "intervention.enabled": {
@@ -94,68 +36,7 @@
     },
     "collector.ndjsonPath": {
       "advanced": false
-    },
-    "tabs": {
-      "security-monitor": {
-        "label": "SST Security Control",
-        "description": "智能体安全监控面板（事件 / 拦截 / 资产 / 策略）。9.4 Control UI iframe 受 sandbox / localStorage 限制，Tab 内不渲染，请直接访问 /openclaw-security-monitor/panel 查看独立面板。"
-      }
-    },
-    "panelUrl": "/openclaw-security-monitor/panel"
-  },
-  "contracts": {
-    "hooks": [
-      "before_agent_run",
-      "agent_end",
-      "before_tool_call",
-      "after_tool_call",
-      "before_message_write",
-      "session_start",
-      "session_end",
-      "subagent_spawned",
-      "subagent_progress",
-      "subagent_ended",
-      "cron_changed"
-    ],
-    "gatewayMethods": [
-      "security.evaluate",
-      "security.status",
-      "security.events.list",
-      "security.events.stats",
-      "security.assets.list",
-      "security.policy.hits",
-      "security.metrics",
-      "security.config.get",
-      "security.config.diff",
-      "security.config.save"
-    ],
-    "httpRoutes": [
-      "/openclaw-security-monitor/events.ndjson",
-      "/openclaw-security-monitor/panel"
-    ]
-  },
-  "risk_flags": {
-    "registered": [
-      "background_execution",
-      "chmod_executable",
-      "data_exfiltration",
-      "db_dump",
-      "download_execute",
-      "file_deletion",
-      "mass_deletion",
-      "network_tool",
-      "pipe_to_shell",
-      "privilege_escalation",
-      "reverse_shell",
-      "secret_in_content",
-      "self_protection_bypass",
-      "sensitive_file_access",
-      "shell_involved",
-      "skill_binary_execution",
-      "suspicious_encoding",
-      "token_in_command",
-      "unpatched_engine"
-    ]
+    }
   },
   "configSchema": {
     "type": "object",

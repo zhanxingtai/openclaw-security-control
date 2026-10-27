@@ -34,7 +34,7 @@ function baseEvent(layer: string, extra: Record<string, unknown>) {
     event_type: "test_emit",
     layer,
     ts: Date.now(),
-    schema_version: "1.0.0",
+    schema_version: 1,
     pid: process.pid,
     session_id: null,
     run_id: null,
@@ -128,9 +128,19 @@ describe("EventBridgeCollector 统一脱敏出口", () => {
     await sink.report(once);
     const firstLine = readFileSync(ndjsonPath, "utf8").trim();
     const parsed = JSON.parse(firstLine);
+    // 落盘层按 event_id 幂等：同一 event_id 重复上报不写第二行。
     await sink.report(parsed);
     const lines = readFileSync(ndjsonPath, "utf8").trim().split("\n");
-    expect(JSON.parse(lines[1])).toEqual(parsed);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual(parsed);
+  });
+
+  it("同样载荷再过一次出口，脱敏结果逐字一致", async () => {
+    await sink.report(baseEvent("application", { content: `key ${AKIA}` }));
+    await sink.report(baseEvent("application", { content: `key ${AKIA}` }));
+    const lines = readFileSync(ndjsonPath, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[1]).content).toBe(JSON.parse(lines[0]).content);
   });
 });
 

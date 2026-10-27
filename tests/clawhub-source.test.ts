@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "fs";
+import path from "path";
 // @ts-expect-error -- plain-JS build helper, no type declarations
 import {
   assertSourceAttribution,
@@ -6,6 +8,7 @@ import {
   parseGitHubRepo,
   pickGitHubRemote,
   renderPublishCommand,
+  resolveListing,
   resolveSourceAttribution,
   stampSourceAttribution,
 } from "../scripts/clawhub-source.mjs";
@@ -25,6 +28,7 @@ import {
  */
 
 const COMMIT = "ea29225dd042632958af5acd197f68d1504ef2c9";
+const ROOT = path.resolve(__dirname, "..");
 
 describe("parseGitHubRepo", () => {
   it("认得 git@ / https / ssh 三种远端写法", () => {
@@ -122,6 +126,33 @@ describe("renderPublishCommand", () => {
     expect(cmd).toContain("--source-path .");
     expect(cmd).toContain("install/pkg.tgz");
   });
+
+  it("带显示名；不给就不带（不留空参数）", () => {
+    const attribution = {
+      repo: "zhanxingtai/openclaw-security-control",
+      commit: COMMIT,
+      ref: "main",
+      path: ".",
+    };
+    const withName = renderPublishCommand(attribution, "install/pkg.tgz", {
+      displayName: "SST Security Control",
+    });
+    expect(withName).toContain('--display-name "SST Security Control"');
+
+    // 显示名为空时不能出现 "--display-name """ 这种空参数，CLI 会当成真值收下。
+    const withoutName = renderPublishCommand(attribution, "install/pkg.tgz", { displayName: "  " });
+    expect(withoutName).not.toContain("--display-name");
+  });
+});
+
+describe("resolveListing", () => {
+  it("显示名取自 package.json#openclaw.plugin.label", () => {
+    // 宿主清单的合法顶层字段里没有 displayName，人类可读的名字只有这一处权威来源。
+    const listing = resolveListing(ROOT);
+    expect(listing.displayName.length).toBeGreaterThan(0);
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    expect(listing.displayName).toBe(pkg.openclaw.plugin.label);
+  });
 });
 
 describe("resolveSourceAttribution", () => {
@@ -187,21 +218,33 @@ describe("resolveSourceAttribution", () => {
 });
 
 describe("stampSourceAttribution", () => {
-  it("把归属信息写进宿主清单的 clawhubSpec.source", () => {
-    const manifest = {
-      openclaw: { install: { clawhubSpec: { source: { type: "git", url: "https://github.com/x/y", ref: "main" } } } },
-    };
-    const stamped = stampSourceAttribution(manifest, {
+  it("把归属信息写进仓内归属记录", () => {
+    // 归属信息不进宿主清单：清单的合法顶层字段里没有这一项，
+    // 装机规格归 package.json#openclaw.install，而 install 块里也没有
+    // source 子结构。权威归属永远是发布命令里的 --source-*。
+    const stamped = stampSourceAttribution(null, {
       repo: "zhanxingtai/openclaw-security-control",
       commit: COMMIT,
       ref: "main",
       path: ".",
     });
-    const source = (stamped.openclaw as any).install.clawhubSpec.source;
-    expect(source.repo).toBe("zhanxingtai/openclaw-security-control");
-    expect(source.commit).toBe(COMMIT);
-    expect(source.path).toBe(".");
-    // 原对象不能被就地改写
-    expect((manifest.openclaw as any).install.clawhubSpec.source.commit).toBeUndefined();
+    expect(stamped.repo).toBe("zhanxingtai/openclaw-security-control");
+    expect(stamped.url).toBe("https://github.com/zhanxingtai/openclaw-security-control");
+    expect(stamped.commit).toBe(COMMIT);
+    expect(stamped.ref).toBe("main");
+    expect(stamped.path).toBe(".");
+  });
+
+  it("原对象不能被就地改写", () => {
+    const existing = { repo: "old/repo", commit: "0".repeat(40), note: "keep" };
+    const stamped = stampSourceAttribution(existing, {
+      repo: "zhanxingtai/openclaw-security-control",
+      commit: COMMIT,
+      ref: "main",
+      path: ".",
+    });
+    expect(stamped.commit).toBe(COMMIT);
+    expect(stamped.note).toBe("keep");
+    expect(existing.commit).toBe("0".repeat(40));
   });
 });

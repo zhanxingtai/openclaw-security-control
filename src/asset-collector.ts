@@ -145,8 +145,9 @@ function pruneUndefined(obj: Record<string, unknown>): Record<string, unknown> {
 // fingerprint so capability upgrades trigger exactly one re-baseline.
 // 2 = packages; 3 = lean parsed for agent_config; 4 = lean parsed for skill;
 // 5 = entry-level exclusion in skill packages;
-// 6 = flat event_type (asset_add/change/remove/snapshot), change_type dropped.
-const STATE_FORMAT_VERSION = 6;
+// 6 = flat event_type (asset_add/change/remove/snapshot), change_type dropped;
+// 7 = asset_package inline 收敛为 asset_package_hash（内容寻址，包体落 asset-blobs/）。
+const STATE_FORMAT_VERSION = 7;
 
 /** Flat event_type per change action — the data standard encodes the action
  * in event_type itself (like file_read/write/delete, process_start/exit), so
@@ -181,6 +182,16 @@ export class AssetCollector {
   // Rate limit for tamper_detected emissions (one per window is enough to
   // alert the panel; a persistent forger must not spam the event sink).
   private lastLockTamperAt = 0;
+  /**
+   * 每个资产已落盘过 blob 的包内容指纹集合（assetId → sha256 集合）。
+   *
+   * 内容寻址后事件只携带 asset_package_hash，包体全局按 hash 落一份到
+   * asset-blobs/。指纹已见过说明 blob 已存在，跳过重写（内容相同，重写也
+   * 幂等，只是省一次写盘）；写盘失败的指纹不登记，后续事件会重试。
+   */
+  private emittedPackageHashes = new Map<string, Set<string>>();
+  /** 每个资产保留的历史 package 指纹上限，保证内存有界。 */
+  private static readonly MAX_EMITTED_PACKAGE_HASHES = 16;
   private sensitiveKeyPatterns: string[];
   private collectSkillPackage: boolean;
   private collectConfigPackage: boolean;
@@ -188,6 +199,8 @@ export class AssetCollector {
   private maxPackageEntryBytes: number;
   private packageEncoding: 'base64' | 'hex';
   private hostPrefix: string;
+  /** 包体内容寻址落盘目录（<ndjsonDir>/asset-blobs）。未配置时事件省略 hash 字段。 */
+  private blobDir?: string;
 
   private configPaths: string[];
   private skillRoots: string[];
@@ -213,11 +226,13 @@ export class AssetCollector {
     collector: IEventCollector,
     config: AssetMonitorConfig,
     environment: EnvironmentConfig = {},
-    discovery?: AssetDiscoveryOverrides
+    discovery?: AssetDiscoveryOverrides,
+    options?: { blobDir?: string }
   ) {
     this.collector = collector;
     this.environment = environment;
     this.enabled = config.enabled === true;
+    this.blobDir = options?.blobDir;
     this.scanIntervalMs = config.scanIntervalMs ?? 300000;
     this.fullSnapshotIntervalMs = config.fullSnapshotIntervalMs ?? 86400000;
     this.watchPaths = config.watchPaths ?? [];
@@ -485,10 +500,10 @@ export class AssetCollector {
     const event = {
       comm: 'openclaw',
       event_id: generateUUID(),
-      event_type: 'tamper_detected',
+      event_type: 'x_openclaw_tamper_detected',
       layer: 'asset',
       ts: now,
-      schema_version: '1.0.0',
+      schema_version: 1,
       pid: process.pid,
       session_id: null,
       run_id: null,
@@ -501,7 +516,7 @@ export class AssetCollector {
       source: 'openclaw.v1',
       collection_method: 'agent_api',
       collector: {
-        hook_name: 'tamper_detected',
+        hook_name: 'x_openclaw_tamper_detected',
         middleware_name: 'sst-security-control-openclaw',
         collector_name: this.name,
       },
@@ -653,13 +668,41 @@ export class AssetCollector {
 
   private async emit(asset: ScannedAsset, changeType: ChangeType, prevHash?: string): Promise<void> {
     const now = Date.now();
+    // 内容寻址：包体不再内嵌事件，按 sha256 全局落一份到 asset-blobs/，
+    // 事件只带 asset_package_hash。内容来回翻转时同 hash 自然收敛，消费方
+    // 按 hash 取回包体。写盘失败降级：省略 hash 字段 + warn，不阻断事件。
+    let assetPackageHash: string | undefined;
+    if (asset.assetPackage) {
+      const fingerprint = sha256Hex(asset.assetPackage.data);
+      const seen = this.emittedPackageHashes.get(asset.assetId);
+      if (seen?.has(fingerprint)) {
+        assetPackageHash = fingerprint;
+      } else {
+        const written = await this.persistAssetBlob(asset.assetPackage.data);
+        if (written !== undefined) {
+          assetPackageHash = written;
+          if (!seen) {
+            this.emittedPackageHashes.set(asset.assetId, new Set([fingerprint]));
+          } else {
+            seen.add(fingerprint);
+            // 指纹集合有界：只保留最近若干份内容的历史。
+            while (seen.size > AssetCollector.MAX_EMITTED_PACKAGE_HASHES) {
+              const oldest = seen.values().next();
+              if (oldest.done) break;
+              seen.delete(oldest.value);
+            }
+          }
+        }
+        // 写盘失败：指纹不登记，后续同内容事件会重试写 blob。
+      }
+    }
     const event: SecurityEvent = {
       comm: 'openclaw',
       event_id: generateUUID(),
       event_type: EVENT_TYPE_BY_CHANGE[changeType],
       layer: 'asset',
       ts: now,
-      schema_version: '1.0.0',
+      schema_version: 1,
       pid: process.pid,
       session_id: null,
       run_id: null,
@@ -680,7 +723,7 @@ export class AssetCollector {
       content_hash: changeType === 'removed' ? undefined : asset.contentHash,
       prev_hash: prevHash,
       parsed: asset.parsed,
-      asset_package: asset.assetPackage,
+      asset_package_hash: assetPackageHash,
       file_size: asset.fileSize,
       file_mtime: asset.fileMtime,
     };
@@ -689,6 +732,28 @@ export class AssetCollector {
       this.totalEmitted += 1;
     } catch (err) {
       console.error('[AssetCollector] failed to report asset event:', err);
+    }
+  }
+
+  /**
+   * 把包体原文（编码文本，base64/hex）按内容 hash 落盘到 <blobDir>/<hash>，
+   * 文件名即 hash——同一内容重复写入是幂等的，天然去重。
+   *
+   * 返回内容 hash；未配置 blobDir 或写盘失败返回 undefined（调用方据此
+   * 省略事件的 asset_package_hash 字段，降级不抛异常）。
+   */
+  private async persistAssetBlob(data: string): Promise<string | undefined> {
+    if (!this.blobDir) return undefined;
+    const hash = sha256Hex(data);
+    try {
+      await mkdir(this.blobDir, { recursive: true });
+      await writeFile(path.join(this.blobDir, hash), data, 'utf8');
+      return hash;
+    } catch (err) {
+      console.warn(
+        `[AssetCollector] 写入 asset blob 失败（事件省略 asset_package_hash）: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return undefined;
     }
   }
 
@@ -849,7 +914,10 @@ export class AssetCollector {
         // Single-file ZIP of the raw config for downstream audit scanning.
         // Intentionally NOT obfuscated (same rationale as skill packages);
         // the archive is what the scanner needs, sections/content stay obf'd.
-        const zip = buildZip([{ name: path.basename(filePath), data: buf, mtime: mtimeMs }]);
+        // mtime 固定为 epoch：包体按内容寻址落盘（asset-blobs/<hash>），
+        // zip 字节必须随内容确定——文件 mtime 一变 hash 就飘，同内容会
+        // 落多份 blob。真实 mtime 已经在 file_mtime / manifest 里。
+        const zip = buildZip([{ name: path.basename(filePath), data: buf, mtime: 0 }]);
         if (zip.length <= this.maxPackageBytes) {
           assetPackage = {
             format: 'zip',
@@ -1164,7 +1232,9 @@ export class AssetCollector {
         if (included.length === 0) {
           parsed.package_omitted = 'entries_too_large';
         } else {
-          const zip = buildZip(included.map((e) => ({ name: e.rel, data: e.buf, mtime: e.mtimeMs })));
+          // mtime 固定为 epoch：包体按内容寻址（asset-blobs/<hash>），zip
+          // 字节必须随内容确定，文件 mtime 已在 manifest 里逐文件携带。
+          const zip = buildZip(included.map((e) => ({ name: e.rel, data: e.buf, mtime: 0 })));
           if (zip.length <= this.maxPackageBytes) {
             assetPackage = {
               format: 'zip',
@@ -1247,6 +1317,7 @@ export class AssetCollector {
             '[AssetCollector] state fingerprint mismatch (payload shape changed); re-baselining all assets'
           );
           this.state = {};
+          this.emittedPackageHashes.clear();
           this.dirty = true;
           return;
         }

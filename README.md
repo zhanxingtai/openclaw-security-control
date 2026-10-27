@@ -30,10 +30,10 @@ npm install --legacy-peer-deps
 npm run build:prod
 
 # 2. Copy the tarball to the target server
-scp install/sst-security-control-openclaw-1.0.1.tgz root@server:~/.openclaw/
+scp install/sst-security-control-openclaw-1.0.2.tgz root@server:~/.openclaw/
 
 # 3. Install on the server (run these two commands in separate terminal sessions)
-openclaw plugins install npm-pack:$HOME/.openclaw/sst-security-control-openclaw-1.0.1.tgz --accept-capabilities --force
+openclaw plugins install npm-pack:$HOME/.openclaw/sst-security-control-openclaw-1.0.2.tgz --accept-capabilities --force
 openclaw plugins enable sst-security-control-openclaw
 openclaw gateway restart
 ```
@@ -49,6 +49,14 @@ openclaw plugins uninstall sst-security-control-openclaw
 - Agent session and behavior event logging (NDJSON)
 - High-risk actions (reverse shells, sensitive file access, and similar) are blocked in `enforce` mode; everything else is only flagged and warned
 - Runtime status and event panel (Control UI → SST Security Control)
+
+### Security panel
+
+The panel shows events, interventions, assets, and policy hits. OpenClaw 9.4's Control UI hosts it in a sandboxed iframe that cannot use `localStorage`, so the tab itself renders blank — open the standalone panel directly:
+
+```text
+http://<host>:<port>/openclaw-security-monitor/panel
+```
 
 ## Configuration
 
@@ -76,17 +84,20 @@ Blocking is driven by SPL declarative rules (YAML, `apiVersion: security.use/v1`
 
 ## Security Events
 
-Events are NDJSON lines. The `event_type` values this version actually emits, by layer:
+Events are NDJSON lines. The `event_type` values this version actually emits, by layer.
+Types prefixed with `x_openclaw_` are project extensions: the platform ingest
+(`validate_batch`) rejects whole batches containing unregistered bare-name types,
+while unregistered `x_<project>_` extensions pass after common-field validation.
 
 | Layer | Event types | Requires Runtime Hooks |
 |-------|-------------|------------------------|
-| Application | `agent_session_start` / `agent_session_end`, `agent_start` / `agent_stop`, `agent_subagent_start` / `agent_subagent_progress` / `agent_subagent_end`, `agent_message`, `agent_tool_call` / `agent_tool_result`, `cron_changed`, `code_mode_exec`, `reasoning` | no |
+| Application | `agent_session_start` / `agent_session_end`, `agent_start` / `agent_stop`, `x_openclaw_subagent_start` / `x_openclaw_subagent_progress` / `x_openclaw_subagent_end`, `agent_message`, `agent_tool_call` / `agent_tool_result`, `cron_changed`, `x_openclaw_cron_run`, `code_mode_exec`, `reasoning` | no |
 | Application (file) | `file_read` / `file_write` / `file_delete` / `file_privilege` — derived from tool names (`fs.readFile` → `file_read`) | no |
-| System (process) | `process_start`, `process_change` / `process_exit` / `process_snapshot` | `process_start`: **yes** |
-| System (cgroup) | `cgroup_snapshot` / `cgroup_anomaly` | no (needs `system.enabled`) |
+| System (process) | `process_start`, `x_openclaw_process_change` / `process_exit` / `x_openclaw_process_snapshot` | `process_start`: **yes** |
+| System (cgroup) | `x_openclaw_cgroup_snapshot` / `x_openclaw_cgroup_anomaly` | no (needs `system.enabled`) |
 | System (network) | `network_http` | **yes** |
 | Asset | `asset_add` / `asset_change` / `asset_remove` / `asset_snapshot` | no |
-| Self-protection | `protection_degraded`, `tamper_detected` | no |
+| Self-protection | `x_openclaw_protection_degraded`, `x_openclaw_tamper_detected`, `x_openclaw_runtime_hook_unloaded` | no |
 
 ## Roadmap
 

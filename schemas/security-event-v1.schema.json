@@ -1,0 +1,1087 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zhanxingtai/openclaw-security-control/schemas/security-event-v1.schema.json",
+  "title": "OpenClaw Security Monitor 事件",
+  "description": "security-events.jsonl 单行（NDJSON）的结构定义。每个事件对象都必须满足本 schema。事件类型清单见 README「Security Events」一节。",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "layer",
+    "ts"
+  ],
+  "properties": {
+    "comm": {
+      "type": "string",
+      "description": "Common fields (all layers)"
+    },
+    "event_id": {
+      "type": "string",
+      "description": "事件唯一标识（UUID）。"
+    },
+    "event_type": {
+      "type": "string",
+      "description": "事件类型。本插件实际会写出的取值：agent_start、agent_stop、agent_session_start、agent_session_end、x_openclaw_subagent_start、x_openclaw_subagent_progress、x_openclaw_subagent_end、cron_changed、x_openclaw_cron_run、agent_message、agent_tool_call、agent_tool_result、code_mode_exec、reasoning、runtime_log、trace_span、command_execution、file_read、file_write、file_delete、file_privilege、network_http、network_connect、network_dns、process_start、x_openclaw_process_change、process_exit、x_openclaw_process_snapshot、x_openclaw_cgroup_snapshot、x_openclaw_cgroup_anomaly、asset_add、asset_change、asset_remove、asset_snapshot、x_openclaw_protection_degraded、x_openclaw_tamper_detected、x_openclaw_runtime_hook_unloaded。宿主可能扩展自定义类型，因此不设 enum 约束。"
+    },
+    "layer": {
+      "type": "string",
+      "enum": [
+        "application",
+        "system",
+        "asset"
+      ],
+      "description": "事件所属层：application | system | asset。"
+    },
+    "ts": {
+      "type": "number",
+      "description": "事件发生时间（Unix 毫秒）。"
+    },
+    "schema_version": {
+      "type": "number",
+      "description": "事件 schema 版本，与 schemas/security-event-v1.schema.json 对应。"
+    },
+    "pid": {
+      "type": "number"
+    },
+    "spawner_pid": {
+      "type": "number",
+      "description": "发起方进程 pid（谁调用了 spawn）。 1.1.0 之前 `pid` 就是这个语义（发起方），而**被拉起的子进程 pid 从来 没被采集过**——审计链上只有\"谁发起的\"，没有\"哪个进程真的跑起来 了\"。现在两者分开：`spawner_pid` = 发起方，`child_pid` = 子进程。 `pid` 保留为发起方 pid 的兼容别名。"
+    },
+    "child_pid": {
+      "type": "number",
+      "description": "被拉起的子进程 pid。spawn 之前拿不到，所以 process_start 事件里可能缺失。"
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "会话标识。runtime 层事件在没有宿主会话上下文时为 null。"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "运行标识。"
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "智能体标识。"
+    },
+    "host_id": {
+      "type": "string",
+      "description": "宿主主机标识。"
+    },
+    "container_id": {
+      "type": "string",
+      "description": "容器标识。非容器部署时与 host_id 相同。"
+    },
+    "pod_name": {
+      "type": "string"
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string",
+      "description": "采集来源，形如 <project>.<component>.<version>。"
+    },
+    "collection_method": {
+      "type": "string",
+      "description": "采集方式：hook | runtime | ebpf | procfs | agent_api | asset_sync。"
+    },
+    "collector": {
+      "type": "object",
+      "properties": {
+        "hook_name": {
+          "type": "string"
+        },
+        "middleware_name": {
+          "type": "string"
+        },
+        "collector_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true,
+      "description": "采集器元数据（hook 名称、中间件名称、采集器名称）。"
+    },
+    "agent_name": {
+      "type": "string",
+      "description": "Application layer fields"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "tool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_kind": {
+      "type": "string"
+    },
+    "tool_description": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "tool_params": {
+      "type": "string",
+      "description": "工具参数的规范化 JSON 字符串。"
+    },
+    "tool_params_length": {
+      "type": "number",
+      "description": "tool_params 截断前的原始长度。"
+    },
+    "raw_params_hash": {
+      "type": "string",
+      "description": "原始参数在**脱敏前**的 SHA-256（规范化键序后序列化，与 tool_params 同源但先于 redact）。 规范（common.json）脱敏四件套之一：审计时凭它核对原始内容，原始明文 走独立安全通道、绝不落事件流。无法确定性序列化的极端载荷（循环引用） 省略本字段。"
+    },
+    "redacted_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "本次落盘时被脱敏替换的一级键名列表（去重；空则省略本字段）。 规范（common.json）脱敏四件套之一：raw_params_hash / raw_params_length / redacted_keys / obfuscation。下游据此知道\"哪个参数被抹掉了\"，而不必 靠对 tool_params 里的 '***' 做形态猜测。只记录键名被替换的键； 值内容模式（JWT/AKIA 等）命中属于\"值被改写\"，不算键被替换。"
+    },
+    "user_prompt": {
+      "type": "string"
+    },
+    "system_prompt_ref": {
+      "type": "string",
+      "description": "系统提示词内容指纹（sha256 前 16 位十六进制）。事件流不再内嵌 system_prompt 全文；全文全局唯一一份落在与 security-events.jsonl 同目录的 security-prompts.jsonl，按完整 prompt_hash 内容寻址。"
+    },
+    "session_title": {
+      "type": "string",
+      "description": "会话标题：由该 session 首条有效 user 消息派生（脱敏 → 取首个非空行 → 压行内空白 → 截断 ≤30 字）。first-write-wins，之后不再改写。 标题在首条 user 消息落盘之后才确定，因此早于它的少数事件（例如 agent_start）没有这个字段——\"字段缺失\"即\"标题尚未确定\"。"
+    },
+    "agent_plan": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "previous_actions": {
+      "type": "array",
+      "items": {}
+    },
+    "step_index": {
+      "type": "number"
+    },
+    "is_code_mode": {
+      "type": "boolean"
+    },
+    "code_content": {
+      "type": "string"
+    },
+    "code_content_length": {
+      "type": "number"
+    },
+    "code_language": {
+      "type": "string"
+    },
+    "model_provider": {
+      "type": "string"
+    },
+    "model_name": {
+      "type": "string"
+    },
+    "role": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "system"
+      ],
+      "description": "消息角色（agent_message）。规范（agent.json）枚举只有 user / assistant / system；写入端（inferMessageRole）保证枚举外取值 （如宿主给的 tool / 任意字符串）不会落盘——它们按\"未知\"走生命周期推断。"
+    },
+    "role_source": {
+      "type": "string",
+      "description": "角色来源（1.1.0）：`explicit` 宿主明确给出 / `inferred` 载荷形态推断 / `lifecycle` 会话生命周期推断 / `default` 兜底。 宿主在消息事件上经常不带 role，没有这个标记时下游分不清\"这是用户 说的\"和\"这是我们猜的\"。"
+    },
+    "content": {
+      "type": "string",
+      "description": "载荷内容（按配置截断后）。"
+    },
+    "content_length": {
+      "type": "number",
+      "description": "载荷原始长度（未截断）。"
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "reasoning_length": {
+      "type": "number"
+    },
+    "message_id": {
+      "type": "string"
+    },
+    "parent_message_id": {
+      "type": "string"
+    },
+    "message_index": {
+      "type": "number"
+    },
+    "duration": {
+      "type": "number",
+      "description": "执行耗时（毫秒）。"
+    },
+    "started_at": {
+      "type": "number",
+      "description": "cron_run：本次运行的开始时间（Unix 毫秒）。scheduled/started 中间 事件不落盘，起点在内存里按 cronId 记；started 缺失（如插件重启过） 时本字段与 duration_ms 一起省略，不编造假值。"
+    },
+    "duration_ms": {
+      "type": "number",
+      "description": "cron_run：本次运行耗时（毫秒）= 落盘时刻 - started_at。"
+    },
+    "fired_result": {
+      "type": "string",
+      "description": "cron_run：宿主回传的触发结果（截断 ≤500 字）。字符串原样收，对象 序列化后收。"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failure",
+        "blocked",
+        "error",
+        "modified",
+        "ended"
+      ],
+      "description": "事件状态，取值随事件类型而异（success/failure、scheduled/started/finished、ended …）。"
+    },
+    "result_size": {
+      "type": "number",
+      "description": "工具结果原始长度（未截断）。"
+    },
+    "result_preview": {
+      "type": "string",
+      "description": "工具结果预览（截断后的字符串）。"
+    },
+    "error_message": {
+      "type": "string"
+    },
+    "loaded_skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "loaded_tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "model_provider": {
+            "type": "string"
+          },
+          "model_name": {
+            "type": "string"
+          },
+          "system_prompt_ref": {
+            "type": "string",
+            "description": "系统提示词内容指纹（sha256 前 16 位十六进制），与事件层 `system_prompt_ref` 同源同值。 事件流里不再内联系统提示词全文——agent_start 的 agents[] 与会话内 消息事件携带的原文逐字节相同，重复落盘一份 25KB 级别的私有载荷 没有收益。全文全局唯一一份落在 security-prompts.jsonl，消费方按 ref 对应的完整 prompt_hash 取回。"
+          },
+          "agent_dir": {
+            "type": "string",
+            "description": "Best-effort agent directory; omitted when it cannot be reliably resolved."
+          },
+          "config": {
+            "type": "string",
+            "description": "Best-effort config file path; omitted when it cannot be reliably resolved."
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Skills loaded by this specific agent — name list only; path/hash via asset_* channel."
+          },
+          "mcp_servers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "MCP servers referenced by this agent — name list only; transport/command/auth via asset_* channel."
+          },
+          "tools": {
+            "type": "array",
+            "items": {},
+            "description": "Tools brought online by this agent."
+          }
+        },
+        "additionalProperties": true
+      },
+      "description": "智能体清单（agent_start）。系统提示词只以 system_prompt_ref 形式出现。"
+    },
+    "exit_code": {
+      "type": "number"
+    },
+    "exit_signal": {
+      "type": "string",
+      "description": "子进程被信号终止时的信号名（process_exit）。"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "runtime": {
+      "type": "string",
+      "description": "Application runtime hook fields (process_start)"
+    },
+    "api": {
+      "type": "string"
+    },
+    "shell_involved": {
+      "type": "boolean"
+    },
+    "shell": {
+      "type": "string"
+    },
+    "target_pid": {
+      "type": "number"
+    },
+    "caller": {
+      "type": "object",
+      "properties": {
+        "function": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "风险标签列表。"
+    },
+    "bypass_reason": {
+      "type": "string",
+      "description": "hook 传播被绕过的具体原因。 - `explicit_skip`：调用方显式要求跳过传播 → 子进程真的裸跑，覆盖丢了； - `env_stripped`：调用方给了不带 NODE_OPTIONS 的 env → hook 已把它 补回去，覆盖没丢（此前这种情形也被算成 `self_protection_bypass`， 宿主自己的探活命令因此刷出大量假告警）。"
+    },
+    "blocked": {
+      "type": "boolean",
+      "description": "是否被策略拦截。恒为布尔值：false 表示未被拦截（不代表未被策略命中，warn/modify 记在 intervention.decision）。"
+    },
+    "block_reason": {
+      "type": "string"
+    },
+    "tool_call_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "关联键：一次工具调用的唯一标识（插件合成，权威关联键）。"
+    },
+    "host_tool_call_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "宿主原始的工具调用 id，仅用于与宿主日志对账。"
+    },
+    "parent_tool_call_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "外层调用 id（嵌套调用时才有）。 code-mode exec 在飞行期间跑的工具调用（read/ls/exec …）各自有独立的 `tool_call_id`（保持唯一，决策缓存不串号），外层那次 code-mode exec 的 id 记在这里——这样\"这段工具调用是 code-mode 脚本发起的\"这件事在 事件流里是显式的，不必再靠时间窗口或 step 索引反推。"
+    },
+    "evaluation_skipped": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "backlog": {
+          "type": "number",
+          "description": "跳过时的队列积压长度。"
+        }
+      },
+      "additionalProperties": true,
+      "description": "采集侧降级留痕：runtime hook 事件的干预评估队列积压达到 上限时，该事件跳过评估、仅落盘，原因记于此字段。评估被跳过意味着 `intervention` 决策缺失（非 allow），chain 规则的时序也不再保证。"
+    },
+    "intervention": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "description": "备用值，便于审计留痕。"
+        },
+        "policy_id": {
+          "type": "string"
+        },
+        "policy_name": {
+          "type": "string"
+        },
+        "policy_version": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "block_reason": {
+          "type": "string"
+        },
+        "block_code": {
+          "type": "string"
+        },
+        "appealable": {
+          "type": "boolean",
+          "description": "展示字段：true = 可联系管理员复核 / 申请调整策略（误报救济， 面板渲染\"可复核\"徽标）；false = 硬性安全底线。无在线申诉动作。"
+        },
+        "remediation_hint": {
+          "type": "string",
+          "description": "阻断后的修复建议；appealable=true 且策略未显式配置时由决策层补缺省复核指引。"
+        },
+        "matched_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "policy_id": {
+                "type": "string"
+              },
+              "policy_name": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "number"
+              },
+              "risk_level": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "critical",
+                  "extreme"
+                ]
+              },
+              "category": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "description": "本次评估命中的全部规则，含 enforce 短路点之前已匹配的 warn/modify 等规则；audit 标注用途，与最终 decision 互补。"
+        },
+        "modified_params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "substituted_tool_name": {
+          "type": "string"
+        },
+        "guidance": {
+          "type": "object",
+          "properties": {
+            "adjustment_id": {
+              "type": "string"
+            },
+            "template_id": {
+              "type": "string"
+            },
+            "template_version": {
+              "type": "string"
+            },
+            "rendered": {
+              "type": "string"
+            },
+            "allowed_scope": {
+              "type": "string"
+            },
+            "alternatives": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "attempts_remaining": {
+              "type": "number"
+            },
+            "guidance_count": {
+              "type": "number"
+            }
+          },
+          "additionalProperties": true
+        },
+        "degrade": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "readonly",
+                "sandbox",
+                "limited_tools"
+              ]
+            },
+            "removed_tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "latency_ms": {
+          "type": "number"
+        },
+        "fail_strategy": {
+          "type": "string",
+          "enum": [
+            "fail_open",
+            "fail_closed",
+            "fail_open_high_risk_only"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "audit",
+            "enforce"
+          ]
+        },
+        "priority": {
+          "type": "number"
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical",
+            "extreme"
+          ]
+        }
+      },
+      "additionalProperties": true,
+      "description": "干预决策留痕。"
+    },
+    "risk_assessment": {
+      "type": "object",
+      "properties": {
+        "risk_score": {
+          "type": "number"
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical",
+            "extreme"
+          ]
+        },
+        "reg_level": {
+          "type": "string",
+          "enum": [
+            "低风险",
+            "中风险",
+            "高风险"
+          ]
+        },
+        "reg_clause": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "matched_policies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evaluation_path": {
+          "type": "string",
+          "enum": [
+            "cache",
+            "rule",
+            "model",
+            "fallback"
+          ]
+        }
+      },
+      "additionalProperties": true,
+      "description": "Risk assessment (Phase 1.5)"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": "string"
+    },
+    "protocol_type": {
+      "type": "string"
+    },
+    "llm_provider": {
+      "type": "string"
+    },
+    "request_method": {
+      "type": "string"
+    },
+    "request_url": {
+      "type": "string"
+    },
+    "request_path": {
+      "type": "string"
+    },
+    "request_host": {
+      "type": "string"
+    },
+    "request_headers": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "request_body": {},
+    "response_status": {
+      "type": "number"
+    },
+    "response_headers": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "response_body": {},
+    "service": {
+      "type": "string",
+      "description": "Standard network_http event fields"
+    },
+    "direction": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "code": {
+      "type": "number"
+    },
+    "header": {
+      "type": "string"
+    },
+    "body": {
+      "type": "string"
+    },
+    "content_truncated": {
+      "type": "boolean",
+      "description": "载荷是否被截断。true 时 content_length 仍是原始长度。"
+    },
+    "local_ip": {
+      "type": "string",
+      "description": "Network event five-tuple per network.json."
+    },
+    "local_port": {
+      "type": "number"
+    },
+    "remote_ip": {
+      "type": "string"
+    },
+    "remote_port": {
+      "type": "number"
+    },
+    "src_ip": {
+      "type": "string",
+      "description": "Legacy fields from older runtime hooks — accept but prefer the five-tuple."
+    },
+    "dst_ip": {
+      "type": "string"
+    },
+    "src_port": {
+      "type": "number"
+    },
+    "dst_port": {
+      "type": "number"
+    },
+    "domain_name": {
+      "type": "string"
+    },
+    "dns_query_type": {
+      "type": "string"
+    },
+    "dns_response_code": {
+      "type": "string"
+    },
+    "resolved_ips": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "token_usage_prompt": {
+      "type": "number"
+    },
+    "token_usage_completion": {
+      "type": "number"
+    },
+    "token_usage_total": {
+      "type": "number"
+    },
+    "latency_ms": {
+      "type": "number"
+    },
+    "tls_version": {
+      "type": "string"
+    },
+    "sni": {
+      "type": "string"
+    },
+    "packets": {
+      "type": "number"
+    },
+    "bytes": {
+      "type": "number"
+    },
+    "flow_action": {
+      "type": "string"
+    },
+    "flow_start": {
+      "type": "number"
+    },
+    "flow_end": {
+      "type": "number"
+    },
+    "ppid": {
+      "type": "number",
+      "description": "System layer fields (reserved for system-collector expansion)"
+    },
+    "pgid": {
+      "type": "number"
+    },
+    "sid": {
+      "type": "number"
+    },
+    "process_name": {
+      "type": "string"
+    },
+    "cmdline": {
+      "type": "string",
+      "description": "Full command line as a single string. Replaces the deprecated `command_line` and `argv` fields (process.json)."
+    },
+    "exe_path": {
+      "type": "string"
+    },
+    "exe": {
+      "type": "string"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "username": {
+      "type": "string"
+    },
+    "uid": {
+      "type": "number"
+    },
+    "gid": {
+      "type": "number"
+    },
+    "euid": {
+      "type": "number"
+    },
+    "create_time": {
+      "type": "number"
+    },
+    "process_status": {
+      "type": "string"
+    },
+    "open_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "fd": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "connections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "local_addr": {
+            "type": "string"
+          },
+          "remote_addr": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "child_pids": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
+    },
+    "cpu_percent": {
+      "type": "number"
+    },
+    "memory_rss": {
+      "type": "number"
+    },
+    "cgroup_path": {
+      "type": "string"
+    },
+    "cgroup_version": {
+      "type": "string",
+      "enum": [
+        "v1",
+        "v2"
+      ]
+    },
+    "memory_current": {
+      "type": "number"
+    },
+    "memory_max": {
+      "type": "number"
+    },
+    "cpu_usage_usec": {
+      "type": "number"
+    },
+    "cpu": {
+      "type": "object",
+      "properties": {
+        "usage_nanos": {
+          "type": "number"
+        },
+        "user_nanos": {
+          "type": "number"
+        },
+        "system_nanos": {
+          "type": "number"
+        },
+        "cfs_period_us": {
+          "type": "number"
+        },
+        "cfs_quota_us": {
+          "type": "number"
+        },
+        "usage_percent": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true,
+      "description": "Cgroup snapshot fields"
+    },
+    "memory": {
+      "type": "object",
+      "properties": {
+        "current_bytes": {
+          "type": "number"
+        },
+        "limit_bytes": {
+          "type": "number"
+        },
+        "rss_bytes": {
+          "type": "number"
+        },
+        "swap_bytes": {
+          "type": "number"
+        },
+        "usage_percent": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "blkio": {
+      "type": "object",
+      "properties": {
+        "read_bytes": {
+          "type": "number"
+        },
+        "write_bytes": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "pids": {
+      "type": "object",
+      "properties": {
+        "current": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "anomaly_type": {
+      "type": "string",
+      "description": "Cgroup anomaly fields"
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "description": {
+      "type": "string"
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "current": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "file_event_path": {
+      "type": "string"
+    },
+    "file_event_type": {
+      "type": "string"
+    },
+    "file_event_mask": {
+      "type": "string"
+    },
+    "audit_syscall": {
+      "type": "number"
+    },
+    "audit_syscall_name": {
+      "type": "string"
+    },
+    "audit_arch": {
+      "type": "string"
+    },
+    "audit_key": {
+      "type": "string"
+    },
+    "audit_a0": {
+      "type": "string"
+    },
+    "audit_success": {
+      "type": "boolean"
+    },
+    "docker_event_type": {
+      "type": "string"
+    },
+    "docker_container_id": {
+      "type": "string"
+    },
+    "asset_id": {
+      "type": "string",
+      "description": "Stable asset identifier derived from host_id + asset_type + path."
+    },
+    "asset_type": {
+      "type": "string"
+    },
+    "asset_path": {
+      "type": "string"
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "SHA-256 of the normalized plaintext content (computed before obfuscation)."
+    },
+    "prev_hash": {
+      "type": "string",
+      "description": "Previous content hash, carried on changed/removed events."
+    },
+    "parsed": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Structured asset summary; sensitive values are obf:v1 envelopes."
+    },
+    "asset_package_hash": {
+      "type": "string",
+      "description": "资产包（zip）内容寻址 sha256。包体原文在 <ndjsonDir>/asset-blobs/<hash>，事件不再内嵌 asset_package。"
+    },
+    "file_size": {
+      "type": "number"
+    },
+    "file_mtime": {
+      "type": "number"
+    }
+  },
+  "additionalProperties": true
+}

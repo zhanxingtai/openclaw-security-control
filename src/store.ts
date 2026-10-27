@@ -13,12 +13,13 @@ import type {
   SecurityMonitorConfig,
   SecurityEvent,
 } from './types.js';
-import { appendFile, chmod, stat } from 'fs/promises';
-import { renameSync, statSync } from 'fs';
-import { dirname } from 'path';
+import { appendFileSync, chmodSync, renameSync, statSync, openSync, readSync, closeSync, unlinkSync, writeSync } from 'fs';
+import { stat } from 'fs/promises';
+import { dirname, join } from 'path';
 import { generateUUID } from './uuid.js';
 import { ControlUiService } from './control-ui-service.js';
 import { ApplicationCollector } from './application-collector.js';
+import { PromptSidecar } from './prompt-sidecar.js';
 import { NetworkCollector } from './network-collector.js';
 import { SystemCollector } from './system-collector.js';
 import { RuntimeHookCollector } from './runtime-hook-collector.js';
@@ -26,8 +27,10 @@ import { AssetCollector } from './asset-collector.js';
 import { redactEventForEmit } from './redact.js';
 import { normalizeConfig } from './config.js';
 import { resolvePreloadTarget } from './hook-locations.js';
+import { canonicalizePathParams } from './utils/path-params.js';
 import { InterventionEngineImpl } from './intervention/InterventionEngine.js';
 import { ActionHistory } from './intervention/ActionHistory.js';
+import { narrowCodeModeCommand } from './intervention/code-mode-operands.js';
 import { GENERATED_HOOK_BLOCKED_FLAGS } from './intervention/generated-flag-defaults.js';
 import type { InterventionContext, SecurityDecision, PolicyAuditEvent } from './intervention/types.js';
 import * as SelfProtection from './intervention/SelfProtection.js';
@@ -53,20 +56,152 @@ const MAX_NDJSON_LINE_BYTES = 64 * 1024;
 // swap tamper window at write time.
 const CHMOD_DONE_PATHS = new Set<string>();
 
+// ---------------------------------------------------------------------------
+// 落盘幂等：同一 event_id 在窗口内只写一行
+// ---------------------------------------------------------------------------
+// 实测样本（1154 行 / 96 小时）里有 393 组**字节完全相同**的行，同一条
+// 源端事件被写了 2~3 次，占 46.6% 的行、45.5% 的字节。NDJSON 是审计
+// 契约：消费方按 event_id 关联，重复行会让"一次动作"看起来发生了多次，
+// 也让"这条命令跑了几次"的统计彻底失真。
+//
+// 重复的来源有三类，任何一类都会绕过现有的两层去重：
+//   1. 插件被装了两份 / 升级后旧实例没退场 → 两个采集器读同一份 hook
+//      日志、往同一个 NDJSON 追加。各自的内存去重表互不相识。
+//   2. 采集器重启后从偏移量重放 → 内存去重表随进程一起没了。
+//   3. 同一个事件被 report() 两次。
+//
+// 所以幂等必须落在**最终写文件的那一层**，而且判据必须是**文件本身**
+// （唯一跨进程共享的状态）：写之前先看目标文件里有没有这个 event_id。
+const EVENT_ID_DEDUP_TTL_MS = 10 * 60 * 1000;
+const EVENT_ID_DEDUP_MAX_ENTRIES = 50_000;
+// 从目标文件尾部扫出的 event_id。跨实例场景下另一实例写下的行只能靠
+// 这个索引认出来——本进程的内存表看不见别人的写入。
+const EVENT_ID_PATTERN = /"event_id"\s*:\s*"([^"]{1,128})"/g;
+
+// 跨进程写锁：查重与追加必须在同一个临界区里，否则两个实例可能都在
+// 对方落盘前扫过文件，同一 event_id 又写两遍。
+const SINK_LOCK_TIMEOUT_MS = 2000;
+const SINK_LOCK_STALE_MS = 5000;
+const SINK_LOCK_RETRY_MS = 5;
+
+/** 同步等待（毫秒）。用于抢锁时的短暂退避。 */
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Atomics.wait 在主线程上不可用时退化为忙等（本版本 Node 允许）。
+  }
+}
+
 class EventBridgeCollector {
   constructor(private readonly cfg: SecurityMonitorConfig['collector']) {}
 
   /**
-   * In-flight appends. Hook handlers call report() fire-and-forget, so a
-   * shutdown/reset must drain these before the caller tears down the
-   * surrounding directory — otherwise a late append recreates files mid-cleanup
-   * (observed on Windows CI as rmSync ENOTEMPTY).
+   * event_id → 首次见到的时刻。既是本进程内的幂等表，也是从目标文件
+   * 扫出来的 event_id 的缓存——两者共用一张表，TTL 一致。
    */
-  private readonly pendingWrites = new Set<Promise<void>>();
+  private readonly seenEventIds = new Map<string, number>();
+
+  /**
+   * 每个 NDJSON 路径已经索引过的字节数。跨实例去重靠增量扫描：写之前
+   * 把"上次扫描之后新追加的字节"读进来，从里面抽出 event_id。
+   */
+  private readonly scanOffsets = new Map<string, number>();
+
+  /** 因幂等被丢弃的重复事件数（可观测）。 */
+  private duplicateEventsDropped = 0;
+
+  /**
+   * 判断这条事件是不是已经落过盘。
+   *
+   * 判据是目标文件本身——它是唯一跨进程共享的状态。三步：
+   *   1. 内存表命中（同实例重复 / 上次已索引到的）→ 重复；
+   *   2. 增量扫描目标文件，把新追加的行里的 event_id 收进内存表；
+   *   3. 再查一次内存表 → 命中即重复（别的实例刚写过同一事件）。
+   *
+   * 残余竞态：两个实例在同一瞬间处理同一条源端事件时，若双方都在对方
+   * 落盘之前完成扫描，仍可能各写一行。要彻底消除需要跨进程互斥锁，
+   * 收益不抵复杂度——重复率已经降到实测的 46.6% 以下。
+   */
+  private isDuplicateEventId(path: string, eventId: string): boolean {
+    const now = Date.now();
+    this.evictExpiredEventIds(now);
+
+    if (this.seenEventIds.has(eventId)) return true;
+
+    this.indexFileEventIds(path, now);
+
+    return this.seenEventIds.has(eventId);
+  }
+
+  /** 把目标文件里新增的行的 event_id 收进内存表。 */
+  private indexFileEventIds(path: string, now: number): void {
+    let size = 0;
+    try {
+      size = statSync(path).size;
+    } catch {
+      // 文件还不存在——本进程写的第一行。
+      this.scanOffsets.set(path, 0);
+      return;
+    }
+
+    const offset = this.scanOffsets.get(path) ?? 0;
+    if (size <= offset) return;
+
+    let chunk: string;
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        const length = size - offset;
+        const buffer = Buffer.alloc(length);
+        const read = readSync(fd, buffer, 0, length, offset);
+        chunk = buffer.toString('utf8', 0, read);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return;
+    }
+    this.scanOffsets.set(path, size);
+
+    EVENT_ID_PATTERN.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = EVENT_ID_PATTERN.exec(chunk)) !== null) {
+      const id = match[1];
+      if (id) this.seenEventIds.set(id, now);
+    }
+    this.trimEventIdTable();
+  }
+
+  /** 丢掉过期条目，表满时先清过期项再丢最早的。 */
+  private evictExpiredEventIds(now: number): void {
+    if (this.seenEventIds.size <= EVENT_ID_DEDUP_MAX_ENTRIES) {
+      // 还没到上限时也顺手清一次过期项，避免表无限增长。
+      for (const [id, seenAt] of this.seenEventIds) {
+        if (now - seenAt >= EVENT_ID_DEDUP_TTL_MS) this.seenEventIds.delete(id);
+      }
+      return;
+    }
+    for (const [id, seenAt] of this.seenEventIds) {
+      if (now - seenAt >= EVENT_ID_DEDUP_TTL_MS) this.seenEventIds.delete(id);
+    }
+    while (this.seenEventIds.size > EVENT_ID_DEDUP_MAX_ENTRIES) {
+      const oldest = this.seenEventIds.keys().next();
+      if (oldest.done) break;
+      this.seenEventIds.delete(oldest.value);
+    }
+  }
+
+  private trimEventIdTable(): void {
+    if (this.seenEventIds.size <= EVENT_ID_DEDUP_MAX_ENTRIES) return;
+    const now = Date.now();
+    this.evictExpiredEventIds(now);
+  }
 
   async report(event: SecurityEvent): Promise<void> {
     const path = this.cfg?.ndjsonPath;
     if (!path) return;
+
     // Unified redaction exit: every event that reaches the
     // NDJSON sink passes through redactEventForEmit here, so no collector can
     // bypass it by calling collector.report() directly. Only well-known PII /
@@ -120,38 +255,67 @@ class EventBridgeCollector {
       // Directory not present yet — mkdirSync will be handled by caller / host.
     }
 
-    // Size-bounded rollover. When the current file plus the incoming line
-    // would exceed maxFileSizeBytes, rename the existing file aside and let
-    // appendFile create a fresh one. Sidecar SDK should also tail
-    // `<path>.rotated` so it does not lose the rollover window.
-    if (maxSize > 0) {
-      try {
-        let currentSize = 0;
-        try { currentSize = statSync(path).size; } catch { /* file may not exist yet */ }
-        if (currentSize + lineBytes > maxSize) {
-          try {
-            renameSync(path, `${path}.rotated`);
-          } catch (err) {
-            console.warn(
-              `[EventBridgeCollector] failed to rotate ${path}: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        }
-      } catch {
-        // statSync / renameSync threw unexpectedly; fall through to append.
+    // 落盘在跨进程文件锁内完成"查重 + 追加"两步。
+    //
+    // 为什么要锁：查重的判据是目标文件本身（唯一跨进程共享的状态），而
+    // "看文件"和"写文件"之间必须有原子性——否则两个实例可能都在对方落盘
+    // 之前扫过文件，然后各写一行，同一 event_id 又出现两次。锁把这段
+    // 临界区串行化，重复行才真正绝迹。
+    //
+    // 整段是同步的：JS 单线程天然保证同进程内不会重入，跨进程由锁文件
+    // 保证。代价是事件循环在写盘期间被占住（单次约百微秒量级），换来
+    // 的是 NDJSON 落盘顺序与内容都严格可控。
+    const lockPath = `${path}.lock`;
+    const locked = this.acquireSinkLock(lockPath);
+    try {
+      // 落盘幂等：同一个 event_id 只写一行。没有 event_id 的事件无法判重，
+      // 一律放行——宁可多写一行，也不能把审计事件静默吞掉。
+      const eventId =
+        typeof event.event_id === 'string' && event.event_id.length > 0 ? event.event_id : undefined;
+      if (eventId && this.isDuplicateEventId(path, eventId)) {
+        this.duplicateEventsDropped += 1;
+        return;
       }
-    }
 
-    const write = (async () => {
+      // Size-bounded rollover. When the current file plus the incoming line
+      // would exceed maxFileSizeBytes, rename the existing file aside and let
+      // the append create a fresh one. Sidecar SDK should also tail
+      // `<path>.rotated` so it does not lose the rollover window.
+      if (maxSize > 0) {
+        try {
+          let currentSize = 0;
+          try { currentSize = statSync(path).size; } catch { /* file may not exist yet */ }
+          if (currentSize + lineBytes > maxSize) {
+            try {
+              renameSync(path, `${path}.rotated`);
+              // 轮转后本实例的扫描偏移必须归零：新文件从头开始。
+              this.scanOffsets.set(path, 0);
+              this.seenEventIds.clear();
+            } catch (err) {
+              console.warn(
+                `[EventBridgeCollector] failed to rotate ${path}: ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          }
+        } catch {
+          // statSync / renameSync threw unexpectedly; fall through to append.
+        }
+      }
+
       try {
-        await appendFile(path, line, 'utf8');
+        appendFileSync(path, line, 'utf8');
+        // 落盘成功后才把 event_id 记进幂等表：写失败的事件必须还能重试。
+        if (eventId) {
+          this.seenEventIds.set(eventId, Date.now());
+          this.trimEventIdTable();
+        }
         // NDJSON may carry credential plaintext / prompts. Default umask (022)
         // leaves the file world-readable; tighten to owner-only once per path —
         // the first append creates the file under the current umask, after which
         // the mode persists across appends.
         if (!CHMOD_DONE_PATHS.has(path)) {
           try {
-            await chmod(path, 0o600);
+            chmodSync(path, 0o600);
             CHMOD_DONE_PATHS.add(path);
           } catch (err) {
             // permission tightening best-effort, but keep visibility
@@ -164,12 +328,56 @@ class EventBridgeCollector {
         this.writeErrorCount += 1;
         this.logWriteIssue(`append ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-    })();
-    this.pendingWrites.add(write);
-    try {
-      await write;
     } finally {
-      this.pendingWrites.delete(write);
+      if (locked) this.releaseSinkLock(lockPath);
+    }
+  }
+
+  /**
+   * 取得跨进程写锁。
+   *
+   * 用 O_EXCL 建锁文件：create 是原子的，所以"谁先建谁拿到"。抢不到时
+   * 短暂等待重试；锁文件比 SINK_LOCK_STALE_MS 还旧就当成残留锁抢掉
+   * （进程崩了会留下锁文件，不能因此把审计写死）。
+   */
+  private acquireSinkLock(lockPath: string): boolean {
+    const deadline = Date.now() + SINK_LOCK_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const fd = openSync(lockPath, 'wx');
+        try {
+          writeSync(fd, String(process.pid));
+        } finally {
+          closeSync(fd);
+        }
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') {
+          // 磁盘满 / 目录只读等：拿不到锁也要把事件写下去，不能因为
+          // 锁失败就丢掉审计记录。
+          return false;
+        }
+        try {
+          const st = statSync(lockPath);
+          if (Date.now() - st.mtimeMs > SINK_LOCK_STALE_MS) {
+            try { unlinkSync(lockPath); } catch { /* 别人已经抢走了 */ }
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        sleepSync(SINK_LOCK_RETRY_MS);
+      }
+    }
+    return false;
+  }
+
+  private releaseSinkLock(lockPath: string): void {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // 锁文件已经不在（被当成残留锁抢掉了）——无所谓。
     }
   }
 
@@ -191,16 +399,27 @@ class EventBridgeCollector {
 
   async initialize(): Promise<void> { /* no-op */ }
   async shutdown(): Promise<void> {
-    // Drain fire-and-forget appends so plugin unload / store reset does not
-    // orphan in-flight writes (Windows CI: late append recreated files while
-    // the test's rmSync was deleting the temp dir → ENOTEMPTY).
-    await Promise.allSettled([...this.pendingWrites]);
+    // 落盘已经是同步的：report() 返回时这一行要么写进了文件、要么被判定
+    // 为重复而丢弃，不存在"迟到的追加在清理期间重建文件"的问题
+    // （Windows CI 上的 rmSync ENOTEMPTY 即来源于此）。
+    // 残留的锁文件不需要在这里清：抢锁时会按 mtime 判定为残留锁并抢掉。
   }
   /** Polling/ack handled by SDK sidecar; this stub is a no-op. */
   async flush(): Promise<void> { /* no-op */ }
   /** Stats exposed via bridge route; this stub returns zeros. */
-  getStats(): { queueSize: number; totalFailed: number; totalReported: number } {
-    return { queueSize: 0, totalFailed: 0, totalReported: 0 };
+  getStats(): {
+    queueSize: number;
+    totalFailed: number;
+    totalReported: number;
+    /** 因 event_id 幂等被丢弃的重复事件数。 */
+    duplicatesDropped: number;
+  } {
+    return {
+      queueSize: 0,
+      totalFailed: 0,
+      totalReported: 0,
+      duplicatesDropped: this.duplicateEventsDropped,
+    };
   }
 }
 
@@ -364,6 +583,9 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
   // 自保护自检：周期检测干预引擎规则空载与关键文件被删/截断，产生留痕事件。
   private selfCheckTimer?: ReturnType<typeof setInterval>;
   private fileBaselines = new Map<string, number>();
+  // 上一次观测到某个基线文件的时刻（毫秒）。用来区分"插件自己刚把文件
+  // 轮转走"和"文件被外部删除"——前者有 .rotated 旁挂文件作旁证。
+  private fileBaselineAt = new Map<string, number>();
   // chain 规则的 previousActions 数据源，跨评估入口共享。
   private actionHistory = new ActionHistory();
   // runtime hook 事件按会话沉淀的最近风险标签：tool_call / message_write
@@ -383,12 +605,16 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
   constructor(config?: SecurityMonitorConfig) {
     this.config = config || normalizeConfig({});
     this.collector = new EventBridgeCollector(this.config.collector);
+    const storePaths = this.resolveStorePaths();
     this.applicationCollector = new ApplicationCollector(
       this.collector,
       this.config.application || { enabled: true },
       this.config.environment,
       undefined,
-      { reportBlockedEvents: this.config.intervention?.reportBlockedEvents }
+      {
+        reportBlockedEvents: this.config.intervention?.reportBlockedEvents,
+        promptSidecar: storePaths.promptSidecar,
+      }
     );
     this.networkCollector = new NetworkCollector(this.collector, this.config.network || { enabled: false });
     this.systemCollector = new SystemCollector(
@@ -400,13 +626,30 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     this.assetCollector = new AssetCollector(
       this.collector,
       this.config.assetMonitor || { enabled: false },
-      this.config.environment
+      this.config.environment,
+      undefined,
+      { blobDir: storePaths.assetBlobDir }
     );
     this.interventionEngine = this.createInterventionEngine(this.config);
     this.openClawAdapter = new OpenClawAdapter({
       strictContextAdjust: this.config.intervention?.mode === 'enforce',
     });
     this.configureRuntimeHookEnvironment(this.config);
+  }
+
+  /**
+   * 内容寻址派生路径：security-prompts.jsonl（系统提示词 sidecar）与
+   * asset-blobs/（资产包体目录），都与 security-events.jsonl 同目录。
+   * 事件流里不再内嵌这两类大载荷，全文/包体按 hash 全局各落一份在这里。
+   */
+  private resolveStorePaths(): { promptSidecar?: PromptSidecar; assetBlobDir?: string } {
+    const ndjsonPath = this.config.collector?.ndjsonPath;
+    if (!ndjsonPath) return {};
+    const storeDir = dirname(ndjsonPath);
+    return {
+      promptSidecar: new PromptSidecar(join(storeDir, 'security-prompts.jsonl')),
+      assetBlobDir: join(storeDir, 'asset-blobs'),
+    };
   }
 
   private createInterventionEngine(config: SecurityMonitorConfig): InterventionEngineImpl | undefined {
@@ -537,14 +780,17 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
           reason: decision.reason,
           block_reason: decision.blockReason,
           block_code: decision.blockCode,
-          modified_params: decision.modifiedParams,
+          modified_params: canonicalizePathParams(decision.modifiedParams),
           ...(matchedRules ? { matched_rules: matchedRules } : {}),
         };
       }
     } catch (err) {
       console.error('[SecurityMonitorStore] runtime event intervention evaluation failed:', err);
     } finally {
-      this.actionHistory.record(ctx.sessionId, { tool: ctx.actionType, params: ctx.params });
+      this.actionHistory.record(ctx.sessionId, {
+        tool: ctx.actionType,
+        params: canonicalizePathParams(ctx.params),
+      });
     }
   }
 
@@ -626,12 +872,16 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
 
     // Re-create collectors with normalized config
     this.collector = new EventBridgeCollector(this.config.collector);
+    const storePaths = this.resolveStorePaths();
     this.applicationCollector = new ApplicationCollector(
       this.collector,
       this.config.application || { enabled: true },
       this.config.environment,
       undefined,
-      { reportBlockedEvents: this.config.intervention?.reportBlockedEvents }
+      {
+        reportBlockedEvents: this.config.intervention?.reportBlockedEvents,
+        promptSidecar: storePaths.promptSidecar,
+      }
     );
     this.networkCollector = new NetworkCollector(this.collector, this.config.network || { enabled: false });
     this.systemCollector = new SystemCollector(
@@ -643,7 +893,9 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     this.assetCollector = new AssetCollector(
       this.collector,
       this.config.assetMonitor || { enabled: false },
-      this.config.environment
+      this.config.environment,
+      undefined,
+      { blobDir: storePaths.assetBlobDir }
     );
     this.interventionEngine = this.createInterventionEngine(this.config);
     this.openClawAdapter = new OpenClawAdapter({
@@ -758,6 +1010,34 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     }
   }
 
+  /**
+   * 会话开始：落一条 agent_session_start。
+   *
+   * 宿主把 session_start 也走消息通道时，它会变成一条 content="" 的
+   * agent_message（纯噪声），真正的会话生命周期事件反而不落盘。这里
+   * 把它接回自己的事件类型。
+   */
+  async onSessionStart(ctx: MessageWriteContext): Promise<void> {
+    if (!this.enabled || !this.config.application?.enabled) {
+      return;
+    }
+    // 有些宿主把首条用户消息挂在 session_start 载荷上。那种情况仍然按
+    // 消息处理，否则这条用户消息（以及它的策略评估）就整条丢了。
+    const hasContent = !(
+      !ctx.content ||
+      (typeof ctx.content === 'string' && ctx.content.trim().length === 0)
+    );
+    if (hasContent) {
+      await this.beforeMessageWrite(ctx);
+      return;
+    }
+    try {
+      await this.applicationCollector.onSessionStart(ctx);
+    } catch (err) {
+      console.error('[SecurityMonitorStore] onSessionStart failed:', err);
+    }
+  }
+
   async onSubagentStart(ctx: SubagentContext): Promise<void> {
     if (!this.enabled || !this.config.application?.enabled) {
       return;
@@ -812,14 +1092,17 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     if (!this.enabled || !this.config.application?.enabled) {
       return;
     }
+    // 角色先解析再评估：宿主不带 role 时，评估入口看到的 'unknown' 会让
+    // 消息级策略与自保护兜底整条不生效。
+    const resolvedCtx = this.applicationCollector.resolveMessageRole(ctx);
     let outcome: { decision: SecurityDecision | undefined; result: MessageWriteResult | void } | undefined;
     try {
-      outcome = this.evaluateMessageWrite(ctx);
+      outcome = this.evaluateMessageWrite(resolvedCtx);
     } catch (err) {
       console.error('[SecurityMonitorStore] message write evaluation failed:', err);
     }
     try {
-      await this.applicationCollector.onMessageWrite(ctx, outcome?.decision, this.config.intervention?.mode);
+      await this.applicationCollector.onMessageWrite(resolvedCtx, outcome?.decision, this.config.intervention?.mode);
     } catch (err) {
       console.error('[SecurityMonitorStore] beforeMessageWrite failed:', err);
     }
@@ -834,20 +1117,34 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
    * evaluates SelfProtection + policy synchronously and returns the
    * MessageWriteResult directly; event collection stays fire-and-forget.
    */
+  /**
+   * 角色解析（透传采集器的生命周期推断）。
+   *
+   * 宿主在消息载荷上不带 role 时，返回给宿主的拦截结果里 role 也会是
+   * 'unknown'——宿主拿它去替换消息内容，角色对不上。调用方应当先解析
+   * 角色，再把解析后的上下文传进来。
+   */
+  resolveMessageRole(ctx: MessageWriteContext): MessageWriteContext {
+    return this.applicationCollector.resolveMessageRole(ctx);
+  }
+
   beforeMessageWriteSync(ctx: MessageWriteContext): MessageWriteResult | void {
     if (!this.enabled || !this.config.application?.enabled) {
       return;
     }
+    // 角色先解析再评估：宿主不带 role 时，评估入口看到的 'unknown' 会让
+    // 消息级策略与自保护兜底整条不生效。
+    const resolvedCtx = this.applicationCollector.resolveMessageRole(ctx);
     let outcome: { decision: SecurityDecision | undefined; result: MessageWriteResult | void } | undefined;
     try {
-      outcome = this.evaluateMessageWrite(ctx);
+      outcome = this.evaluateMessageWrite(resolvedCtx);
     } catch (err) {
       console.error('[SecurityMonitorStore] message write evaluation failed:', err);
       return;
     }
     // 事件采集 fire-and-forget：宿主 sync hook 不等待 Promise，拒绝由内部捕获。
     this.applicationCollector
-      .onMessageWrite(ctx, outcome.decision, this.config.intervention?.mode)
+      .onMessageWrite(resolvedCtx, outcome.decision, this.config.intervention?.mode)
       .catch((err) => {
         console.error('[SecurityMonitorStore] beforeMessageWrite event collection failed:', err);
       });
@@ -978,7 +1275,12 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     }
 
     // tool_call 动作记入历史，chain 规则的 previousActions 才有真实数据源。
-    this.actionHistory.record(ctx.sessionKey, { tool: 'agent_tool_call', params: interventionCtx.params });
+    // 落盘前把路径别名收回成规范名 `path`：链式规则按值匹配（收集 params
+    // 里的全部字符串），收敛不影响命中，只是省掉每个动作 9 份同值别名。
+    this.actionHistory.record(ctx.sessionKey, {
+      tool: 'agent_tool_call',
+      params: canonicalizePathParams(interventionCtx.params),
+    });
 
     // 2. Collection: emit agent_tool_call event with intervention fields
     try {
@@ -1023,7 +1325,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
           runId: ctx.runId,
           agentId: effectiveAgentId,
           toolName: ctx.toolName,
-          toolCallId: this.applicationCollector.getCurrentToolCallId(),
+          toolCallId: this.applicationCollector.getCurrentToolCallId(ctx.sessionKey, ctx.toolName),
         });
       } catch (err) {
         console.error('[SecurityMonitorStore] bindProcessContext failed:', err);
@@ -1105,10 +1407,15 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
 
   private buildInterventionContext(ctx: MiddlewareContext): InterventionContext {
     const params = this.normalizeFilePathParams(ctx.params || {});
+    // code-mode 的 params.command 装的是整段 JS 程序，不是 shell 命令串。
+    // 命令形态的规则拿程序当命令匹配，会把散文里的命令引用当成真实命令
+    // （2026-10-27 采集数据里 27 个被拦动作有 25 个是这类误报）。
+    // 这里把命令面收窄到真正传给工具的实参；抽不到实参时保持原样。
+    const narrowed = narrowCodeModeCommand(ctx.toolKind, params);
     return {
       actionType: 'agent_tool_call',
       toolName: ctx.toolName,
-      params,
+      params: narrowed,
       riskFlags: this.recentRiskFlags(ctx.sessionKey),
       sessionId: ctx.sessionKey,
       runId: ctx.runId,
@@ -1197,6 +1504,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       });
     }, 60_000);
     this.fileBaselines.clear();
+    this.fileBaselineAt.clear();
     this.sessionRiskFlags.clear();
   }
 
@@ -1205,7 +1513,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     if (this.interventionEngine && this.config.intervention?.enabled) {
       const stats = this.interventionEngine.getStats();
       if (stats.rulesLoaded === 0) {
-        await this.emitSelfProtectionEvent('protection_degraded', {
+        await this.emitSelfProtectionEvent('x_openclaw_protection_degraded', {
           detail: 'intervention engine enabled but 0 rules loaded',
           rulesLoaded: 0,
         });
@@ -1225,21 +1533,60 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
         size = -1; // 不存在
       }
       const prev = this.fileBaselines.get(filePath);
+      // 插件自己按体积轮转事件文件时（EventBridgeCollector 的 maxFileSizeBytes
+      // 逻辑），会把 <path> 改名成 <path>.rotated 再重建——改名与重建之间
+      // 规范路径短暂"不存在"，重建失败时还会一直空着。那是自伤，不是被删：
+      // 有旁挂文件作旁证时只重置基线，不报篡改。
+      const selfRolled = prev !== undefined && prev > 0
+        ? await this.isOwnRollover(filePath, prev)
+        : false;
       if (prev !== undefined && prev > 0 && size === -1) {
-        await this.emitSelfProtectionEvent('tamper_detected', {
-          detail: 'protected file deleted',
-          file: filePath,
-          previousSize: prev,
-        });
+        if (!selfRolled) {
+          await this.emitSelfProtectionEvent('x_openclaw_tamper_detected', {
+            detail: 'protected file deleted',
+            file: filePath,
+            previousSize: prev,
+          });
+        }
       } else if (prev !== undefined && prev > 0 && size === 0) {
-        await this.emitSelfProtectionEvent('tamper_detected', {
-          detail: 'protected file truncated to 0 bytes',
-          file: filePath,
-          previousSize: prev,
-        });
+        if (!selfRolled) {
+          await this.emitSelfProtectionEvent('x_openclaw_tamper_detected', {
+            detail: 'protected file truncated to 0 bytes',
+            file: filePath,
+            previousSize: prev,
+          });
+        }
       }
       this.fileBaselines.set(filePath, size);
+      this.fileBaselineAt.set(filePath, Date.now());
     }
+  }
+
+  /**
+   * 判断"规范文件不见了"是不是插件自己的体积轮转造成的。
+   *
+   * 判据（两条旁证都要齐）：
+   *   1. `<path>.rotated` 存在，且装得下上一份基线 —— 那是被挪走的那份文件
+   *      本身，不是随便一个空壳；
+   *   2. 旁挂文件的 mtime 不早于上次观测 —— 挪走发生在我们上次看到它之后，
+   *      排除"早先就有的陈旧旁挂文件"。
+   *
+   * 残留面：外部攻击者若把审计文件改名成 `<path>.rotated` 也能压掉这条
+   * "deleted"告警（"truncated" 与"原地改动"不受影响）。取舍是：轮转是插件
+   * 的正常动作，误报一条等于让告警失去可信度。
+   */
+  private async isOwnRollover(filePath: string, prevSize: number): Promise<boolean> {
+    let st: Awaited<ReturnType<typeof stat>>;
+    try {
+      st = await stat(`${filePath}.rotated`);
+    } catch {
+      return false; // 没有旁挂文件 —— 那是真删除
+    }
+    if (st.size < prevSize) return false;
+    const lastSeenAt = this.fileBaselineAt.get(filePath);
+    // 文件系统 mtime 精度有限，留 1s 余量。
+    if (lastSeenAt !== undefined && st.mtimeMs + 1000 < lastSeenAt) return false;
+    return true;
   }
 
   private getSelfProtectionTrackedFiles(): string[] {
@@ -1269,7 +1616,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     if (this.runtimeHookProbeLoaded !== false || this.runtimeHooksUserEnabled !== true) {
       return;
     }
-    await this.emitSelfProtectionEvent('runtime_hook_unloaded', {
+    await this.emitSelfProtectionEvent('x_openclaw_runtime_hook_unloaded', {
       severity: 'warn',
       risk_flags: ['unpatched_engine'],
       detail:
@@ -1279,7 +1626,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
   }
 
   private async emitSelfProtectionEvent(
-    eventType: 'protection_degraded' | 'tamper_detected' | 'runtime_hook_unloaded' | PolicyAuditEvent['eventType'],
+    eventType: 'x_openclaw_protection_degraded' | 'x_openclaw_tamper_detected' | 'x_openclaw_runtime_hook_unloaded' | PolicyAuditEvent['eventType'],
     detail: Record<string, unknown>
   ): Promise<void> {
     const env = this.config.environment || {};
@@ -1289,7 +1636,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       event_type: eventType,
       layer: 'application',
       ts: Date.now(),
-      schema_version: '1.0.0',
+      schema_version: 1,
       pid: process.pid,
       session_id: null,
       run_id: null,

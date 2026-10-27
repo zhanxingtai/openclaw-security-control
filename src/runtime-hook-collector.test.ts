@@ -98,6 +98,166 @@ describe('RuntimeHookCollector', () => {
     expect(reported[0].tool_call_id).toBe('call-1');
   });
 
+  it('keeps the source event id and source timestamp instead of regenerating them', async () => {
+    await runtimeCollector.initialize();
+    const sourceTs = '2026-10-20T08:00:00.000Z';
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'process_start',
+        type: 'application.process_start',
+        id: 'src-uuid-1',
+        event_id: 'src-uuid-1',
+        ts: sourceTs,
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: 'ls -la',
+        executable: 'ls',
+        pid: 4321,
+        ppid: 1,
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    // The source id is the event's stable identity: it is what makes a
+    // replayed sidecar line de-duplicable, and what lets an auditor trace
+    // the event back to the runtime hook that produced it.
+    expect(reported[0].event_id).toBe('src-uuid-1');
+    // The source timestamp is when the command actually ran — falling back
+    // to "now" would silently rewrite the audit timeline.
+    expect(reported[0].ts).toBe(Date.parse(sourceTs));
+  });
+
+  it('drops a replayed source event instead of writing it once per replay', async () => {
+    await runtimeCollector.initialize();
+    const line =
+      JSON.stringify({
+        event_type: 'process_start',
+        type: 'application.process_start',
+        id: 'src-uuid-replay',
+        event_id: 'src-uuid-replay',
+        ts: '2026-10-20T08:00:00.000Z',
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: '/usr/bin/lsof -nP -iTCP:18789',
+        executable: '/usr/bin/lsof',
+        pid: 368,
+        ppid: 8,
+      }) + '\n';
+    fs.appendFileSync(logFile, line, 'utf8');
+    fs.appendFileSync(logFile, line, 'utf8');
+    fs.appendFileSync(logFile, line, 'utf8');
+
+    await waitForReported(reported, 1);
+    await wait(400);
+
+    expect(reported).toHaveLength(1);
+    expect(runtimeCollector.getStats().eventsDeduplicated).toBe(2);
+  });
+
+  it('drops the same command repeated by the same call site inside the dedup window', async () => {
+    await runtimeCollector.initialize();
+    const base = {
+      event_type: 'process_start',
+      type: 'application.process_start',
+      ts: '2026-10-20T08:00:00.000Z',
+      runtime: 'node',
+      api: 'child_process.spawn',
+      command_line: '/usr/bin/lsof -nP -iTCP:18789',
+      executable: '/usr/bin/lsof',
+      pid: 368,
+      ppid: 8,
+      caller: { function: 'spawn', file: '/app/dist/spawn.js', line: 42, column: 7 },
+    };
+    // Distinct ids: only the command-window fingerprint can catch these.
+    fs.appendFileSync(logFile, JSON.stringify({ ...base, id: 'a', event_id: 'a' }) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify({ ...base, id: 'b', event_id: 'b' }) + '\n', 'utf8');
+
+    await waitForReported(reported, 1);
+    await wait(400);
+
+    expect(reported).toHaveLength(1);
+  });
+
+  it('keeps the same command when the call site differs', async () => {
+    await runtimeCollector.initialize();
+    const base = {
+      event_type: 'process_start',
+      type: 'application.process_start',
+      ts: '2026-10-20T08:00:00.000Z',
+      runtime: 'node',
+      api: 'child_process.spawn',
+      command_line: 'ls -la',
+      executable: 'ls',
+      pid: 368,
+      ppid: 8,
+    };
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        ...base,
+        id: 'c',
+        event_id: 'c',
+        caller: { function: 'spawn', file: '/app/dist/a.js', line: 1, column: 1 },
+      }) + '\n',
+      'utf8'
+    );
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        ...base,
+        id: 'd',
+        event_id: 'd',
+        caller: { function: 'spawn', file: '/app/dist/b.js', line: 2, column: 2 },
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 2);
+    await wait(400);
+
+    // Two different call sites are two different actions, not a duplicate.
+    expect(reported).toHaveLength(2);
+  });
+
+  it('normalizes empty-string context fields to null', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'process_start',
+        type: 'application.process_start',
+        id: 'src-empty-ctx',
+        ts: '2026-10-20T08:00:00.000Z',
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: 'ls -la',
+        executable: 'ls',
+        pid: 4321,
+        ppid: 1,
+        session_id: '',
+        run_id: '',
+        agent_id: '',
+        tool_call_id: '',
+        tool_name: '',
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    // "absent" must not be spelled three different ways ("", null, missing).
+    expect(reported[0].agent_id).toBeNull();
+    expect(reported[0].session_id).toBeNull();
+    expect(reported[0].run_id).toBeNull();
+    expect(reported[0].tool_call_id).toBeNull();
+    expect(reported[0].tool_name).toBeNull();
+  });
+
   it('filters command_execution events matching excludeCommandLines patterns', async () => {
     runtimeCollector = new RuntimeHookCollector(collector, {
       enabled: true,
@@ -406,8 +566,36 @@ describe('RuntimeHookCollector', () => {
     expect(reported[0].collector?.collector_name).toBe('runtime-hook-collector');
   });
 
-  it('forwards network_http events without legacy type field', async () => {
+  it('does not store the response body twice when it equals the canonical content', async () => {
     await runtimeCollector.initialize();
+    const body = '{"version":"2026.10.7"}';
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'network_http',
+        event_id: 'net-dup-1',
+        ts: 1784277722604,
+        method: 'GET',
+        url: '/api/latest-version',
+        host: 'telemetry.openclaw.ai',
+        content: body,
+        content_length: body.length,
+        body: '',
+        response_body: body,
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    // The response body is already the canonical content — carrying it in a
+    // second field doubles the payload for no information.
+    expect(reported[0].content).toBe(body);
+    expect(reported[0].response_body).toBeUndefined();
+  });
+
+  it('forwards network_http events without legacy type field', async () => {    await runtimeCollector.initialize();
     const event = {
       event_id: '34ac8d9a-89ae-4555-9eb5-9b06b33298c8',
       event_type: 'network_http',
@@ -681,5 +869,298 @@ describe('RuntimeHookCollector 评估队列背压', () => {
     expect(reported).toHaveLength(50);
     expect(evaluated).toHaveLength(50);
     expect(reported.every((e) => e.evaluation_skipped === undefined)).toBe(true);
+  });
+});
+
+/**
+ * 宿主内部只读探针的排除（1.1.0）。
+ *
+ * 两道闸门同时成立才排除：事件没有任何 agent 归属（调用方层）+ 命令行
+ * 逐字命中一条已知只读探针形态（命令模式层）。任一不成立都保留。
+ */
+describe('RuntimeHookCollector 宿主内部探针排除', () => {
+  let logFile: string;
+  let collector: { report: (event: SecurityEvent) => Promise<void>; shutdown: () => Promise<void> };
+  let runtimeCollector: RuntimeHookCollector;
+  let reported: SecurityEvent[];
+
+  function probeLine(overrides: Record<string, unknown> = {}): string {
+    return (
+      JSON.stringify({
+        event_type: 'process_start',
+        type: 'application.process_start',
+        id: `probe-${Math.random().toString(36).slice(2)}`,
+        ts: new Date().toISOString(),
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: '/usr/bin/lsof -nP -iTCP:18789 -sTCP:LISTEN -FpFcn',
+        executable: '/usr/bin/lsof',
+        pid: 2544,
+        ppid: 2209,
+        ...overrides,
+      }) + '\n'
+    );
+  }
+
+  function makeCollector(options: Record<string, unknown>) {
+    const sink: SecurityEvent[] = [];
+    const instance = new RuntimeHookCollector(
+      {
+        report: async (event: SecurityEvent) => {
+          sink.push(event);
+        },
+        shutdown: async () => {},
+      },
+      { enabled: true, logPath: logFile, ...options } as never
+    );
+    return { instance, sink };
+  }
+
+  beforeEach(() => {
+    reported = [];
+    logFile = path.join(os.tmpdir(), `openclaw-host-probe-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+    fs.writeFileSync(logFile, '', 'utf8');
+    collector = {
+      report: async (event: SecurityEvent) => {
+        reported.push(event);
+      },
+      shutdown: async () => {},
+    };
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+    } as never);
+  });
+
+  afterEach(async () => {
+    await runtimeCollector.shutdown();
+    for (const p of [logFile, `${logFile}.offset`]) {
+      try {
+        fs.unlinkSync(p);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  it('无 agent 归属的宿主探针被排除，且计数留痕', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(logFile, probeLine(), 'utf8');
+    await wait(500);
+
+    expect(reported).toHaveLength(0);
+    const stats = runtimeCollector.getStats();
+    expect(stats.eventsExcludedHostProbes).toBe(1);
+    expect(stats.hostInternalProbes).toEqual({ lsof_port_probe: 1 });
+  });
+
+  it('带 session 归属的同一命令保留（agent 动作的产物永不排除）', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(logFile, probeLine({ session_id: 'sess-1' }), 'utf8');
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    expect(reported[0].cmdline).toBe('/usr/bin/lsof -nP -iTCP:18789 -sTCP:LISTEN -FpFcn');
+    expect(runtimeCollector.getStats().eventsExcludedHostProbes).toBe(0);
+  });
+
+  it('带 tool_call 归属的同一命令保留', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(logFile, probeLine({ tool_call_id: 'call-1', tool_name: 'exec' }), 'utf8');
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    expect(runtimeCollector.getStats().eventsExcludedHostProbes).toBe(0);
+  });
+
+  it('带凭据的命令即使没有归属也保留', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(
+      logFile,
+      probeLine({ command_line: 'gh auth token --hostname github.com', executable: 'gh' }),
+      'utf8'
+    );
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    expect(runtimeCollector.getStats().eventsExcludedHostProbes).toBe(0);
+  });
+
+  it('配置关掉时宿主探针照常采集（可回到完整审计）', async () => {
+    const { instance, sink } = makeCollector({ excludeHostInternalProbeCommands: false });
+    await instance.initialize();
+    fs.appendFileSync(logFile, probeLine(), 'utf8');
+    await wait(500);
+
+    expect(sink).toHaveLength(1);
+    expect(instance.getStats().eventsExcludedHostProbes).toBe(0);
+    await instance.shutdown();
+  });
+});
+
+/**
+ * 子进程退出事件（1.1.0）。
+ *
+ * 运行时层此前只记录 process_start：审计链上只有"发起了"，没有"跑完了、
+ * 结果如何"（采样里 process_exit 为 0 条）。
+ */
+describe('RuntimeHookCollector 子进程退出事件', () => {
+  let logFile: string;
+  let reported: SecurityEvent[];
+  let runtimeCollector: RuntimeHookCollector;
+
+  beforeEach(() => {
+    reported = [];
+    logFile = path.join(
+      os.tmpdir(),
+      `openclaw-process-exit-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`
+    );
+    fs.writeFileSync(logFile, '', 'utf8');
+    runtimeCollector = new RuntimeHookCollector(
+      {
+        report: async (event: SecurityEvent) => {
+          reported.push(event);
+        },
+        shutdown: async () => {},
+      },
+      { enabled: true, logPath: logFile } as never
+    );
+  });
+
+  afterEach(async () => {
+    await runtimeCollector.shutdown();
+    for (const p of [logFile, `${logFile}.offset`]) {
+      try {
+        fs.unlinkSync(p);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  it('把 process_exit 落成事件，并保留子进程 pid 与退出码', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'process_exit',
+        type: 'application.process_exit',
+        id: 'exit-1',
+        event_id: 'exit-1',
+        ts: '2026-10-20T08:00:00.000Z',
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: 'npm pack ./plugin.tgz',
+        executable: 'npm',
+        process_name: 'npm',
+        pid: 4242,
+        spawner_pid: 4242,
+        child_pid: 5151,
+        exit_code: 0,
+        exit_signal: null,
+        session_id: 'sess-1',
+        run_id: 'run-1',
+        tool_call_id: 'call-1',
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+
+    expect(reported).toHaveLength(1);
+    const event = reported[0];
+    expect(event.event_type).toBe('process_exit');
+    expect(event.child_pid).toBe(5151);
+    expect(event.spawner_pid).toBe(4242);
+    // pid 保持"发起方"语义（与 process_start 一致）。
+    expect(event.pid).toBe(4242);
+    expect(event.exit_code).toBe(0);
+    expect(event.cmdline).toBe('npm pack ./plugin.tgz');
+    expect(event.session_id).toBe('sess-1');
+    expect(event.tool_call_id).toBe('call-1');
+  });
+
+  it('起点事件带出子进程 pid', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'process_start',
+        type: 'application.process_start',
+        id: 'start-1',
+        event_id: 'start-1',
+        ts: '2026-10-20T08:00:00.000Z',
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: 'npm pack ./plugin.tgz',
+        executable: 'npm',
+        pid: 4242,
+        spawner_pid: 4242,
+        child_pid: 5151,
+      }) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+
+    expect(reported[0].event_type).toBe('process_start');
+    expect(reported[0].child_pid).toBe(5151);
+    expect(reported[0].spawner_pid).toBe(4242);
+  });
+
+  it('宿主探针的退出事件与起点事件一起被排除（不留孤儿退出）', async () => {
+    await runtimeCollector.initialize();
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify({
+        event_type: 'process_exit',
+        type: 'application.process_exit',
+        id: 'exit-probe',
+        event_id: 'exit-probe',
+        ts: '2026-10-20T08:00:00.000Z',
+        runtime: 'node',
+        api: 'child_process.spawn',
+        command_line: '/usr/bin/lsof -nP -iTCP:18789 -sTCP:LISTEN -FpFcn',
+        executable: '/usr/bin/lsof',
+        pid: 4242,
+        child_pid: 5151,
+        exit_code: 0,
+      }) + '\n',
+      'utf8'
+    );
+
+    await wait(500);
+
+    expect(reported).toHaveLength(0);
+  });
+
+  it('同一命令的多个子进程退出事件互不去重', async () => {
+    await runtimeCollector.initialize();
+    for (const childPid of [5151, 5152, 5153]) {
+      fs.appendFileSync(
+        logFile,
+        JSON.stringify({
+          event_type: 'process_exit',
+          type: 'application.process_exit',
+          id: `exit-${childPid}`,
+          event_id: `exit-${childPid}`,
+          ts: '2026-10-20T08:00:00.000Z',
+          runtime: 'node',
+          api: 'child_process.spawn',
+          command_line: 'npm pack ./plugin.tgz',
+          executable: 'npm',
+          pid: 4242,
+          child_pid: childPid,
+          exit_code: 0,
+        }) + '\n',
+        'utf8'
+      );
+    }
+
+    await waitForReported(reported, 3);
+    await wait(300);
+
+    expect(reported).toHaveLength(3);
+    expect(reported.map((e) => e.child_pid).sort()).toEqual([5151, 5152, 5153]);
   });
 });

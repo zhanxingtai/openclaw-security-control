@@ -386,7 +386,7 @@ describe('SystemCollector cgroups support', () => {
     expect(parsed.data.tool_call_id).toBe('tc-001');
   });
 
-  it('forwards cgroup_snapshot events to collector', async () => {
+  it('forwards x_openclaw_cgroup_snapshot events to collector', async () => {
     const child = new MockChildProcess();
     mockSpawn.mockReturnValue(child as unknown as ChildProcess);
 
@@ -399,7 +399,7 @@ describe('SystemCollector cgroups support', () => {
 
     const event: SecurityEvent = {
       event_id: 'sys-123',
-      event_type: 'cgroup_snapshot',
+      event_type: 'x_openclaw_cgroup_snapshot',
       layer: 'system',
       ts: Date.now(),
       pid: 1,
@@ -412,11 +412,11 @@ describe('SystemCollector cgroups support', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(collector.events.length).toBe(1);
-    expect(collector.events[0].event_type).toBe('cgroup_snapshot');
+    expect(collector.events[0].event_type).toBe('x_openclaw_cgroup_snapshot');
     expect(collector.events[0].collector?.collector_name).toBe('system-collector');
   });
 
-  it('forwards cgroup_anomaly events to collector', async () => {
+  it('forwards x_openclaw_cgroup_anomaly events to collector', async () => {
     const child = new MockChildProcess();
     mockSpawn.mockReturnValue(child as unknown as ChildProcess);
 
@@ -429,7 +429,7 @@ describe('SystemCollector cgroups support', () => {
 
     const event: SecurityEvent = {
       event_id: 'sys-123',
-      event_type: 'cgroup_anomaly',
+      event_type: 'x_openclaw_cgroup_anomaly',
       layer: 'system',
       ts: Date.now(),
       pid: 1,
@@ -442,7 +442,7 @@ describe('SystemCollector cgroups support', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(collector.events.length).toBe(1);
-    expect(collector.events[0].event_type).toBe('cgroup_anomaly');
+    expect(collector.events[0].event_type).toBe('x_openclaw_cgroup_anomaly');
   });
 });
 

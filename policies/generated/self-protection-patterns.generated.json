@@ -2,7 +2,7 @@
   "flags": "i",
   "groups": {
     "protected_paths": [
-      "(^|/)\\.openclaw[/\\\\]",
+      "(^|/)\\.openclaw[/\\\\](?!workspace\\b)",
       "(^|/)\\.openclaw[/\\\\]openclaw\\.json$",
       "(^|/)\\.openclaw[/\\\\]security-policy\\.ya?ml$",
       "(^|/)\\.openclaw[/\\\\]security-events\\.jsonl$",

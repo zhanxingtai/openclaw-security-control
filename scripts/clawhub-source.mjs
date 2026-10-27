@@ -27,12 +27,22 @@
  * 用法：
  *   node scripts/clawhub-source.mjs            # 打印归属信息 + 发布命令
  *   node scripts/clawhub-source.mjs --check    # 只校验（内容不一致即非零退出）
- *   node scripts/clawhub-source.mjs --stamp    # 把归属信息写进宿主清单
+ *   node scripts/clawhub-source.mjs --stamp    # 把归属信息写进 clawhub.source.json
  *
- * --stamp 的已知性质：清单里记的 commit 是"打戳之前"那棵树的提交，而打戳本身
- * 又要再提交一次——所以清单里的 SHA 天然比公开分支落后一个提交。这不是 bug，
+ * 打印出来的发布命令还带 --display-name：ClawHub 侧没有合法的地方放"人类可读的
+ * 插件名"（宿主清单的顶层字段里没有 displayName，package.json#openclaw.plugin.label
+ * 只对宿主 UI 生效），不回退的话市场列表上就只有包名 slug。
+ *
+ * --stamp 写的是仓库根的 clawhub.source.json，不是宿主清单：宿主清单
+ * （openclaw.plugin.json）只允许静态能力元数据，装机规格归 package.json#openclaw
+ * .install，而 ClawHub 的 source 归属既不在清单里也不在 package.json 里——它是
+ * 发布时传给 CLI 的 --source-* 参数。落一份仓内记录只为"这次发布对应哪个提交"
+ * 可查，权威归属永远是发布命令里的 --source-commit。
+ *
+ * --stamp 的已知性质：记录里的 commit 是"打戳之前"那棵树的提交，而打戳本身
+ * 又要再提交一次——所以记录的 SHA 天然比公开分支落后一个提交。这不是 bug，
  * 是自指（提交无法包含自己的 SHA）导致的固有结果。图片改写只要求该提交里存在
- * 相应文件，这一条不受影响；真正的权威归属仍以发布时的 --source-commit 为准。
+ * 相应文件，这一条不受影响。
  */
 import fs from 'fs';
 import path from 'path';
@@ -153,18 +163,57 @@ export function assertSourceAttribution(attribution) {
 /**
  * 生成发布命令。--source-path 是包在仓库里的相对路径，本仓在根目录即 "."。
  *
+ * listing.displayName 是**上架展示名**，必须显式传，不能指望清单兜底：宿主清单
+ * 的合法顶层字段里没有 displayName，CLI 的回退顺序是 pluginManifest.name →
+ * package.json#displayName → README 的 H1，前两者在本仓都只会给出
+ * "sst-security-control-openclaw" 这种包名。人类可读的标签在
+ * package.json#openclaw.plugin.label 里。
+ *
+ * 这里不自动带 --categories：清单的 categories 是**宿主**的插件浏览分类
+ * （openclaw 的 PLUGIN_CATEGORY_SLUGS），ClawHub 的 --categories 是市场目录
+ * 的 slug，两套取值空间不同且后者由服务端校验，猜错会被发布接口打回。
+ *
  * @param {SourceAttribution} attribution
  * @param {string} artifact 待发布的归档（tgz 路径或目录）
+ * @param {{ displayName?: string }} [listing]
  * @returns {string}
  */
-export function renderPublishCommand(attribution, artifact) {
-  return [
-    `clawhub package publish ${artifact} \\`,
+export function renderPublishCommand(attribution, artifact, listing = {}) {
+  const lines = [`clawhub package publish ${artifact} \\`];
+  const displayName = listing.displayName?.trim();
+  if (displayName) {
+    lines.push(`  --display-name "${displayName}" \\`);
+  }
+  lines.push(
     `  --source-repo ${attribution.repo} \\`,
     `  --source-commit ${attribution.commit} \\`,
     `  --source-ref ${attribution.ref} \\`,
-    `  --source-path ${attribution.path}`,
-  ].join('\n');
+    `  --source-path ${attribution.path}`
+  );
+  return lines.join('\n');
+}
+
+/**
+ * 从仓内文件里取上架展示信息。
+ *
+ * 显示名取 package.json#openclaw.plugin.label —— 那是本仓唯一一处"人类可读的
+ * 插件名"的权威来源（清单里没有合法字段能放它）。
+ *
+ * @param {string} [root]
+ * @returns {{ displayName: string }}
+ */
+export function resolveListing(root = ROOT) {
+  let label = '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const value = pkg?.openclaw?.plugin?.label;
+    if (typeof value === 'string') label = value.trim();
+  } catch (err) {
+    throw new Error(
+      `读取 package.json 失败，无法取上架显示名：${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  return { displayName: label };
 }
 
 /**
@@ -255,33 +304,25 @@ export function resolveSourceAttribution(run, options = {}) {
 }
 
 /**
- * 把归属信息写进宿主清单的 clawhubSpec.source（宿主清单是 install 规格的
- * 唯一权威，build.js 搬运它进发布归档根的 package.json）。
+ * 把归属信息写进仓内的归属记录（clawhub.source.json 的内容）。
  *
- * @param {Record<string, any>} manifest openclaw.plugin.json 的内容
+ * 不写宿主清单：宿主清单的合法顶层字段里没有"source 归属"这一项，
+ * 装机规格归 package.json#openclaw.install，而 install 块里也没有 source
+ * 子结构——归属信息只存在于 ClawHub 的发布载荷里。
+ *
+ * @param {Record<string, any> | null | undefined} existing 已有记录（没有则传 null）
  * @param {SourceAttribution} attribution
- * @returns {Record<string, any>} 新的清单对象（不改原对象）
+ * @returns {Record<string, any>} 新的记录对象（不改原对象）
  */
-export function stampSourceAttribution(manifest, attribution) {
-  const spec = manifest?.openclaw?.install?.clawhubSpec;
-  if (!spec || typeof spec !== 'object') {
-    throw new Error('openclaw.plugin.json 里没有 openclaw.install.clawhubSpec，无法写入 source 归属信息。');
-  }
-  const source = { ...(spec.source ?? {}) };
-  source.repo = attribution.repo;
-  source.url = `https://github.com/${attribution.repo}`;
-  source.ref = attribution.ref;
-  source.commit = attribution.commit;
-  source.path = attribution.path;
+export function stampSourceAttribution(existing, attribution) {
+  const prev = existing && typeof existing === 'object' ? existing : {};
   return {
-    ...manifest,
-    openclaw: {
-      ...manifest.openclaw,
-      install: {
-        ...manifest.openclaw.install,
-        clawhubSpec: { ...spec, source },
-      },
-    },
+    ...prev,
+    repo: attribution.repo,
+    url: `https://github.com/${attribution.repo}`,
+    ref: attribution.ref,
+    commit: attribution.commit,
+    path: attribution.path,
   };
 }
 
@@ -312,14 +353,21 @@ function main(argv) {
   const attribution = resolveSourceAttribution(defaultRun, {});
 
   if (mode === 'stamp') {
-    const manifestPath = path.join(ROOT, 'openclaw.plugin.json');
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const recordPath = path.join(ROOT, 'clawhub.source.json');
+    let existing = null;
+    if (fs.existsSync(recordPath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+      } catch (err) {
+        throw new Error(`已有归属记录 ${recordPath} 不是合法 JSON：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     fs.writeFileSync(
-      manifestPath,
-      JSON.stringify(stampSourceAttribution(manifest, attribution), null, 2) + '\n',
+      recordPath,
+      JSON.stringify(stampSourceAttribution(existing, attribution), null, 2) + '\n',
       'utf8'
     );
-    console.log('[clawhub-source] 已写入 openclaw.plugin.json：');
+    console.log(`[clawhub-source] 已写入 ${path.relative(ROOT, recordPath)}：`);
   }
 
   console.log('ClawHub source 归属信息：');
@@ -329,7 +377,7 @@ function main(argv) {
   console.log(`  Package path     : ${attribution.path}`);
   console.log('');
   console.log('发布命令（缺 --source-* 时详情页的相对图片会 404）：');
-  console.log(renderPublishCommand(attribution, 'install/<你的插件>.tgz'));
+  console.log(renderPublishCommand(attribution, 'install/<你的插件>.tgz', resolveListing(ROOT)));
   console.log('');
   console.log('网页上传时对应填：');
   console.log(`  GitHub repository : ${attribution.repo}`);

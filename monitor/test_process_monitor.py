@@ -174,7 +174,7 @@ class TestProcessMonitorSnapshot(unittest.TestCase):
         snapshot = self.monitor.build_snapshot(proc, context)
         self.assertEqual(snapshot["tool_call_id"], "call-1")
 
-        self.assertEqual(snapshot["event_type"], "process_snapshot")
+        self.assertEqual(snapshot["event_type"], "x_openclaw_process_snapshot")
         self.assertEqual(snapshot["layer"], "system")
         self.assertEqual(snapshot["comm"], "python")
         self.assertEqual(snapshot["pid"], 1234)
@@ -519,7 +519,7 @@ class TestCgroupMonitor(unittest.TestCase):
         contexts = {1234: {"session_id": "sess-1", "run_id": "run-1", "agent_id": "agent-1", "tool_call_id": "tc-001"}}
         events = self.monitor.scan(contexts, burst_mode=False)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_type"], "cgroup_snapshot")
+        self.assertEqual(events[0]["event_type"], "x_openclaw_cgroup_snapshot")
         self.assertEqual(events[0]["session_id"], "sess-1")
         self.assertEqual(events[0]["tool_call_id"], "tc-001")
         self.assertEqual(events[0]["cgroup_path"], "/system.slice/docker-abc.scope")
@@ -580,7 +580,7 @@ class TestCgroupMonitor(unittest.TestCase):
         # Steady state: no threshold crossed, heartbeat fires once.
         events = self.monitor.scan(contexts, burst_mode=False)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_type"], "cgroup_snapshot")
+        self.assertEqual(events[0]["event_type"], "x_openclaw_cgroup_snapshot")
         # Immediate re-scan is still inside the window -> no second heartbeat.
         events = self.monitor.scan(contexts, burst_mode=False)
         self.assertEqual(len(events), 0)
@@ -625,7 +625,7 @@ class TestCgroupMonitor(unittest.TestCase):
             self.monitor.last_scan_times["/system.slice/docker-abc.scope"] = time.time() - 1.0
             events = self.monitor.scan({1234: {}}, burst_mode=False)
 
-        anomaly_events = [e for e in events if e["event_type"] == "cgroup_anomaly"]
+        anomaly_events = [e for e in events if e["event_type"] == "x_openclaw_cgroup_anomaly"]
         self.assertTrue(len(anomaly_events) > 0)
         self.assertEqual(anomaly_events[0]["anomaly_type"], "cpu_spike")
 
@@ -637,8 +637,8 @@ class TestProcessMonitorCgroupIntegration(unittest.TestCase):
         self.monitor.cgroup_monitor.config = self.monitor.config
 
     @patch.object(pm.CgroupMonitor, "scan", return_value=[
-        {"event_type": "cgroup_snapshot", "cgroup_path": "/test"},
-        {"event_type": "cgroup_anomaly", "cgroup_path": "/test", "anomaly_type": "cpu_spike"},
+        {"event_type": "x_openclaw_cgroup_snapshot", "cgroup_path": "/test"},
+        {"event_type": "x_openclaw_cgroup_anomaly", "cgroup_path": "/test", "anomaly_type": "cpu_spike"},
     ])
     def test_scan_cgroups_emits_events(self, mock_scan):
         events = []
@@ -646,8 +646,8 @@ class TestProcessMonitorCgroupIntegration(unittest.TestCase):
         self.monitor.last_cgroup_scan = 0
         self.monitor.scan_cgroups()
         self.assertEqual(len(events), 2)
-        self.assertEqual(events[0]["event_type"], "cgroup_snapshot")
-        self.assertEqual(events[1]["event_type"], "cgroup_anomaly")
+        self.assertEqual(events[0]["event_type"], "x_openclaw_cgroup_snapshot")
+        self.assertEqual(events[1]["event_type"], "x_openclaw_cgroup_anomaly")
 
     def test_bind_context_includes_tool_call_id(self):
         self.monitor.bind_context(

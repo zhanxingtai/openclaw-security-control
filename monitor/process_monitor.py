@@ -13,9 +13,12 @@ Commands:
 
 Events:
     process_start   - a process belonging to a bound context is discovered
-    process_change  - an already tracked process changed state
+    x_openclaw_process_change - an already tracked process changed state
     process_exit    - a tracked process disappeared
-    process_snapshot- periodic full snapshot of all tracked processes
+    x_openclaw_process_snapshot - periodic full snapshot of all tracked processes
+
+    event_type 带 x_openclaw_ 前缀：平台 validate_batch 对未登记且无
+    x_<project>_ 前缀的类型直接 UnsupportedEventType 并整批拒绝 NDJSON。
 """
 
 from __future__ import annotations
@@ -750,12 +753,16 @@ class CgroupMonitor:
         blkio: Dict[str, Any],
         pids: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Build a cgroup_snapshot event."""
+        """Build a cgroup_snapshot event.
+
+        event_type 带 x_openclaw_ 前缀：平台 validate_batch 对未登记且无
+        x_<project>_ 前缀的类型直接 UnsupportedEventType 并整批拒绝 NDJSON。
+        """
         now = int(time.time() * 1000)
         snapshot: Dict[str, Any] = {
             "comm": "openclaw-process-monitor",
             "event_id": str(uuid.uuid4()),
-            "event_type": "cgroup_snapshot",
+            "event_type": "x_openclaw_cgroup_snapshot",
             "layer": "system",
             "ts": now,
             "cgroup_version": self.reader.version,
@@ -897,7 +904,7 @@ class CgroupMonitor:
         return {
             "comm": "openclaw-process-monitor",
             "event_id": str(uuid.uuid4()),
-            "event_type": "cgroup_anomaly",
+            "event_type": "x_openclaw_cgroup_anomaly",
             "layer": "system",
             "ts": now,
             "cgroup_version": self.reader.version,
@@ -1328,11 +1335,11 @@ class ProcessMonitor:
             snapshot["event_type"] = "process_start"
             self.emit(snapshot)
         elif self.has_changed(prev, snapshot):
-            snapshot["event_type"] = "process_change"
+            snapshot["event_type"] = "x_openclaw_process_change"
             snapshot["changed_fields"] = self.changed_fields(prev, snapshot)
             self.emit(snapshot)
         elif emit_snapshot:
-            snapshot["event_type"] = "process_snapshot"
+            snapshot["event_type"] = "x_openclaw_process_snapshot"
             self.emit(snapshot)
 
         self.last_states[pid] = snapshot
@@ -1397,7 +1404,7 @@ class ProcessMonitor:
             snapshot: Dict[str, Any] = {
                 "comm": process_name or "openclaw-process-monitor",
                 "event_id": str(uuid.uuid4()),
-                "event_type": "process_snapshot",
+                "event_type": "x_openclaw_process_snapshot",
                 "layer": "system",
                 "ts": now,
                 "session_id": context.get("session_id"),

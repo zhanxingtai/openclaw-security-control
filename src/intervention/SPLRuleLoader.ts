@@ -174,12 +174,52 @@ function normalizeRegexEntry(value: unknown, where: string, options: SPLParseOpt
       return undefined;
     }
     const flags = sanitizeFlags(entry.flags, where, options);
-    return flags ? { pattern: entry.pattern, flags } : { pattern: entry.pattern };
+    // 条目级专属豁免（except）：命中任一即视为"本条目未匹配"，不影响同规则
+    // 其它条目。与规则级 paramsNotRegex（整条规则一票否决）语义不同。
+    const except = normalizeExceptList(entry.except, `${where}.except`, options);
+    const normalized: { pattern: string; flags?: string; except?: Array<string | { pattern: string; flags?: string }> } =
+      flags ? { pattern: entry.pattern, flags } : { pattern: entry.pattern };
+    if (except && except.length > 0) normalized.except = except;
+    return normalized;
   }
   options.logger?.warn?.(
     `[SPLRuleLoader] ${where}: unsupported regex entry ${JSON.stringify(value)}; entry dropped`
   );
   return undefined;
+}
+
+/**
+ * 归一化条目级豁免列表。豁免条目只支持 pattern/flags（不再嵌套 except），
+ * 非法条目丢弃并记 WARN。
+ */
+function normalizeExceptList(
+  value: unknown,
+  where: string,
+  options: SPLParseOptions
+): Array<string | { pattern: string; flags?: string }> | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = Array.isArray(value) ? value : [value];
+  const out: Array<string | { pattern: string; flags?: string }> = [];
+  for (const [i, item] of raw.entries()) {
+    if (typeof item === 'string') {
+      if (item.length === 0) continue;
+      out.push(item);
+      continue;
+    }
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const entry = item as Record<string, unknown>;
+      if (typeof entry.pattern !== 'string' || entry.pattern.length === 0) {
+        options.logger?.warn?.(
+          `[SPLRuleLoader] ${where}[${i}]: exemption entry missing non-empty "pattern" string; entry dropped`
+        );
+        continue;
+      }
+      // 豁免条目内不再接受嵌套豁免
+      const flags = sanitizeFlags(entry.flags, `${where}[${i}]`, options);
+      out.push(flags ? { pattern: entry.pattern, flags } : { pattern: entry.pattern });
+    }
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function normalizeRegexList(value: unknown, where: string, options: SPLParseOptions): PolicyRegexEntry[] | undefined {

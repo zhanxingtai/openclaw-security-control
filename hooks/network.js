@@ -1,4 +1,4 @@
-// openclaw-hook: v1.0.1 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
+// openclaw-hook: v1.0.2 (信息性注释；升级判定用全文内容哈希，勿依赖此值)
 // ⚠ 本文件只被 --require 加载，不要加 shebang —— `#!` 一旦不在文件最开头
 // 就是语法错，而这个文件正是 NODE_OPTIONS 的预加载目标，语法错 = 整个宿主
 // 进程在启动期退出。详见 hooks/hook-mounter.js 顶部同款说明。
@@ -59,9 +59,16 @@ const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 
 const MODULE_NAME = 'openclaw-security-monitor-network-hook';
-const DEBUG = process.env.OPENCLAW_NETWORK_HOOK_DEBUG === 'true' || process.env.OPENCLAW_NETWORK_HOOK_DEBUG === '1';
+// 诊断开关。OPENCLAW_HOOK_DEBUG 是总开关（runtime.js / hook-mounter.js 也认），
+// 单 hook 的 OPENCLAW_NETWORK_HOOK_DEBUG 保留，两者任一为真即开。
+const DEBUG =
+  process.env.OPENCLAW_NETWORK_HOOK_DEBUG === 'true' ||
+  process.env.OPENCLAW_NETWORK_HOOK_DEBUG === '1' ||
+  process.env.OPENCLAW_HOOK_DEBUG === 'true' ||
+  process.env.OPENCLAW_HOOK_DEBUG === '1';
 const MAX_BODY_LENGTH = parseInt(process.env.OPENCLAW_NETWORK_HOOK_MAX_BODY || '4096', 10);
 const MAX_HEADER_LENGTH = parseInt(process.env.OPENCLAW_NETWORK_HOOK_MAX_HEADER || '2048', 10);
 const MAX_CONTENT_LENGTH = parseInt(process.env.OPENCLAW_NETWORK_HOOK_MAX_CONTENT || '4096', 10);
@@ -484,7 +491,9 @@ function buildNetworkEvent(reqInfo, resInfo, startTime) {
   if (urlInfo.fullUrl) event.request_url = urlInfo.fullUrl;
   if (urlInfo.hostname) event.domain_name = urlInfo.hostname;
   // Five-tuple per network.json: local is our side, remote is the target.
-  if (urlInfo.hostname) event.remote_ip = urlInfo.hostname;
+  // remote_ip must hold an IP literal — stuffing a hostname in there makes
+  // IP-based consumers (allowlists, geo checks) silently match nothing.
+  if (urlInfo.hostname && net.isIP(urlInfo.hostname)) event.remote_ip = urlInfo.hostname;
   if (urlInfo.port) event.remote_port = parseInt(urlInfo.port, 10) || undefined;
 
   return event;
@@ -575,12 +584,12 @@ process.once('exit', () => {
   closeEventFd();
 });
 
-// Diagnostic counters — flushed at shutdown so an operator can confirm the
-// filter is actually working without enabling DEBUG logging. These are the
-// single most useful piece of evidence when "the install has noise data" is
-// reported again: if startupFilterStatus prints N hosts and N URLs but
-// dropCounts shows zero drops, then the events in the JSONL came from a
-// different code path (or the bundle is stale).
+// Diagnostic counters — flushed at shutdown (only with DEBUG on, see
+// logDropSummary) so an operator can confirm the filter is actually working.
+// These are the single most useful piece of evidence when "the install has
+// noise data" is reported again: if startupFilterStatus prints N hosts and N
+// URLs but dropCounts shows zero drops, then the events in the JSONL came from
+// a different code path (or the bundle is stale).
 const dropCounts = {
   selfReporting: 0,
   ignoredHost: 0,
@@ -593,8 +602,13 @@ const dropCounts = {
 };
 
 function logStartupFilterStatus() {
-  // Always-on (not gated by DEBUG) so an operator can verify in journalctl
-  // that the env vars didn't accidentally override the defaults to empty.
+  // 默认静默：这一行原本 always-on，是每个 node 进程都要打一遍的噪音（安装
+  // / CLI 输出里最显眼的一类）。但它存在是有理由的——环境变量可能把默认
+  // 过滤器覆盖成空（OPENCLAW_NETWORK_HOOK_IGNORE_HOSTS="" 会让 split(',')
+  // 产出空数组），那时噪声过滤整个失效。所以"过滤器为空"仍然无条件出声，
+  // 其余情况交给 DEBUG。
+  const filterEmpty = IGNORE_HOSTS.length === 0 || IGNORE_URLS.length === 0;
+  if (!DEBUG && !filterEmpty) return;
   console.error(
     `[network-hook] startup: ` +
       `IGNORE_HOSTS(n=${IGNORE_HOSTS.length})=${JSON.stringify(IGNORE_HOSTS)}; ` +
@@ -606,6 +620,9 @@ function logStartupFilterStatus() {
 }
 
 function logDropSummary() {
+  // 同上：默认静默。丢包计数是"装完发现 JSONL 里有噪声"时的取证材料，
+  // 排查时用 OPENCLAW_HOOK_DEBUG=1 打开即可。
+  if (!DEBUG) return;
   console.error(
     `[network-hook] shutdown drops: ` +
       `self=${dropCounts.selfReporting}, ` +

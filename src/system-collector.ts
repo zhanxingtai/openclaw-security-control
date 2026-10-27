@@ -489,7 +489,7 @@ export class SystemCollector implements ILayerCollector {
 
     event.source = 'openclaw.v1';
     if (!event.collection_method) event.collection_method = 'procfs';
-    event.schema_version = '1.0.0';
+    event.schema_version = 1;
     if (event.session_id === undefined) event.session_id = null;
     if (event.run_id === undefined) event.run_id = null;
     if (event.task_id === undefined) event.task_id = null;

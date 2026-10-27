@@ -473,8 +473,19 @@ export interface RedactPolicy {
  * 带标志的正则条目：对象形态的 flags 取代 PCRE 内联
  * `(?i:...)` 写法；仅允许 JS/Python 公共子集 i/m/s。字符串形态等价于
  * `{ pattern: <string> }`（无 flags）。
+ *
+ * `except` 是条目级的专属豁免：命中其中任一模式即认为"本条目未匹配"，
+ * 但不影响同一规则里的其它条目。规则级 `paramsNotRegex` 仍是整条规则的
+ * 一票否决——两者语义不同，前者用于"这一条形态在某种上下文下不算违规"，
+ * 后者用于"整条规则在某种上下文下不适用"。
  */
-export type PolicyRegexEntry = string | { pattern: string; flags?: string };
+export interface PolicyRegexPatternObject {
+  pattern: string;
+  flags?: string;
+  except?: Array<string | { pattern: string; flags?: string }>;
+}
+
+export type PolicyRegexEntry = string | PolicyRegexPatternObject;
 
 /**
  * 分层检测正则条目：runtime hook / process monitor

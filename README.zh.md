@@ -30,10 +30,10 @@ npm install --legacy-peer-deps
 npm run build:prod
 
 # 2. 上传 tarball 到目标服务器
-scp install/sst-security-control-openclaw-1.0.1.tgz root@server:~/.openclaw/
+scp install/sst-security-control-openclaw-1.0.2.tgz root@server:~/.openclaw/
 
 # 3. 在服务器上安装（两行命令必须拆两个终端会话）
-openclaw plugins install npm-pack:$HOME/.openclaw/sst-security-control-openclaw-1.0.1.tgz --accept-capabilities --force
+openclaw plugins install npm-pack:$HOME/.openclaw/sst-security-control-openclaw-1.0.2.tgz --accept-capabilities --force
 openclaw plugins enable sst-security-control-openclaw
 openclaw gateway restart
 ```
@@ -49,6 +49,16 @@ openclaw plugins uninstall sst-security-control-openclaw
 - 智能体会话及行为事件记录（NDJSON 格式）
 - 高危动作（反弹 shell、敏感文件访问等）在 `enforce` 模式下阻断，其余行为仅标记告警
 - 运行状态与事件查看面板（Control UI → SST Security Control）
+
+### 安全监控面板
+
+面板展示事件、拦截、资产与策略命中。OpenClaw 9.4 的 Control UI 把面板放在
+sandbox iframe 里渲染，该环境不允许使用 `localStorage`，因此 Tab 内不渲染内容
+——请直接访问独立面板：
+
+```text
+http://<host>:<port>/openclaw-security-monitor/panel
+```
 
 ## 配置
 
@@ -76,17 +86,19 @@ openclaw plugins config sst-security-control-openclaw --set \
 
 ## 安全事件
 
-事件为 NDJSON 行。本版本实际会写出的 `event_type`，按层分：
+事件为 NDJSON 行。本版本实际会写出的 `event_type`，按层分。
+带 `x_openclaw_` 前缀的是项目扩展类型：平台接入层（`validate_batch`）对未登记
+的裸名类型整批拒收 NDJSON，而未登记的 `x_<project>_` 前缀扩展只校验公共字段后放行。
 
 | 层 | 事件类型 | 需要运行时 hooks |
 |----|---------|-------------------|
-| 应用 | `agent_session_start` / `agent_session_end`、`agent_start` / `agent_stop`、`agent_subagent_start` / `agent_subagent_progress` / `agent_subagent_end`、`agent_message`、`agent_tool_call` / `agent_tool_result`、`cron_changed`、`code_mode_exec`、`reasoning` | 否 |
+| 应用 | `agent_session_start` / `agent_session_end`、`agent_start` / `agent_stop`、`x_openclaw_subagent_start` / `x_openclaw_subagent_progress` / `x_openclaw_subagent_end`、`agent_message`、`agent_tool_call` / `agent_tool_result`、`cron_changed`、`x_openclaw_cron_run`、`code_mode_exec`、`reasoning` | 否 |
 | 应用（文件） | `file_read` / `file_write` / `file_delete` / `file_privilege` —— 由工具名归一化而来（`fs.readFile` → `file_read`） | 否 |
-| 系统（进程） | `process_start`、`process_change` / `process_exit` / `process_snapshot` | `process_start`：**是** |
-| 系统（cgroup） | `cgroup_snapshot` / `cgroup_anomaly` | 否（需 `system.enabled`） |
+| 系统（进程） | `process_start`、`x_openclaw_process_change` / `process_exit` / `x_openclaw_process_snapshot` | `process_start`：**是** |
+| 系统（cgroup） | `x_openclaw_cgroup_snapshot` / `x_openclaw_cgroup_anomaly` | 否（需 `system.enabled`） |
 | 系统（网络） | `network_http` | **是** |
 | 资产 | `asset_add` / `asset_change` / `asset_remove` / `asset_snapshot` | 否 |
-| 自保护 | `protection_degraded`、`tamper_detected` | 否 |
+| 自保护 | `x_openclaw_protection_degraded`、`x_openclaw_tamper_detected`、`x_openclaw_runtime_hook_unloaded` | 否 |
 
 ## 后续计划
 

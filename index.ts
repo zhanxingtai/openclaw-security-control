@@ -238,6 +238,38 @@ function createMiddleware(
 }
 
 /**
+ * Gateway RPC 方法 → 权限 scope 的**唯一事实源**。
+ *
+ * 放在模块作用域（而不是 register() 内部）有两个原因：
+ *   1. registerGatewayMethod 的注册面必须能被外部校验脚本读到 —— 早先
+ *      scripts/verify-bridge.mjs 把方法数硬编码成 10，策略面扩容到 13
+ *      之后该断言就变成了"永远失败的死数字"。
+ *   2. 少一个 handler 或多一个 handler 都会被集合比对抓到（比数量比对
+ *      更严），而正常增删方法不会误报。
+ */
+export const GATEWAY_RPC_SCOPES: Record<
+  string,
+  "operator.read" | "operator.write" | "operator.admin"
+> = {
+  "security.evaluate": "operator.admin",
+  "security.status": "operator.read",
+  "security.events.list": "operator.read",
+  "security.events.stats": "operator.read",
+  "security.assets.list": "operator.read",
+  "security.policy.hits": "operator.read",
+  "security.metrics": "operator.read",
+  "security.config.get": "operator.read",
+  "security.config.raw": "operator.read",
+  "security.config.diff": "operator.write",
+  "security.config.save": "operator.write",
+  "security.panel.locale.get": "operator.read",
+  "security.panel.locale.set": "operator.write",
+};
+
+/** 应当出现在宿主 gateway 上的 RPC 方法名集合（校验脚本用）。 */
+export const GATEWAY_RPC_METHODS: readonly string[] = Object.keys(GATEWAY_RPC_SCOPES);
+
+/**
  * OpenClaw 2026.9.4 entry point.
  *
  * MUST be synchronous: the host rejects a Promise return with
@@ -319,15 +351,21 @@ function register(api: OpenClawPluginApi): void {
   on?.("before_message_write", (event, ctx) => {
     const input = hookBridge.bridgeMessageWrite(event, ctx);
     if (!input) return;
-    const result = middleware.beforeMessageWriteSync(input);
-    return hookBridge.toMessageWriteHostResult(input, result);
+    // 先解析角色：返回给宿主的拦截结果里要带上真实角色，宿主拿它去
+    // 替换消息内容，role 对不上就没法用。
+    const resolved = middleware.resolveMessageRole(input);
+    const result = middleware.beforeMessageWriteSync(resolved);
+    return hookBridge.toMessageWriteHostResult(resolved, result);
   });
 
   // Typed hook: session / subagent / cron lifecycle.
   on?.("session_start", async (event, ctx) => {
+    // session_start 是**会话**生命周期事件，不是消息。之前它走消息通道，
+    // 结果是一条 content="" 的 agent_message（纯噪声），真正的
+    // agent_session_start 反而不落盘。这里接回自己的事件类型。
     const input = hookBridge.bridgeMessageWrite(event, ctx);
     if (!input) return;
-    await middleware.beforeMessageWrite(input);
+    await middleware.onSessionStart(input);
   });
 
   on?.("session_end", async (event, ctx) => {
@@ -522,27 +560,12 @@ function register(api: OpenClawPluginApi): void {
   // Register each handler through `registerGatewayMethod` for WS clients.
   // OpenClaw 9.4 dispatches gateway methods over the gateway WebSocket;
   // the HTTP surface below is for the in-iframe panel.
-  const wsScopes: Record<string, "operator.read" | "operator.write" | "operator.admin"> = {
-    "security.evaluate": "operator.admin",
-    "security.status": "operator.read",
-    "security.events.list": "operator.read",
-    "security.events.stats": "operator.read",
-    "security.assets.list": "operator.read",
-    "security.policy.hits": "operator.read",
-    "security.metrics": "operator.read",
-    "security.config.get": "operator.read",
-    "security.config.raw": "operator.read",
-    "security.config.diff": "operator.write",
-    "security.config.save": "operator.write",
-    "security.panel.locale.get": "operator.read",
-    "security.panel.locale.set": "operator.write",
-  };
   if (typeof api.registerGatewayMethod === "function") {
     for (const [name, handler] of Object.entries(rpcHandlers)) {
       api.registerGatewayMethod(
         name,
         async (params: unknown) => handler(params),
-        { scope: wsScopes[name] ?? "operator.read" }
+        { scope: GATEWAY_RPC_SCOPES[name] ?? "operator.read" }
       );
     }
   } else {
@@ -776,8 +799,9 @@ function register(api: OpenClawPluginApi): void {
   // browser tab without the Control UI's control-ui-plugin grant cookie.
   // The 9.4 iframe path is broken in sandboxed iframes (host React crashes on
   // window.localStorage), so we cannot rely on the iframe to set the grant.
-// All 10 RPCs behind this route are read-only (security.evaluate returns a
-  // decision but does not enforce; security.config.save is the only mutator).
+  // Every RPC behind this route is dispatched from the one handler table;
+  // security.evaluate returns a decision but does not enforce, and the only
+  // mutators are security.config.save and security.panel.locale.set.
   // Shared panel HTML handler. Used by two routes below:
   //   1) /openclaw-security-monitor/panel (auth=plugin) for direct browser tabs.
   //   2) /openclaw-security-monitor/panel-tab (auth=gateway) so the host
@@ -2802,7 +2826,10 @@ async function handleInternalHookEvent(
       break;
     case "message":
       if (event.action === "received" || event.action === "sending") {
-        const input = hookBridge.bridgeMessageWrite(merged, undefined);
+        // 钩子语义自带角色：received = 用户输入，sending = 模型输出。
+        // 载荷里常常没有 role 字段，这个信息只在 action 名字里。
+        const defaultRole = event.action === "received" ? "user" : "assistant";
+        const input = hookBridge.bridgeMessageWrite(merged, undefined, defaultRole);
         if (input) await middleware.beforeMessageWrite(input);
       }
       break;

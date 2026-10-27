@@ -136,7 +136,20 @@ function hasAnyParamsNotRegex(rule) {
   const v = m.paramsNotRegex;
   if (Array.isArray(v)) return v.length > 0;
   if (v && typeof v === 'object') {
-    return Object.values(v).some((dim) => Array.isArray(dim) && dim.length > 0);
+    if (Object.values(v).some((dim) => Array.isArray(dim) && dim.length > 0)) return true;
+  }
+  // 条目级专属豁免（paramsRegex[*][i].except）同样是白名单，只是作用域收在
+  // 单条 pattern 上而不是整条规则——计分口径与规则级豁免一致。
+  const pr = m.paramsRegex;
+  if (pr && typeof pr === 'object') {
+    for (const dim of Object.values(pr)) {
+      if (!Array.isArray(dim)) continue;
+      for (const entry of dim) {
+        if (entry && typeof entry === 'object' && Array.isArray(entry.except) && entry.except.length > 0) {
+          return true;
+        }
+      }
+    }
   }
   return false;
 }

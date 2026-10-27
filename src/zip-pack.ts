@@ -59,7 +59,13 @@ export function buildZip(entries: ZipEntryInput[]): Buffer {
     const useStore = deflated.length >= entry.data.length;
     const payload = useStore ? entry.data : deflated;
     const method = useStore ? 0 : 8;
-    const { time, date } = dosDateTime(entry.mtime ? new Date(entry.mtime) : new Date());
+    // mtime 归一到固定值才满足内容寻址：包 hash 必须只由内容决定，嵌入
+    // 墙钟会让"内容翻转回原文"得到不同 hash（DOS 时间 2 秒粒度，跨边界
+    // 即 flaky）。注意不能用 truthiness 判断——调用方传 mtime: 0 就是
+    // 要固定 epoch，0 是 falsy 但不是"没给"。
+    const { time, date } = dosDateTime(
+      entry.mtime !== undefined ? new Date(entry.mtime) : new Date(0)
+    );
 
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0); // local file header signature

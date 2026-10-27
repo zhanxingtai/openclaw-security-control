@@ -347,12 +347,12 @@ const EN = {
     "Requires python3 + psutil on the host; when the bootstrap probe finds them missing, this layer turns",
     "itself off and the save is reported with a warning.",
     "Once enabled and the gateway restarted, tool calls that spawn processes produce process_start /",
-    "process_change / process_exit / process_snapshot events.",
+    "x_openclaw_process_change / process_exit / x_openclaw_process_snapshot events.",
   ].join("\n"),
   "cfg.help.system.cgroups.enabled": [
     "Read-only cgroup v1/v2 metrics (cpu / memory / blkio / pids); low overhead.",
     "Starts together with the process monitor. Once enabled and restarted it produces",
-    "cgroup_snapshot / cgroup_anomaly events;",
+    "x_openclaw_cgroup_snapshot / x_openclaw_cgroup_anomaly events;",
     "steady-state heartbeats are governed by cgroups.heartbeatEnabled + cgroups.aggregateWindowSeconds.",
   ].join("\n"),
   "cfg.help.intervention.guidance.enabled": [
@@ -658,11 +658,11 @@ const ZH: Record<DictKey, string> = {
     "只读 psutil 进程扫描，默认不做任何杀伤（autoKill 默认关闭）。",
     "需主机 python3 + psutil；bootstrap 探测缺失时会自动关闭本层并在保存时提示。",
     "开启并重启 gateway 后，绑定的工具调用进程树会产生 process_start / ",
-    "process_change / process_exit / process_snapshot 事件。",
+    "x_openclaw_process_change / process_exit / x_openclaw_process_snapshot 事件。",
   ].join("\n"),
   "cfg.help.system.cgroups.enabled": [
     "只读 cgroup v1/v2 指标（cpu / memory / blkio / pids），低开销。",
-    "随 process monitor 一同启动，开启并重启后产生 cgroup_snapshot / cgroup_anomaly 事件；",
+    "随 process monitor 一同启动，开启并重启后产生 x_openclaw_cgroup_snapshot / x_openclaw_cgroup_anomaly 事件；",
     "稳态心跳由 cgroups.heartbeatEnabled + cgroups.aggregateWindowSeconds 控制。",
   ].join("\n"),
   "cfg.help.intervention.guidance.enabled":

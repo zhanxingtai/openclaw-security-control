@@ -26,6 +26,12 @@ export interface CompiledRuleRegexes {
   bodyRegex?: RegExp[];
   paramsRegex?: Record<string, RegExp[]>;
   paramsNotRegex?: Record<string, RegExp[]>;
+  /**
+   * 条目级专属豁免：key → 与 paramsRegex[key] 下标一一对应的豁免列表。
+   * 某条目的豁免命中即视为"该条目未匹配"，不影响同 key 的其它条目。
+   * 缺省项为空数组。
+   */
+  paramsRegexExcept?: Record<string, RegExp[][]>;
   chain?: {
     withinSteps?: number;
     prior: CompiledChainRequirement[];
@@ -198,10 +204,13 @@ export function isSuspiciousNestedQuantifier(pattern: string): boolean {
 export function collectRulePatterns(rule: PolicyRule): string[] {
   const match = rule.match || {};
   const toSource = (e: PolicyRegexEntry): string => (typeof e === 'string' ? e : e.pattern);
+  // 条目级豁免也是评估期要跑的正则，同样纳入静态回溯审计与合法性校验。
+  const toExceptSources = (e: PolicyRegexEntry): string[] =>
+    typeof e === 'string' || !e.except ? [] : e.except.map((x) => (typeof x === 'string' ? x : x.pattern));
   return [
     ...(match.sessionRegex || []).map(toSource),
     ...(match.bodyRegex || []).map(toSource),
-    ...Object.values(match.paramsRegex || {}).flat().map(toSource),
+    ...Object.values(match.paramsRegex || {}).flat().flatMap((e) => [toSource(e), ...toExceptSources(e)]),
     ...Object.values(match.paramsNotRegex || {}).flat().map(toSource),
     ...(match.chain?.prior || []).flatMap((p) => [
       ...(p.pathRegex || []).map(toSource),
@@ -284,6 +293,31 @@ function compilePatternMap(map: Record<string, PolicyRegexEntry[]>, ruleFlags?: 
 }
 
 /**
+ * 编译条目级专属豁免。返回 key → 与 paramsRegex[key] 下标一一对应的豁免
+ * 列表；没有豁免的条目给空数组（保持下标对齐）。整张表都没有豁免时返回
+ * undefined，评估热路径据此完全跳过豁免检查。
+ */
+function compileExceptMap(
+  map: Record<string, PolicyRegexEntry[]>,
+  ruleFlags?: string
+): Record<string, RegExp[][]> | undefined {
+  const result: Record<string, RegExp[][]> = {};
+  let any = false;
+  for (const [key, patterns] of Object.entries(map)) {
+    const list = patterns || [];
+    const perPattern: RegExp[][] = list.map((entry) => {
+      if (typeof entry === 'string') return [];
+      const except = entry.except || [];
+      if (except.length === 0) return [];
+      any = true;
+      return except.map((e) => compilePattern(e, ruleFlags));
+    });
+    result[key] = perPattern;
+  }
+  return any ? result : undefined;
+}
+
+/**
  * 编译单条规则的全部正则维度。任一模式非法或命中灾难性回溯签名即返回
  * ok=false，调用方据此跳过该规则并记告警——单条规则的正则问题不得中断评估。
  */
@@ -305,6 +339,8 @@ export function compileRuleRegexes(rule: PolicyRule): RuleRegexCompileResult {
     }
     if (match.paramsRegex && Object.keys(match.paramsRegex).length > 0) {
       value.paramsRegex = compilePatternMap(match.paramsRegex, ruleFlags);
+      const exceptMap = compileExceptMap(match.paramsRegex, ruleFlags);
+      if (exceptMap) value.paramsRegexExcept = exceptMap;
     }
     if (match.paramsNotRegex && Object.keys(match.paramsNotRegex).length > 0) {
       value.paramsNotRegex = compilePatternMap(match.paramsNotRegex, ruleFlags);
@@ -341,10 +377,12 @@ export function compileRuleRegexes(rule: PolicyRule): RuleRegexCompileResult {
 /** 收集规则全部维度的正则条目（保留对象形态，供编译定位器使用）。 */
 function collectRulePatternEntries(rule: PolicyRule): PolicyRegexEntry[] {
   const match = rule.match || {};
+  const exceptEntries = (e: PolicyRegexEntry): PolicyRegexEntry[] =>
+    typeof e === 'string' || !e.except ? [] : e.except.map((x) => (typeof x === 'string' ? x : { pattern: x.pattern, flags: x.flags }));
   return [
     ...(match.sessionRegex || []),
     ...(match.bodyRegex || []),
-    ...Object.values(match.paramsRegex || {}).flat(),
+    ...Object.values(match.paramsRegex || {}).flat().flatMap((e) => [e, ...exceptEntries(e)]),
     ...Object.values(match.paramsNotRegex || {}).flat(),
     ...(match.chain?.prior || []).flatMap((p) => [
       ...(p.pathRegex || []),

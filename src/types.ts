@@ -7,7 +7,11 @@
 // ============================================================================
 
 export interface MiddlewareContext {
-  sessionKey: string;
+  /**
+   * 会话键。规范（common.json）：session 未知时必须为 undefined → 事件上
+   * 落 null；绝不回退 runId（只允许 run_id 向下回退 task/session）。
+   */
+  sessionKey: string | undefined;
   agentId: string;
   runId: string;
   toolName: string;
@@ -25,7 +29,8 @@ export interface MiddlewareResult {
 }
 
 export interface AgentStartContext {
-  sessionKey: string;
+  /** 会话键；undefined = 宿主没给会话（事件上落 null，见 MiddlewareContext）。 */
+  sessionKey: string | undefined;
   agentId: string;
   agentConfig?: AgentConfig;
   systemPrompt?: string;
@@ -46,9 +51,20 @@ export interface AgentStartResult {
 }
 
 export interface MessageWriteContext {
-  sessionKey: string;
+  /** 会话键；undefined = 宿主没给会话（事件上落 null，见 MiddlewareContext）。 */
+  sessionKey: string | undefined;
   runId?: string;
   role: 'user' | 'assistant' | 'tool' | string;
+  /**
+   * 角色是怎么来的。'explicit' = 宿主明确给出；'inferred' = 由载荷形态
+   * 推断；'lifecycle' = 由会话生命周期推断（见 application-collector）；
+   * 'default' = 都没拿到，走了兜底。
+   *
+   * 1.1.0 起落盘：宿主在 message 事件上经常不带 role，导致下游拿到的
+   * 角色全是 'unknown'，等于没有角色。标出来源，下游才知道哪些行可以
+   * 当成事实用。
+   */
+  roleSource?: 'explicit' | 'inferred' | 'lifecycle' | 'default' | string;
   content: string | unknown;
   reasoning?: string;
   messageId?: string;
@@ -66,7 +82,8 @@ export interface MessageWriteResult {
 }
 
 export interface AgentCompleteContext {
-  sessionKey: string;
+  /** 会话键；undefined = 宿主没给会话（事件上落 null，见 MiddlewareContext）。 */
+  sessionKey: string | undefined;
   agentId: string;
   runId?: string;
   status?: 'success' | 'error' | string;
@@ -176,14 +193,29 @@ export type EventType =
   | 'agent_stop'
   | 'agent_session_start'
   | 'agent_session_end'
-  | 'agent_subagent_start'
-  | 'agent_subagent_progress'
-  | 'agent_subagent_end'
+  // ---------------------------------------------------------------------
+  // 以下类型带 `x_openclaw_` 前缀：平台 aise-agent-governance 的
+  // validate_batch 对**未登记且无 x_<project>_ 前缀**的 event_type 直接
+  // UnsupportedEventType 并整批拒绝 NDJSON；未登记的 x_ 前缀扩展只校验
+  // 公共字段后放行。这是 project_standards 的扩展命名约定，改名前这些
+  // 裸名类型会触发整批拒收。
+  // ---------------------------------------------------------------------
+  | 'x_openclaw_subagent_start'
+  | 'x_openclaw_subagent_progress'
+  | 'x_openclaw_subagent_end'
+  // cron 配置变化事件。保留裸名：平台已登记 deprecated →
+  // x_openclaw_cron_changed 的 alias；其 status 枚举是 started/stopped/
+  // modified/error，故本插件发 modified。
   | 'cron_changed'
+  // 一次 cron 运行的单条收敛事件：宿主每次触发发的
+  // scheduled/started/finished 三元组收敛为运行结束这一条。
+  | 'x_openclaw_cron_run'
   | 'agent_message'
   | 'agent_tool_call'
   | 'agent_tool_result'
   | 'code_mode_exec'
+  // 'reasoning' 只在类型 union 里保留（宿主可能扩展），本插件不发出——
+  // 未发出就不会触发平台的整批拒收，无需加前缀。
   | 'reasoning'
   | 'runtime_log'
   | 'trace_span'
@@ -201,20 +233,22 @@ export type EventType =
   | 'network_dns'
   // System layer process lifecycle events
   | 'process_start'
-  | 'process_change'
+  | 'x_openclaw_process_change'
   | 'process_exit'
-  | 'process_snapshot'
+  | 'x_openclaw_process_snapshot'
   // System layer cgroup events
-  | 'cgroup_snapshot'
-  | 'cgroup_anomaly'
+  | 'x_openclaw_cgroup_snapshot'
+  | 'x_openclaw_cgroup_anomaly'
   // Asset layer events (agent config / skill / MCP asset monitoring)
   | 'asset_add'
   | 'asset_change'
   | 'asset_remove'
   | 'asset_snapshot'
   // Self-protection events (intervention engine degraded / protected file tampered)
-  | 'protection_degraded'
-  | 'tamper_detected';
+  | 'x_openclaw_protection_degraded'
+  | 'x_openclaw_tamper_detected'
+  // 运行时 hook 被宿主卸载（自保护留痕）。
+  | 'x_openclaw_runtime_hook_unloaded';
 
 // Per project_standards/event-schema/common.json: layer is one of
 // 'application' | 'system' | 'asset'. The legacy 'network' value is mapped to
@@ -228,9 +262,24 @@ export interface SecurityEvent {
   event_type: EventType | string;
   layer: SourceLayer;
   ts: number;
-  /** Event schema version per project_standards (e.g. "1.0.0"). */
-  schema_version?: string;
+  /**
+   * 事件 schema 版本。**整数 1**（project_standards schema-versions.md：
+   * 只允许 JSON 整数，兼容新增字段继续沿用 1）——1.1.0 之前误用字符串
+   * "1.0.0"，平台接收层按整数归一，字符串型会被判类型不符。
+   */
+  schema_version?: number;
   pid?: number;
+  /**
+   * 发起方进程 pid（谁调用了 spawn）。
+   *
+   * 1.1.0 之前 `pid` 就是这个语义（发起方），而**被拉起的子进程 pid 从来
+   * 没被采集过**——审计链上只有"谁发起的"，没有"哪个进程真的跑起来
+   * 了"。现在两者分开：`spawner_pid` = 发起方，`child_pid` = 子进程。
+   * `pid` 保留为发起方 pid 的兼容别名。
+   */
+  spawner_pid?: number;
+  /** 被拉起的子进程 pid。spawn 之前拿不到，所以 process_start 事件里可能缺失。 */
+  child_pid?: number;
   session_id?: string | null;
   run_id?: string | null;
   task_id?: string | null;
@@ -260,16 +309,57 @@ export interface SecurityEvent {
   // Application layer fields
   agent_name?: string;
   user_id?: string;
-  tool_name?: string;
+  tool_name?: string | null;
   tool_kind?: string;
   tool_description?: string;
   path?: string;
-  params?: Record<string, unknown>;
+  /**
+   * 工具参数的规范化 JSON 字符串（唯一的参数载荷字段，agent.json 1.1.0）。
+   *
+   * 历史上同一数据落过三份：`raw_params`（字符串）、`tool_params`（同一
+   * 字符串）、`params`（同一份数据的对象视图）。现只保留 `tool_params`
+   * 一份；要对象形态的消费方 JSON.parse 即可。
+   */
   tool_params?: string;
-  raw_params?: string;
-  raw_params_length?: number;
+  /** `tool_params` 截断前的原始长度（截断阈值 application.maxRawParamsLength）。 */
+  tool_params_length?: number;
+  /**
+   * 原始参数在**脱敏前**的 SHA-256（规范化键序后序列化，与 tool_params
+   * 同源但先于 redact）。
+   *
+   * 规范（common.json）脱敏四件套之一：审计时凭它核对原始内容，原始明文
+   * 走独立安全通道、绝不落事件流。无法确定性序列化的极端载荷（循环引用）
+   * 省略本字段。
+   */
+  raw_params_hash?: string;
+  /**
+   * 本次落盘时被脱敏替换的一级键名列表（去重；空则省略本字段）。
+   *
+   * 规范（common.json）脱敏四件套之一：raw_params_hash / raw_params_length /
+   * redacted_keys / obfuscation。下游据此知道"哪个参数被抹掉了"，而不必
+   * 靠对 tool_params 里的 '***' 做形态猜测。只记录键名被替换的键；
+   * 值内容模式（JWT/AKIA 等）命中属于"值被改写"，不算键被替换。
+   */
+  redacted_keys?: string[];
   user_prompt?: string;
-  system_prompt?: string;
+  /**
+   * 系统提示词的内容指纹（sha256 前 16 位十六进制，内容寻址）。
+   *
+   * 事件流里不再出现 system_prompt 全文（实测它占事件流约 54% 体积，
+   * 同一提示词被每个会话的第一条消息反复内嵌）。全文全局只落一份到与
+   * security-events.jsonl 同目录的 security-prompts.jsonl，按完整
+   * prompt_hash（= ref 的 64 位原值）检索；所有事件一律只带这个 ref，
+   * 下游按 ref 回 sidecar 取全文即可。
+   */
+  system_prompt_ref?: string;
+  /**
+   * 会话标题：由该 session 首条有效 user 消息派生（脱敏 → 取首个非空行 →
+   * 压行内空白 → 截断 ≤30 字）。first-write-wins，之后不再改写。
+   *
+   * 标题在首条 user 消息落盘之后才确定，因此早于它的少数事件（例如
+   * agent_start）没有这个字段——"字段缺失"即"标题尚未确定"。
+   */
+  session_title?: string;
   agent_plan?: string[];
   previous_actions?: ActionRecord[];
   step_index?: number;
@@ -279,7 +369,20 @@ export interface SecurityEvent {
   code_language?: string;
   model_provider?: string;
   model_name?: string;
-  role?: string;
+  /**
+   * 消息角色（agent_message）。规范（agent.json）枚举只有
+   * user / assistant / system；写入端（inferMessageRole）保证枚举外取值
+   * （如宿主给的 tool / 任意字符串）不会落盘——它们按"未知"走生命周期推断。
+   */
+  role?: 'user' | 'assistant' | 'system';
+  /**
+   * 角色来源（1.1.0）：`explicit` 宿主明确给出 / `inferred` 载荷形态推断 /
+   * `lifecycle` 会话生命周期推断 / `default` 兜底。
+   *
+   * 宿主在消息事件上经常不带 role，没有这个标记时下游分不清"这是用户
+   * 说的"和"这是我们猜的"。
+   */
+  role_source?: 'explicit' | 'inferred' | 'lifecycle' | 'default' | string;
   content?: string;
   content_length?: number;
   reasoning?: string;
@@ -287,14 +390,37 @@ export interface SecurityEvent {
   message_id?: string;
   parent_message_id?: string;
   message_index?: number;
-  execution_duration_ms?: number;
+  /** 执行耗时（毫秒）。1.1.0 起取代同值的 `execution_duration_ms`。 */
   duration?: number;
-  execution_status?: 'success' | 'error' | string;
-  status?: 'success' | 'failure' | string;
-  result?: string;
+  /**
+   * cron_run：本次运行的开始时间（Unix 毫秒）。scheduled/started 中间
+   * 事件不落盘，起点在内存里按 cronId 记；started 缺失（如插件重启过）
+   * 时本字段与 duration_ms 一起省略，不编造假值。
+   */
+  started_at?: number;
+  /** cron_run：本次运行耗时（毫秒）= 落盘时刻 - started_at。 */
+  duration_ms?: number;
+  /**
+   * cron_run：宿主回传的触发结果（截断 ≤500 字）。字符串原样收，对象
+   * 序列化后收。
+   */
+  fired_result?: string;
+  /**
+   * 事件状态。取值随事件类型而异（写入端实际产出的全部取值）：
+   *   - 工具/子代理/智能体结果类：success | failure | blocked | error
+   *     （blocked = 被策略拦截，blocked 布尔恒在，双写是为了旧消费方兼容）；
+   *   - cron_changed（配置变化）：modified（平台已登记 schema 的枚举是
+   *     started/stopped/modified/error，发 changed 会校验失败）；
+   *   - cron_run（一次运行收敛后的单条事件）：success | failure；
+   *   - agent_session_end：ended | error。
+   * 1.1.0 起取代同值的 `execution_status`；宿主给的任意字符串在写入端
+   * 收敛进上述枚举，不会原样落盘。
+   */
+  status?: 'success' | 'failure' | 'blocked' | 'error' | 'modified' | 'ended';
+  /** 工具结果原始长度（字节/字符数，未截断）。 */
   result_size?: number;
+  /** 工具结果预览（截断后的字符串）。 */
   result_preview?: string;
-  result_preview_length?: number;
   error_message?: string;
   loaded_skills?: string[];
   loaded_tools?: string[];
@@ -306,7 +432,16 @@ export interface SecurityEvent {
     description?: string;
     model_provider?: string;
     model_name?: string;
-    system_prompt?: string;
+    /**
+     * 系统提示词内容指纹（sha256 前 16 位十六进制），与事件层
+     * `system_prompt_ref` 同源同值。
+     *
+     * 事件流里不再内联系统提示词全文——agent_start 的 agents[] 与会话内
+     * 消息事件携带的原文逐字节相同，重复落盘一份 25KB 级别的私有载荷
+     * 没有收益。全文全局唯一一份落在 security-prompts.jsonl，消费方按
+     * ref 对应的完整 prompt_hash 取回。
+     */
+    system_prompt_ref?: string;
     /** Best-effort agent directory; omitted when it cannot be reliably resolved. */
     agent_dir?: string;
     /** Best-effort config file path; omitted when it cannot be reliably resolved. */
@@ -319,6 +454,8 @@ export interface SecurityEvent {
     tools?: AgentToolRef[];
   }>;
   exit_code?: number;
+  /** 子进程被信号终止时的信号名（process_exit）。 */
+  exit_signal?: string;
   metadata?: Record<string, unknown>;
 
   // Application runtime hook fields (process_start)
@@ -334,9 +471,45 @@ export interface SecurityEvent {
     column?: number;
   };
   risk_flags?: string[];
+  /**
+   * hook 传播被绕过的具体原因。
+   *
+   * - `explicit_skip`：调用方显式要求跳过传播 → 子进程真的裸跑，覆盖丢了；
+   * - `env_stripped`：调用方给了不带 NODE_OPTIONS 的 env → hook 已把它
+   *   补回去，覆盖没丢（此前这种情形也被算成 `self_protection_bypass`，
+   *   宿主自己的探活命令因此刷出大量假告警）。
+   */
+  bypass_reason?: string;
+  /**
+   * 是否被策略拦截。**恒在**（无策略命中时为 false）。
+   *
+   * 1.1.0 之前这个键只在部分事件类型上出现（其余事件类型整个键缺失），
+   * 且为 false 时无法区分"未被拦截"与"根本没评估"。现在恒为布尔值，
+   * 下游可以安全地按 `blocked === false` 过滤而不漏掉 warn/modify 类命中
+   * （那类命中记在 `intervention.decision`）。
+   */
   blocked?: boolean;
   block_reason?: string;
-  tool_call_id?: string;
+  /** 关联键：一次工具调用的唯一标识（插件合成，权威）。 */
+  tool_call_id?: string | null;
+  /**
+   * 宿主原始的工具调用 id（`tool_call:call_function_…`）。
+   *
+   * 与 `tool_call_id` 是两套体系：`tool_call_id` 是本插件的关联权威键，
+   * 这个字段仅用于与宿主日志对账。1.1.0 之前宿主原始 id 只藏在
+   * `metadata.toolCallId` 里，与其他 metadata 字段混在一起，无法被
+   * schema 约束，也无法作为 join 键。
+   */
+  host_tool_call_id?: string | null;
+  /**
+   * 外层调用 id（嵌套调用时才有）。
+   *
+   * code-mode exec 在飞行期间跑的工具调用（read/ls/exec …）各自有独立的
+   * `tool_call_id`（保持唯一，决策缓存不串号），外层那次 code-mode exec
+   * 的 id 记在这里——这样"这段工具调用是 code-mode 脚本发起的"这件事在
+   * 事件流里是显式的，不必再靠时间窗口或 step 索引反推。
+   */
+  parent_tool_call_id?: string | null;
   /**
    * 采集侧降级留痕：runtime hook 事件的干预评估队列积压达到
    * 上限时，该事件跳过评估、仅落盘，原因记于此字段。评估被跳过意味着
@@ -434,6 +607,16 @@ export interface SecurityEvent {
   code?: number;
   header?: string;
   body?: string;
+  /**
+   * 载荷是否被截断。
+   *
+   * 1.1.0 之前 network_http 的 `content` 由 runtime hook 原样透传，
+   * 不受 `application.maxContentLength` 约束（实测落盘 4099 字符，
+   * 而配置声明 2000），且 `content_length` 照抄 hook 值，无法区分
+   * "完整响应"与"被截断的响应"。现在 content 按配置截断，
+   * `content_length` 恒为**原始**长度，截断与否由本字段表达。
+   */
+  content_truncated?: boolean;
   /** Network event five-tuple per network.json. */
   local_ip?: string;
   local_port?: number;
@@ -544,8 +727,14 @@ export interface SecurityEvent {
   prev_hash?: string;
   /** Structured asset summary; sensitive values are obf:v1 envelopes. */
   parsed?: Record<string, unknown>;
-  /** Full skill directory package (present when collectSkillPackage is on and the package fits maxPackageBytes). */
-  asset_package?: AssetPackageInfo;
+  /**
+   * 资产包（zip）的内容寻址 sha256（对 asset_package.data 的编码文本计算）。
+   *
+   * 1.1.0 起事件不再内嵌 asset_package 全文（base64 zip 是 asset 事件的
+   * 体积大头）；包体原文写在 `<ndjsonDir>/asset-blobs/<asset_package_hash>`，
+   * 消费方按 hash 取回。asset_change/asset_remove 不携带包字段。
+   */
+  asset_package_hash?: string;
   file_size?: number;
   file_mtime?: number;
 }
@@ -603,6 +792,16 @@ export interface SessionContext {
   agentId?: string;
   agentName?: string;
   agentConfig?: AgentConfig;
+  /**
+   * tool_call 上最近一次已落盘的 user_prompt。user_prompt 是会话内常量，
+   * 逐条复制是纯冗余；只在首次出现或内容变化时携带，其余事件省略字段，
+   * 下游按 session 继承（与 system_prompt_ref 同一语义）。
+   */
+  emittedUserPrompt?: string;
+  /** 同上去重：agent_plan 的 JSON 序列化键，undefined 表示当前为空。 */
+  emittedAgentPlanKey?: string;
+  /** 同上去重：previous_actions 的 JSON 序列化键，undefined 表示当前为空。 */
+  emittedPreviousActionsKey?: string;
 }
 
 // ============================================================================
@@ -803,6 +1002,48 @@ export interface RuntimeHooksConfig {
    * maintenance cron scripts). Patterns are matched case-insensitively.
    */
   excludeCommandLines?: string[];
+  /**
+   * 是否排除宿主自有内部 worker 的子进程事件（1.1.0 起默认开启）。
+   *
+   * 宿主网关在空闲期会周期性拉起自己的只读 worker（sqlite 只读子进程、
+   * 数据库校验 worker 等）。实测 43 条 process_start 里 26 条属于这一类，
+   * 其中 20 条命令行完全一致、只差 pid 与时间戳——它们把真正的子进程
+   * 信号淹没在 17% 的文件体积里。
+   *
+   * 内置判据只匹配宿主自己派生的**子进程标记**（如 `--openclaw-sqlite-
+   * readonly-child`），不匹配宿主内部的模块路径：宿主改版换掉内部文件
+   * 名时内置规则会失配（表现为噪声回来，而不是误杀别的进程）。
+   * 需要完整审计时置 `false`。
+   */
+  excludeHostInternalProcesses?: boolean;
+  /**
+   * 是否排除宿主自身的**只读维护探针**（1.1.0 起默认开启）。
+   *
+   * 宿主网关在空闲期会周期性拉起一批只读的自身维护命令（端口探活
+   * lsof、systemd 状态查询、busctl 版本查询、全局包根目录查询、git
+   * 工作区状态查询、用户/路由/磁盘查询）。实测 1139 条 process_start
+   * 里约 560 条属于这一类，其中 lsof 一条命令就重复了 203 次，且 360 条
+   * 还带着 `self_protection_bypass` 误标，把真正的子进程信号淹没。
+   *
+   * 排除需要**两道闸门同时成立**：事件没有任何 agent 归属（不是某个
+   * agent 动作的产物）+ 命令行逐字命中一条已知的只读探针形态
+   * （见 src/host-internal-probe.ts）。因此带凭据或带拓扑信息的命令
+   * （`gh auth token`、`crontab -l`、`npm config list`、`git config
+   * --get remote.origin.url`、`claude auth status`）一律不会被排除。
+   *
+   * 宿主改版换掉探针写法时规则失配——表现是噪声回来，而不是误杀别的
+   * 进程。失配方向是安全的一侧。需要完整审计时置 `false`。
+   */
+  excludeHostInternalProbeCommands?: boolean;
+  /**
+   * runtime 采集事件的单字段最大长度（字符）。
+   *
+   * 1.1.0 之前 runtime hook 的 `content` 原样透传，不受
+   * `application.maxContentLength` 约束（实测落盘 4099 字符而配置声明
+   * 2000）。现在按本项截断，`content_length` 恒为原始长度，截断与否
+   * 由 `content_truncated` 表达。Default: 2000。
+   */
+  maxContentLength?: number;
   /**
    * Regex patterns for network HTTP requests that should be excluded from
    * collection. Each pattern is tested against the concatenated string

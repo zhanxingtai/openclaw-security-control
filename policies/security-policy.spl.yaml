@@ -214,7 +214,10 @@ rules:
         - move
       paramsRegex:
         path:
-          - (^|/)\.openclaw/
+          # 2026-10-27 误报收敛：agent 工作区（.openclaw/workspace）不是插件
+          # 资产，agent 往自己的 memory 目录写笔记不应被判成篡改配置。
+          # 插件自有资产仍由下方逐条精确模式覆盖。
+          - (^|/)\.openclaw/(?!workspace\b)
           - (^|/)\.openclaw[/\\]openclaw\.json$
           - (^|/)\.openclaw[/\\]security-policy\.ya?ml$
           - (^|/)\.openclaw[/\\]security-events\.jsonl$
@@ -1091,43 +1094,56 @@ rules:
         command:
           # (?:\s+\S+)* 是 ReDoS 灾难性回溯形态，会被 RuleRegexCache 的
           # "ambiguous repetition boundary"护栏拒收、导致整条规则被静默丢弃；
-          # 须用有界间隙 [\s\S]{0,80}?\s+（80 字符跨度 + 强制至少 1 空白）。
-          - cat[\s\S]{0,80}?\s+/etc/passwd
-          - cat[\s\S]{0,80}?\s+/etc/shadow
-          - cat[\s\S]{0,80}?\s+/etc/hosts
+          # 须用有界间隙 [^;|&\n]{0,80}?\s+（80 字符跨度 + 强制至少 1 空白）。
+          #
+          # 2026-10-27 误报收敛：间隙不再跨越 shell 分隔符（; | & 换行）。
+          # 旧形态 [\s\S]{0,80}? 会跨命令边界搭桥——散文里的 "cat passwd
+          # file?" 与后半段真实的 "stat /etc/passwd" 被拼成一条
+          # "cat ... /etc/passwd" 命中。跨分隔符的 cat 与路径本就不是同
+          # 一条命令，不该命中。
+          - cat[^;|&\n]{0,80}?\s+/etc/passwd
+          - cat[^;|&\n]{0,80}?\s+/etc/shadow
+          - pattern: cat[^;|&\n]{0,80}?\s+/etc/hosts
+            except:
+              # 误报收敛协同：SRE 向 /etc/hosts 追加私网 IP（RFC1918 + loopback）
+              # —— 例：echo "10.0.0.5 db.local" >> /etc/hosts（容器内网服务映射）
+              # —— 豁免只作用于 /etc/hosts 这几条形态：读 /etc/shadow 等其它
+              #    敏感文件不受影响（旧写法是整条规则一票否决）。
+              - "(?:^|[;&]|&&|\\|\\|)\\s*[^|;&]*?(?:127\\.0\\.0\\.1|::1|localhost|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)[^|;&]*?(?:>>|tee\\s+-?a?)\\s*/etc/hosts\\b"
           # /root/ 收窄至确凿凭据；开发者本地配置由 data-leak-sensitive-file-001 兜底
           - cat[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b
           - cat[\s\S]{0,80}?.*\.ssh/id_rsa
           - cat[\s\S]{0,80}?.*\.ssh/id_ed25519
           - cat[\s\S]{0,80}?.*\.ssh/id_ecdsa
           - cat[\s\S]{0,80}?.*\.ssh/id_dsa
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/passwd
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/shadow
-          - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/etc/hosts
+          # /etc/passwd 的 head/tail/awk 等部分读取形态不含哈希材料，
+          # 降级到 warn 规则 warn-sensitive-user-enumeration；
+          # /etc/shadow、/etc/hosts 的任一读取形态仍 block。
+          - (head|tail|less|more|awk|grep|sed|strings|xxd|od)[^;|&\n]{0,80}?\s+/etc/shadow
+          - pattern: (head|tail|less|more|awk|grep|sed|strings|xxd|od)[^;|&\n]{0,80}?\s+/etc/hosts
+            except:
+              - "(?:^|[;&]|&&|\\|\\|)\\s*[^|;&]*?(?:127\\.0\\.0\\.1|::1|localhost|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)[^|;&]*?(?:>>|tee\\s+-?a?)\\s*/etc/hosts\\b"
           # /root/ 收窄至确凿凭据；开发者本地配置由 data-leak-sensitive-file-001 兜底
           - (cat|head|tail|less|more|awk|grep|sed|strings|xxd|od)[\s\S]{0,80}?\s+/root/(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.bash_history|\.zsh_history|\.aws/credentials|\.git-credentials|\.netrc)\b
-          - getent\s+passwd
-          - getent\s+(passwd|shadow|group)
+          # getent 只在取 shadow 库（哈希）时 block；passwd/group 枚举不
+          # 暴露任何凭据材料，降级到 warn 规则 warn-sensitive-user-enumeration。
+          - getent\s+shadow\b
           - type\s+[Cc]:[\\/][Ww]indows[\\/][Ss]ystem32[\\/][^\s]+
           # Universal path-based patterns: match sensitive files regardless of the
           # command used, including shell redirect input like `while read ... < /etc/passwd`.
-          - "(?:^|\\s|[\"'<>])/etc/passwd\\b"
+          # /etc/passwd 不含凭据材料，已整体移入 warn 规则（通配只保留含
+          # 哈希/凭据的文件）。
           - "(?:^|\\s|[\"'<>])/etc/shadow\\b"
           - "(?:^|\\s|[\"'<>])/etc/gshadow\\b"
-          - "(?:^|\\s|[\"'<>])/etc/hosts\\b"
+          - pattern: "(?:^|\\s|[\"'<>])/etc/hosts\\b"
+            except:
+              - "(?:^|[;&]|&&|\\|\\|)\\s*[^|;&]*?(?:127\\.0\\.0\\.1|::1|localhost|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)[^|;&]*?(?:>>|tee\\s+-?a?)\\s*/etc/hosts\\b"
           - "(?:^|\\s|[\"'<>])/etc/sudoers\\b"
           - "(?:^|\\s|[\"'<>])/etc/ssh/\\S+"
           # universal /root/ 收窄至确凿敏感文件（与上行 cat/head 形态同覆盖）
           - "(?:^|\\s|[\"'<>])/root/(?:\\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\\.bash_history|\\.zsh_history|\\.aws/credentials|\\.git-credentials|\\.netrc)\\b"
           - "(?:^|\\s|[\"'<>])/proc/self/environ\\b"
           - "(?:^|\\s|[\"'<>])(?:.*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)\\b"
-      paramsNotRegex:
-        command:
-          # 误报收敛协同：SRE 向 /etc/hosts 追加私网 IP（RFC1918 + loopback）
-          # —— 例：echo "10.0.0.5 db.local" >> /etc/hosts（容器内网服务映射）
-          # —— 不豁免 cat/head/tail/less/... /etc/hosts 等读取形态（仍 block 确凿读取）
-
-          - "(?:^|[;&]|&&|\\|\\|)\\s*[^|;&]*?(?:127\\.0\\.0\\.1|::1|localhost|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)[^|;&]*?(?:>>|tee\\s+-?a?)\\s*/etc/hosts\\b"
 
     action:
       decision: block
@@ -1177,6 +1193,78 @@ rules:
           toolName: exec
           params: { command: "cat /root/.npmrc" }
         expectedDecision: allow
+      - name: SRE 追加私网 IP 到 /etc/hosts 不命中（条目级豁免只作用于 /etc/hosts 形态）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "echo \"10.0.0.5 db.local\" >> /etc/hosts" }
+        expectedDecision: allow
+      - name: 同一条命令里追加 hosts 私网 IP 又读 /etc/shadow 仍被阻断（豁免不再整条规则一票否决）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "echo \"10.0.0.5 db.local\" >> /etc/hosts && cat /etc/shadow" }
+        expectedDecision: block
+
+  - id: warn-sensitive-user-enumeration
+    name: 账号枚举类敏感读取留痕（已降 warn，误报收敛）
+    enabled: true
+    priority: 870
+    category: sensitive_data_access
+    severity: medium
+    notes: |
+      getent passwd/group、head/awk/stat /etc/passwd 等账号枚举形态不含哈希材料，
+      与 block-sensitive-system-files 的 read /etc/passwd 同档——留痕不阻断。
+      getent shadow 仍由 block-exec-sensitive-file 阻断（取哈希）。
+    match:
+      actionType:
+        - agent_tool_call
+      toolName:
+        - exec
+        - execute
+        - run_command
+        - bash
+        - shell
+        - sh
+      paramsRegex:
+        command:
+          - getent\s+(passwd|group)\b
+          - (head|tail|less|more|awk|grep|sed|strings|xxd|od)[^;|&\n]{0,80}?\s+/etc/passwd
+          - stat[^;|&\n]{0,40}?\s+/etc/passwd
+          - while\s+read[^;|&\n]{0,80}?\s*<\s*/etc/passwd
+          # 通用 /etc/passwd 路径形态（脚本内嵌读取、python open() 等）
+          - "(?:^|\\s|[\"'<>])/etc/passwd\\b"
+    action:
+      decision: warn
+      warnReason: 账号枚举类敏感读取已记录审计（误报收敛；/etc/passwd 不含哈希材料）
+      blockCode: SENSITIVE_DATA_ACCESS_USER_ENUMERATION_001
+      appealable: true
+    testCases:
+      - name: getent passwd 枚举留痕（已降 warn）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "getent passwd" }
+        expectedDecision: warn
+      - name: getent shadow 取哈希仍被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "getent shadow" }
+        expectedDecision: block
+      - name: head 部分读取 /etc/passwd 留痕（已降 warn）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "head -3 /etc/passwd" }
+        expectedDecision: warn
+      - name: 读取普通日志不命中（负向）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "head -3 /var/log/app.log" }
+        expectedDecision: allow
+
   - id: block-exec-reverse-shell
     name: 阻断 exec 反弹 shell
     enabled: true
@@ -3736,6 +3824,13 @@ rules:
     severity: low
     notes: |
       modify 限制用户数据路径。只收紧白名单、不丢字段，无误伤面。
+      2026-10-27 误报收敛：家目录点目录的触发面排除 agent 自己的工作区
+      ~/.openclaw/workspace/**——那不是受保护区域（与 SelfProtection 的
+      protected_paths 同口径）。旧形态把工作区也拖进本规则，而
+      whitelistConstraint 只放行 .openclaw/data/ 子树，于是 agent 写自己
+      工作区笔记时 path 字段会被整条删掉（modify 的 whitelistConstraint
+      语义是"不匹配就丢字段"），写操作直接失去目标路径。凭据/私钥类点目录
+      （.netrc/.pypirc/.aws/.docker/.ssh…）仍在触发面内：写它们依旧要剥路径。
     match:
       actionType:
         - agent_tool_call
@@ -3747,9 +3842,11 @@ rules:
       paramsRegex:
         path:
           - ^\.\./
-          - ^/home/[^/]+/\.
           - ^/root/\.openclaw/data/
           - ^/home/[^/]+/\.openclaw/data/
+          # 家目录点目录（凭据/私钥/敏感配置）：写入要剥掉目标路径。
+          # 例外：agent 自己的工作区 ~/.openclaw/workspace/** 不在此面内。
+          - ^/home/[^/]+/\.(?!openclaw/workspace\b)
     action:
       decision: modify
       modify:
@@ -6129,13 +6226,17 @@ rules:
         - powershell
       paramsRegex:
         command:
+          # 审计文件引用不受包管理器上下文豁免——即使同一条命令里出现
+          # npm/node_modules，读审计文件依然是规避审计的前置动作。
           - (security-monitor\.patch|security-events[^\s"']{0,40}\.jsonl|security-policy\.json)
-          - (node_modules[/\\][^\s]*(?:sst-security-control-openclaw|openclaw-security-monitor))
-          - (\S*/(?:sst-security-control-openclaw|openclaw-security-monitor)/(?:dist|src|policies|lib)[^\s]*)
-      paramsNotRegex:
-        command:
-          # 包管理器安装/链接上下文提及 node_modules 路径属正常操作
-          - \b(?:npm|yarn|pnpm|pnpx|npx)\b[^|&;\n]{0,120}node_modules[/\\]
+          # 下面两条是"插件安装路径"形态：包管理器安装/链接上下文里提及
+          # node_modules 路径属正常操作，按条目级豁免放行。
+          - pattern: (node_modules[/\\][^\s]*(?:sst-security-control-openclaw|openclaw-security-monitor))
+            except:
+              - \b(?:npm|yarn|pnpm|pnpx|npx)\b[^|&;\n]{0,120}node_modules[/\\]
+          - pattern: (\S*/(?:sst-security-control-openclaw|openclaw-security-monitor)/(?:dist|src|policies|lib)[^\s]*)
+            except:
+              - \b(?:npm|yarn|pnpm|pnpx|npx)\b[^|&;\n]{0,120}node_modules[/\\]
     action:
       decision: block
       blockReason: 命令中引用安全监控插件配置/数据/安装路径可能用于读取、篡改或规避审计，已被安全策略阻断
@@ -6178,6 +6279,12 @@ rules:
           toolName: exec
           params: { command: "npm install node_modules/openclaw-security-monitor/build/hook.js" }
         expectedDecision: allow
+      - name: npm 上下文里引用审计文件仍被阻断（豁免只作用于 node_modules 形态，不牵连审计文件形态）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "npm install foo && cat /root/.openclaw/security-events.jsonl" }
+        expectedDecision: block
       - name: 普通项目 security-policy 文档不命中（负向）
         input:
           actionType: agent_tool_call
@@ -6464,7 +6571,12 @@ x-openclaw-selfProtection:
   flags: 'i'
   groups:
     protected_paths:
-      - '(^|/)\.openclaw[/\\]'
+      # 2026-10-27 误报收敛：agent 工作区（~/.openclaw/workspace）不是插件
+      # 资产——它承载 agent 自己的 memory/笔记。原先的通配把整个 .openclaw/
+      # 都列为受保护路径，于是「把这段排查笔记写进 memory」会因为正文里
+      # 出现 workspace 路径而被当成篡改拦下。插件自有资产（openclaw.json /
+      # 策略文件 / 审计日志 / 扩展目录 / 安装目录）由下方逐条精确模式覆盖。
+      - '(^|/)\.openclaw[/\\](?!workspace\b)'
       - '(^|/)\.openclaw[/\\]openclaw\.json$'
       - '(^|/)\.openclaw[/\\]security-policy\.ya?ml$'
       - '(^|/)\.openclaw[/\\]security-events\.jsonl$'

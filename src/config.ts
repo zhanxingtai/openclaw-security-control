@@ -109,6 +109,20 @@ export const DEFAULT_CONFIG: SecurityMonitorConfig = {
       blockedFlags: [...GENERATED_HOOK_BLOCKED_FLAGS],
       excludeCommandLines: [],
       excludeNetworkUrls: [],
+      // 宿主自有内部 worker 的子进程事件（sqlite 只读子进程等）默认排除：
+      // 实测 43 条 process_start 里 26 条属于这一类，占事件文件体积 17%。
+      // 需要完整审计时置 false。
+      excludeHostInternalProcesses: true,
+      // 宿主自身的只读维护探针（lsof / systemctl / busctl / npm root -g /
+      // git 工作区查询 …）默认排除：实测 1139 条 process_start 里约 560 条
+      // 属于这一类，其中 lsof 一条命令重复 203 次，且 360 条带着
+      // self_protection_bypass 误标。排除需要「无 agent 归属」+「命令逐字
+      // 命中已知只读探针形态」两道闸门同时成立，带凭据的命令不受影响。
+      // 需要完整审计时置 false。
+      excludeHostInternalProbeCommands: true,
+      // runtime 采集事件的单字段最大长度。1.1.0 之前 runtime hook 的
+      // content 原样透传，不受 application.maxContentLength 约束。
+      maxContentLength: 2000,
     },
   },
   network: {
@@ -302,6 +316,9 @@ const runtimeHooksSchema: Record<string, Rule> = {
   blockedFlags: arr,
   excludeCommandLines: arr,
   excludeNetworkUrls: arr,
+  excludeHostInternalProcesses: bool,
+  excludeHostInternalProbeCommands: bool,
+  maxContentLength: (v, d) => (v !== undefined ? Math.max(0, Number(v)) : d),
 };
 
 function mergeRuntimeHooksConfig(input: Record<string, unknown> | undefined) {

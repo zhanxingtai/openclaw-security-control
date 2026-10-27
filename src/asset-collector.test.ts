@@ -66,7 +66,8 @@ function mockCollector(reported: SecurityEvent[]): { report: (event: SecurityEve
 function createCollector(
   fixture: Fixture,
   reported: SecurityEvent[],
-  extra?: Partial<AssetMonitorConfig>
+  extra?: Partial<AssetMonitorConfig>,
+  options?: { blobDir?: string }
 ): AssetCollector {
   return new AssetCollector(
     mockCollector(reported),
@@ -82,8 +83,14 @@ function createCollector(
       configPaths: [fixture.configPath],
       skillDirs: [fixture.skillsRoot],
       mcpPaths: [fixture.mcpPath],
-    }
+    },
+    { blobDir: options?.blobDir ?? path.join(fixture.root, 'asset-blobs') }
   );
+}
+
+/** 按内容寻址从 asset-blobs/ 读回包体原文（base64 文本）。 */
+function readBlob(root: string, hash: string): string {
+  return fs.readFileSync(path.join(root, 'asset-blobs', hash), 'utf8');
 }
 
 describe('AssetCollector', () => {
@@ -414,7 +421,7 @@ describe('AssetCollector', () => {
       });
     }
 
-    it('reclaims a forged lock (dead pid + fresh timestamp) and emits tamper_detected', async () => {
+    it('reclaims a forged lock (dead pid + fresh timestamp) and emits x_openclaw_tamper_detected', async () => {
       writeLock({ pid: await deadPid(), acquiredAt: Date.now() });
 
       const c = track(createCollector(fixture, reported, { scanIntervalMs: 60000 }));
@@ -423,7 +430,7 @@ describe('AssetCollector', () => {
       // 扫描未被抑制：基线照常上报。
       expect(reported.some((e) => e.event_type === 'asset_add')).toBe(true);
       // 伪造持有已被识别并留痕。
-      const tamper = reported.find((e) => e.event_type === 'tamper_detected');
+      const tamper = reported.find((e) => e.event_type === 'x_openclaw_tamper_detected');
       expect(tamper).toBeDefined();
       expect(tamper?.kind).toBe('forged_lock');
       expect(typeof tamper?.lock_pid).toBe('number');
@@ -452,14 +459,14 @@ describe('AssetCollector', () => {
         expect(reported.some((e) => e.event_type === 'asset_add')).toBe(false);
 
         // 持有者死亡后：下一次 tick 检出伪造签名（新鲜时间戳 + 死 pid），
-        // 发 tamper_detected 并回收锁，扫描恢复。
+        // 发 x_openclaw_tamper_detected 并回收锁，扫描恢复。
         holder.kill('SIGKILL');
         const resumed = await waitFor(
           () => reported.some((e) => e.event_type === 'asset_add'),
           5000
         );
         expect(resumed).toBe(true);
-        expect(reported.some((e) => e.event_type === 'tamper_detected' && e.kind === 'forged_lock')).toBe(true);
+        expect(reported.some((e) => e.event_type === 'x_openclaw_tamper_detected' && e.kind === 'forged_lock')).toBe(true);
       } finally {
         holder.kill('SIGKILL');
       }
@@ -477,7 +484,7 @@ describe('AssetCollector', () => {
       writeLock({ pid: process.pid, acquiredAt: Date.now(), nonce: 'forged-nonce' });
 
       const detected = await waitFor(
-        () => reported.some((e) => e.event_type === 'tamper_detected' && e.kind === 'lock_replaced'),
+        () => reported.some((e) => e.event_type === 'x_openclaw_tamper_detected' && e.kind === 'lock_replaced'),
         5000
       );
       expect(detected).toBe(true);
@@ -506,7 +513,7 @@ describe('AssetCollector', () => {
 
   it('emits content_hash + content_preview (no raw content) when collectContent is enabled', async () => {
     // 内容落盘收紧 —— 不再保留 obfuscated 原文，
-    // 改存 sha256 + 前 256 字节脱敏预览。原文走 `asset_package` zip
+    // 改存 sha256 + 前 256 字节脱敏预览。原文走 asset-blobs 内容寻址
     // 通道或干脆不存；parsed 走 lean 形态。
     const c = track(createCollector(fixture, reported, { collectContent: true }));
     await c.initialize();
@@ -615,19 +622,18 @@ describe('AssetCollector', () => {
     expect(JSON.stringify(reported)).not.toContain('pw123');
   });
 
-  it('attaches a ZIP package of the full skill directory when collectSkillPackage is on', async () => {
+  it('attaches a content-addressed ZIP package of the full skill directory when collectSkillPackage is on', async () => {
     const c = track(createCollector(fixture, reported, { collectSkillPackage: true }));
     await c.initialize();
 
     const skill = reported.find((e) => e.asset_type === 'skill');
-    const pkg = skill?.asset_package;
-    expect(pkg).toBeDefined();
-    expect(pkg?.format).toBe('zip');
-    expect(pkg?.encoding).toBe('base64');
-    expect(pkg?.file_count).toBe(2);
+    // 事件只带内容寻址 hash，包体（编码文本）按 hash 落在 asset-blobs/<hash>。
+    const hash = skill?.asset_package_hash;
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(skill?.asset_package).toBeUndefined();
 
     // Decode and walk the archive: both files must be inside, intact.
-    const zip = Buffer.from(pkg!.data, 'base64');
+    const zip = Buffer.from(readBlob(fixture.root, hash!), 'base64');
     expect(zip.readUInt32LE(0)).toBe(0x04034b50);
     const entries = readZipEntries(zip);
     expect(entries.map((e) => e.name).sort()).toEqual(['SKILL.md', 'helper.txt']);
@@ -652,6 +658,7 @@ describe('AssetCollector', () => {
 
     const skill = reported.find((e) => e.asset_type === 'skill');
     expect(skill?.asset_package).toBeUndefined();
+    expect(skill?.asset_package_hash).toBeUndefined();
     expect(skill?.parsed?.package_omitted).toBe('too_large');
     expect(skill?.parsed?.package_bytes).toBeGreaterThan(10);
     // Manifest still goes out so the consumer has per-file hashes.
@@ -663,6 +670,7 @@ describe('AssetCollector', () => {
     await c.initialize();
     const skill = reported.find((e) => e.asset_type === 'skill');
     expect(skill?.asset_package).toBeUndefined();
+    expect(skill?.asset_package_hash).toBeUndefined();
   });
 
   it('removed events carry no package', async () => {
@@ -676,6 +684,7 @@ describe('AssetCollector', () => {
     expect(reported).toHaveLength(1);
     expect(reported[0].event_type).toBe('asset_remove');
     expect(reported[0].asset_package).toBeUndefined();
+    expect(reported[0].asset_package_hash).toBeUndefined();
   });
 
   it('excludes oversized single files from the skill package but keeps them in the manifest', async () => {
@@ -690,9 +699,9 @@ describe('AssetCollector', () => {
     await c.initialize();
 
     const skill = reported.find((e) => e.asset_path === bigDir);
-    const pkg = skill?.asset_package;
-    expect(pkg).toBeDefined();
-    expect(pkg?.file_count).toBe(1); // only SKILL.md made it into the ZIP
+    const hash = skill?.asset_package_hash;
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(skill?.asset_package).toBeUndefined();
     expect(skill?.parsed?.package_omitted).toBeUndefined();
     expect(skill?.parsed?.package_excluded_files).toBe(1);
 
@@ -701,7 +710,7 @@ describe('AssetCollector', () => {
     expect(bigEntry?.excluded).toBe('too_large');
     expect(bigEntry?.sha256).toMatch(/^[0-9a-f]{64}$/);
 
-    const zip = Buffer.from(pkg!.data, 'base64');
+    const zip = Buffer.from(readBlob(fixture.root, hash!), 'base64');
     expect(readZipEntries(zip).map((e) => e.name)).toEqual(['SKILL.md']);
   });
 
@@ -717,6 +726,7 @@ describe('AssetCollector', () => {
 
     const skill = reported.find((e) => e.asset_path === hugeDir);
     expect(skill?.asset_package).toBeUndefined();
+    expect(skill?.asset_package_hash).toBeUndefined();
     expect(skill?.parsed?.package_omitted).toBe('entries_too_large');
   });
 
@@ -725,13 +735,11 @@ describe('AssetCollector', () => {
     await c.initialize();
 
     const cfg = reported.find((e) => e.asset_type === 'agent_config');
-    const pkg = cfg?.asset_package;
-    expect(pkg).toBeDefined();
-    expect(pkg?.format).toBe('zip');
-    expect(pkg?.file_count).toBe(1);
-    expect(pkg?.original_bytes).toBe(fs.statSync(fixture.configPath).size);
+    const pkgHash = cfg?.asset_package_hash;
+    expect(pkgHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(cfg?.asset_package).toBeUndefined();
 
-    const zip = Buffer.from(pkg!.data, 'base64');
+    const zip = Buffer.from(readBlob(fixture.root, pkgHash!), 'base64');
     const entries = readZipEntries(zip);
     expect(entries).toHaveLength(1);
     expect(entries[0].name).toBe('openclaw.json');
@@ -744,14 +752,45 @@ describe('AssetCollector', () => {
     expect(JSON.stringify(mcp?.parsed)).not.toContain(TOKEN);
   });
 
-  it('omits the config package and marks package_omitted when it exceeds maxPackageBytes', async () => {
-    const c = track(
+  it('does not repeat an unchanged config package when the content flips back', async () => {
+    const c = track(createCollector(fixture, reported, { collectConfigPackage: true }));
+    await c.initialize();
+
+    const baseline = reported.find((e) => e.asset_type === 'agent_config');
+    expect(baseline?.asset_package_hash).toMatch(/^[0-9a-f]{64}$/);
+
+    // Flip the config to a second content, then flip it back to the original.
+    // The second flip reproduces a package that was already shipped — carrying
+    // the same content-addressed hash again is safe (no inline duplication),
+    // and the blob already exists on disk.
+    const original = fs.readFileSync(fixture.configPath, 'utf8');
+    const cfg = JSON.parse(original);
+    cfg.mcpServers.github.env.GITHUB_TOKEN = 'ghp_new_token_999';
+    writeJson(fixture.configPath, cfg);
+    await c.scanNow();
+
+    writeJson(fixture.configPath, JSON.parse(original));
+    await c.scanNow();
+
+    const configChanges = reported.filter((e) => e.asset_type === 'agent_config');
+    expect(configChanges.length).toBeGreaterThanOrEqual(3);
+    // The last change restores the original content: same package → same hash,
+    // referenced by content address instead of copying the payload.
+    const last = configChanges[configChanges.length - 1];
+    expect(last.event_type).toBe('asset_change');
+    expect(last.asset_package).toBeUndefined();
+    expect(last.asset_package_hash).toBe(baseline?.asset_package_hash);
+    expect(last.content_hash).toBe(baseline?.content_hash);
+  });
+
+  it('omits the config package and marks package_omitted when it exceeds maxPackageBytes', async () => {    const c = track(
       createCollector(fixture, reported, { collectConfigPackage: true, maxPackageBytes: 10 })
     );
     await c.initialize();
 
     const cfg = reported.find((e) => e.asset_type === 'agent_config');
     expect(cfg?.asset_package).toBeUndefined();
+    expect(cfg?.asset_package_hash).toBeUndefined();
     expect(cfg?.parsed?.package_omitted).toBe('too_large');
     expect(cfg?.parsed?.package_bytes).toBeGreaterThan(10);
     // Fallback: without the package, sections stay as the content visibility.
@@ -765,8 +804,9 @@ describe('AssetCollector', () => {
     await c.initialize();
 
     const cfg = reported.find((e) => e.asset_type === 'agent_config');
-    expect(cfg?.asset_package).toBeDefined();
-    // Full content lives only in the ZIP; parsed keeps descriptive fields only.
+    expect(cfg?.asset_package_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(cfg?.asset_package).toBeUndefined();
+    // Full content lives only in the blob; parsed keeps descriptive fields only.
     expect(cfg?.parsed?.content).toBeUndefined();
     expect(cfg?.parsed?.sections).toBeUndefined();
     expect(Object.keys(cfg?.parsed ?? {}).sort()).toEqual(
@@ -782,20 +822,57 @@ describe('AssetCollector', () => {
     expect(reported).toHaveLength(3);
 
     // Second run with packaging ON: fingerprint differs → full re-baseline,
-    // and the skill event now carries its package.
+    // and the skill event now carries its package hash.
     reported.length = 0;
     const c2 = track(createCollector(fixture, reported, { collectSkillPackage: true }));
     await c2.initialize();
     await c2.shutdown();
     expect(reported).toHaveLength(3);
     expect(reported.every((e) => e.event_type === 'asset_add')).toBe(true);
-    expect(reported.find((e) => e.asset_type === 'skill')?.asset_package).toBeDefined();
+    expect(reported.find((e) => e.asset_type === 'skill')?.asset_package_hash).toMatch(/^[0-9a-f]{64}$/);
 
     // Third run with the SAME flags: fingerprint matches → silent again.
     reported.length = 0;
     const c3 = track(createCollector(fixture, reported, { collectSkillPackage: true }));
     await c3.initialize();
     expect(reported).toHaveLength(0);
+  });
+
+  it('blob 写盘失败时降级：事件省略 asset_package_hash，不抛异常', async () => {
+    // blobDir 指向一个已存在的**文件**：mkdir 递归失败，写盘必然报错。
+    const blocker = path.join(fixture.root, 'blob-blocker');
+    fs.writeFileSync(blocker, 'occupied');
+
+    const c = track(
+      createCollector(fixture, reported, { collectSkillPackage: true }, { blobDir: blocker })
+    );
+    await expect(c.initialize()).resolves.toBeUndefined();
+
+    const skill = reported.find((e) => e.asset_type === 'skill');
+    expect(skill).toBeDefined();
+    expect(skill?.asset_package).toBeUndefined();
+    expect(skill?.asset_package_hash).toBeUndefined();
+  });
+
+  it('同一包内容在 asset-blobs/ 里只落一份（文件名即 hash）', async () => {
+    const c = track(createCollector(fixture, reported, { collectConfigPackage: true }));
+    await c.initialize();
+    const baseline = reported.find((e) => e.asset_type === 'agent_config');
+
+    // 内容翻转出去再翻回来：blob 文件仍然只有一份（同 hash 复用）。
+    const original = fs.readFileSync(fixture.configPath, 'utf8');
+    const cfg = JSON.parse(original);
+    cfg.mcpServers.github.env.GITHUB_TOKEN = 'ghp_new_token_999';
+    writeJson(fixture.configPath, cfg);
+    await c.scanNow();
+    writeJson(fixture.configPath, JSON.parse(original));
+    await c.scanNow();
+
+    // 翻转出去产生第二份不同内容的 blob；翻转回来同 hash 复用，不新增。
+    const blobDir = path.join(fixture.root, 'asset-blobs');
+    const blobs = fs.readdirSync(blobDir);
+    expect(blobs).toHaveLength(2);
+    expect(blobs).toContain(baseline?.asset_package_hash);
   });
 });
 

@@ -55,10 +55,21 @@ function bridgeAgentComplete(event: unknown, ctx: unknown): AgentCompleteContext
   }
 }
 
-function bridgeMessageWrite(event: unknown, ctx: unknown): MessageWriteContext | undefined {
+/**
+ * 归一化一条消息写入上下文。
+ *
+ * `defaultRole` 是**钩子语义**带来的兜底角色：宿主的 `message.received`
+ * 一定是用户输入，`message.sending` 一定是模型输出——即便载荷里没有
+ * role 字段，这个信息也在 hook 名字里，丢掉可惜。
+ */
+function bridgeMessageWrite(
+  event: unknown,
+  ctx: unknown,
+  defaultRole?: MessageWriteContext['role']
+): MessageWriteContext | undefined {
   try {
     const merged = mergeHookArgs([event, ctx]);
-    return normalizeMessageWriteContext(merged);
+    return normalizeMessageWriteContext(merged, defaultRole);
   } catch (err) {
     logBridgeFailure('before_message_write / message_received / message_sending', err);
     return undefined;

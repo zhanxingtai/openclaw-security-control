@@ -3,12 +3,14 @@ import { mkdtempSync, rmSync, copyFileSync, writeFileSync, readFileSync, existsS
 import { tmpdir } from "os";
 import path from "path";
 import { Writable } from "stream";
-import plugin from "../index.js";
+import plugin, { GATEWAY_RPC_METHODS } from "../index.js";
 
 /**
  * 宿主集成面覆盖：
- * - index.ts 其余 7 个 RPC（security.evaluate/status/events.list/
+ * - index.ts 的读侧 RPC（security.evaluate/status/events.list/
  *   events.stats/assets.list/policy.hits/metrics）注册后调用断言；
+ * - 全部已声明的 gateway 方法都真的注册到了宿主上（集合比对，见
+ *   "全部已声明的 gateway 方法都注册" 用例）；
  * - /events.ndjson 流式路由真实写出 NDJSON；
  * - api.on typed-hook 链路：fakeApi 捕获注册并驱动 before_tool_call
  *   回调，断言事件落盘。
@@ -91,7 +93,7 @@ afterAll(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("7 个 RPC 注册与调用", () => {
+describe("读侧 RPC 注册与调用（7 个）", () => {
   const EXPECTED_RPCS = [
     "security.evaluate",
     "security.status",
@@ -195,6 +197,80 @@ describe("/events.ndjson 流式路由", () => {
     const lines = body.split("\n").filter((l) => l.trim().length > 0);
     for (const line of lines) {
       expect(() => JSON.parse(line)).not.toThrow();
+    }
+  });
+});
+
+/**
+ * 宿主清单不再声明运行期行为。
+ *
+ * 宿主清单（openclaw.plugin.json）的 `contracts` 只认"静态能力归属"
+ * （providers / tools 之类的 id 列表），不认 hook 名、网关方法名、HTTP 路由。
+ * 这些以前写死在 `contracts.hooks` / `contracts.gatewayMethods` /
+ * `contracts.httpRoutes` 里，宿主加载器从来就没读过（ClawHub 上架校验把
+ * 它们判成非法键），真正生效的是 register() 里的注册。
+ *
+ * 所以同一份事实改由这里钉住：注册面必须在运行时真的存在。
+ */
+describe("运行期注册面（清单不再声明，改由注册代码拥有）", () => {
+  const EXPECTED_HOOKS = [
+    "before_agent_run",
+    "agent_end",
+    "before_tool_call",
+    "after_tool_call",
+    "before_message_write",
+    "session_start",
+    "session_end",
+    "subagent_spawned",
+    "subagent_progress",
+    "subagent_ended",
+    "cron_changed",
+  ];
+
+  const EXPECTED_RPCS = [
+    "security.evaluate",
+    "security.status",
+    "security.events.list",
+    "security.events.stats",
+    "security.assets.list",
+    "security.policy.hits",
+    "security.metrics",
+    "security.config.get",
+    "security.config.diff",
+    "security.config.save",
+  ];
+
+  const EXPECTED_ROUTES = [
+    "/openclaw-security-monitor/events.ndjson",
+    "/openclaw-security-monitor/panel",
+  ];
+
+  it("11 个 typed hook 全部通过 api.on 注册", () => {
+    for (const hook of EXPECTED_HOOKS) {
+      expect(onHandlers.has(hook), `hook ${hook} must be registered via api.on`).toBe(true);
+    }
+  });
+
+  it("面板与评估面板依赖的网关方法全部注册", () => {
+    for (const rpc of EXPECTED_RPCS) {
+      expect(gatewayMethods.has(rpc), `RPC ${rpc} must be registered`).toBe(true);
+    }
+  });
+
+  it("全部已声明的 gateway 方法都注册（集合比对，不留未声明的方法）", () => {
+    // 早先这里只逐个断言"子集已注册"，多注册/少注册都抓不到；
+    // 现在与 index.ts 导出的 GATEWAY_RPC_METHODS 做集合比对：
+    //   - handler 写了却忘了在 GATEWAY_RPC_SCOPES 里声明 → 抓得到
+    //     （漏声明会被兜底成 operator.read，写方法静默降权）；
+    //   - 声明了却没实现 handler → 也抓得到。
+    const declared = [...GATEWAY_RPC_METHODS].sort();
+    const registered = [...gatewayMethods.keys()].sort();
+    expect(registered).toEqual(declared);
+  });
+
+  it("面板与事件流路由注册", () => {
+    for (const route of EXPECTED_ROUTES) {
+      expect(httpRoutes.has(route), `route ${route} must be registered`).toBe(true);
     }
   });
 });

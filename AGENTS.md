@@ -45,7 +45,7 @@ npm run build:ci
 
 ```bash
 ls -la install/
-tar -tzf install/sst-security-control-openclaw-1.0.1.tgz | grep -E "changed/file|changed/keyword"
+tar -tzf install/sst-security-control-openclaw-1.0.2.tgz | grep -E "changed/file|changed/keyword"
 ```
 
 ## 3. 避免重复测试反模式

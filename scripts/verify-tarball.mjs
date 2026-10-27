@@ -10,6 +10,9 @@
  *   - 根目录含 index.js / openclaw.plugin.json / policies/ / hooks/ / system/
  *   - 不含 src/adapters/ / src/middleware/ / dist/ 旧路径
  *   - 不含 scripts/setup-openclaw.js（插件严格自包含，无 install scripts）
+ *   - 打包进去的 openclaw.plugin.json 只含宿主认识的字段（ClawHub 上架校验
+ *     对未知顶层字段 / 未知 contracts 键判硬错误），且 package.json 声明的
+ *     openclaw.extensions 入口在包里真实存在
  *
  * Exit code: 0 if all checks pass, 1 otherwise.
  */
@@ -19,6 +22,11 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  findUnknownCategories,
+  findUnknownContractKeys,
+  findUnknownManifestFields,
+} from './openclaw-manifest-contract.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -106,46 +114,43 @@ try {
     if (bad) failures.push(`forbidden entry present: ${entry}`);
   }
 
-  // openclaw.plugin.json must declare entry = index.js so the 9.4 host loader
-  // resolves to package/index.js (the tarball-stripped re-export).
+  // The shipped manifest must only carry fields the host knows.
+  // ClawHub's publish validation rejects unknown top-level fields
+  // (manifest-unknown-fields) and unknown contracts keys
+  // (manifest-unknown-contracts) as hard errors, so the tarball is checked
+  // here — the artifact the user actually uploads, not just the repo copy.
   const manifest = JSON.parse(
     execSync(`tar -xOzf "${tarPath}" package/openclaw.plugin.json`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
   );
-  const entryOk = manifest.main === 'index.js' && manifest.entry === 'index.js';
-  console.log(`[verify-tarball] manifest entry: ${entryOk ? '✓' : '✗'} main=${manifest.main} entry=${manifest.entry}`);
-  if (!entryOk) failures.push(`manifest entry mismatch: ${JSON.stringify({ main: manifest.main, entry: manifest.entry })}`);
+  const unknownFields = findUnknownManifestFields(manifest);
+  const fieldsOk = unknownFields.length === 0;
+  console.log(`[verify-tarball] manifest fields: ${fieldsOk ? '✓' : '✗'}${fieldsOk ? '' : ` unknown=${JSON.stringify(unknownFields)}`}`);
+  if (!fieldsOk) failures.push(`manifest declares unknown top-level fields: ${JSON.stringify(unknownFields)}`);
 
-  // Contracts must list the 11 typed hooks plus the legacy
-  // 5-family hook fallback for older hosts.
-  const expectedHooks = [
-    'before_agent_run', 'agent_end', 'before_tool_call', 'after_tool_call',
-    'before_message_write', 'session_start', 'session_end',
-    'subagent_spawned', 'subagent_progress', 'subagent_ended', 'cron_changed',
-  ];
-  const declaredHooks = manifest.contracts?.hooks ?? [];
-  const hooksOk = expectedHooks.every((h) => declaredHooks.includes(h)) && declaredHooks.length === expectedHooks.length;
-  console.log(`[verify-tarball] contracts.hooks: ${hooksOk ? '✓' : '✗'} (${declaredHooks.length} declared, expected ${expectedHooks.length})`);
-  if (!hooksOk) failures.push(`hooks mismatch: declared=${JSON.stringify(declaredHooks)} expected=${JSON.stringify(expectedHooks)}`);
+  const unknownContracts = findUnknownContractKeys(manifest);
+  const contractsOk = unknownContracts.length === 0;
+  console.log(`[verify-tarball] manifest contracts keys: ${contractsOk ? '✓' : '✗'}${contractsOk ? '' : ` unknown=${JSON.stringify(unknownContracts)}`}`);
+  if (!contractsOk) failures.push(`manifest.contracts declares unknown keys: ${JSON.stringify(unknownContracts)}`);
 
-  // httpRoutes must include the panel route (Security Tab iframe surface).
-  const expectedRoutes = [
-    '/openclaw-security-monitor/events.ndjson',
-    '/openclaw-security-monitor/panel',
-  ];
-  const routesOk = expectedRoutes.every((r) => (manifest.contracts?.httpRoutes ?? []).includes(r));
-  console.log(`[verify-tarball] contracts.httpRoutes: ${routesOk ? '✓' : '✗'}`);
-  if (!routesOk) failures.push(`httpRoutes mismatch: ${JSON.stringify(manifest.contracts?.httpRoutes)}`);
+  const unknownCategories = findUnknownCategories(manifest);
+  const categoriesOk = unknownCategories.length === 0;
+  console.log(`[verify-tarball] manifest categories: ${categoriesOk ? '✓' : '✗'}${categoriesOk ? '' : ` unknown=${JSON.stringify(unknownCategories)}`}`);
+  if (!categoriesOk) failures.push(`manifest.categories has unknown slugs: ${JSON.stringify(unknownCategories)}`);
 
-  // gatewayMethods must include the 10 RPCs the Control UI calls.
-  const expectedRpcs = [
-    'security.evaluate', 'security.status', 'security.events.list',
-    'security.events.stats', 'security.assets.list', 'security.policy.hits',
-    'security.metrics', 'security.config.get', 'security.config.diff',
-    'security.config.save',
-  ];
-  const rpcsOk = expectedRpcs.every((m) => (manifest.contracts?.gatewayMethods ?? []).includes(m));
-  console.log(`[verify-tarball] contracts.gatewayMethods: ${rpcsOk ? '✓' : '✗'}`);
-  if (!rpcsOk) failures.push(`gatewayMethods mismatch: ${JSON.stringify(manifest.contracts?.gatewayMethods)}`);
+  // The host resolves the plugin entry from package.json#openclaw.extensions,
+  // not from the manifest — the manifest has no main/entry field to read.
+  // Every declared extension must exist in the tarball, otherwise the host
+  // resolves to a missing file and the plugin silently never loads.
+  const shippedPkg = JSON.parse(
+    execSync(`tar -xOzf "${tarPath}" package/package.json`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
+  );
+  const extensions = Array.isArray(shippedPkg.openclaw?.extensions) ? shippedPkg.openclaw.extensions : [];
+  const missingExtensions = extensions.filter(
+    (entry) => !present(`package/${String(entry).replace(/^\.\//, '')}`)
+  );
+  const extensionsOk = extensions.length > 0 && missingExtensions.length === 0;
+  console.log(`[verify-tarball] openclaw.extensions: ${extensionsOk ? '✓' : '✗'} ${JSON.stringify(extensions)}`);
+  if (!extensionsOk) failures.push(`openclaw.extensions missing from tarball: ${JSON.stringify(missingExtensions)}`);
 } catch (err) {
   console.error(`[verify-tarball] failed: ${err.message}`);
   exitCode = 1;

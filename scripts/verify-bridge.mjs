@@ -13,7 +13,7 @@
  *   - GET  /openclaw-security-monitor/events.ndjson   (SDK pull)
  *   - GET  /openclaw-security-monitor/panel           (Control UI iframe HTML)
  *   - POST /openclaw-security-monitor/panel           (in-iframe RPC dispatch)
- *   - the 10 registerGatewayMethod RPCs               (gateway WS surface)
+ *   - the registerGatewayMethod RPCs                   (gateway WS surface)
  *
  * Block/allow correctness is proven against the BUNDLED policy's own
  * test-case pair: `npm uninstall openclaw-security-monitor` must block,
@@ -173,7 +173,21 @@ async function callBeforeToolCall(command) {
 
   console.log('[verify-bridge] registration surface:');
   check('register() is synchronous', entry.register.constructor.name !== 'AsyncFunction');
-  check('10 gateway methods registered', gatewayMethods.size === 10, [...gatewayMethods.keys()].join(', '));
+  // 方法集合与插件自己声明的 GATEWAY_RPC_METHODS 逐一比对（不是数量
+  // 比对）：早先这里硬编码 "10"，RPC 面扩容到 13 之后断言变成永远失败
+  // 的死数字，而脚本不在 CI 里没人发现。集合比对还能抓住"加了 handler
+  // 忘了配 scope"这类半途而废。
+  const expectedMethods = Array.isArray(mod.GATEWAY_RPC_METHODS) ? [...mod.GATEWAY_RPC_METHODS].sort() : null;
+  if (!expectedMethods) {
+    console.error('[verify-bridge] 插件入口未导出 GATEWAY_RPC_METHODS —— 请先 `npm run build` 重新构建');
+    process.exit(1);
+  }
+  const actualMethods = [...gatewayMethods.keys()].sort();
+  check(
+    `gateway methods registered match declared set (${expectedMethods.length})`,
+    actualMethods.length === expectedMethods.length && actualMethods.every((m, i) => m === expectedMethods[i]),
+    `actual=${actualMethods.join(', ')} expected=${expectedMethods.join(', ')}`
+  );
   check('5 http routes registered', httpRoutes.size === 5, [...httpRoutes.keys()].join(', '));
   check('typed hooks subscribed', ['before_agent_run', 'agent_end', 'before_tool_call', 'after_tool_call', 'before_message_write', 'session_end'].every((h) => typedHooks.has(h)));
   check('legacy registerHook fallback registered', internalHooks.length === 1 && internalHooks[0].opts?.name === 'sst-security-control-openclaw-internal-hooks');

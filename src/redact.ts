@@ -80,21 +80,63 @@ export function redactSensitiveHeaders(
   return redacted;
 }
 
+/**
+ * 脱敏后的结果 + 本次被替换的一级键名。
+ *
+ * `redactedKeys` 只收**最外层对象**被替换的键名（规范 redacted_keys 只要
+ * 一级键名）；嵌套对象里的命中由递归处理，不收进来——否则一次深嵌套的
+ * 脱敏会报出下游无法对应到工具参数顶层结构的键名清单。
+ */
+export interface RedactBodyResult {
+  value: unknown;
+  redactedKeys: string[];
+}
+
+/**
+ * redactSensitiveBody 的收集版：除脱敏值外，返回最外层被替换的键名
+ * （去重、保持出现顺序）。行为与 redactSensitiveBody 完全一致（同一个
+ * 递归实现，见 depth 参数为什么只在 0 层收键名）。
+ */
+export function redactSensitiveBodyWithKeys(
+  body: unknown,
+  sensitiveKeys: string[] = DEFAULT_SENSITIVE_BODY_KEYS
+): RedactBodyResult {
+  const collected = new Set<string>();
+  const value = redactSensitiveBodyInternal(body, normaliseKeys(sensitiveKeys), 0, collected);
+  return { value, redactedKeys: [...collected] };
+}
+
 export function redactSensitiveBody(
   body: unknown,
   sensitiveKeys: string[] = DEFAULT_SENSITIVE_BODY_KEYS
 ): unknown {
+  return redactSensitiveBodyInternal(body, normaliseKeys(sensitiveKeys), 0, undefined);
+}
+
+/** 归一化敏感键列表：小写、去重、按长度降序（长键优先于其子串短键）。 */
+function normaliseKeys(sensitiveKeys: string[]): string[] {
+  return [...new Set(sensitiveKeys.map((k) => k.toLowerCase()))].sort(
+    (a, b) => b.length - a.length
+  );
+}
+
+function redactSensitiveBodyInternal(
+  body: unknown,
+  normalisedKeys: string[],
+  depth: number,
+  collected: Set<string> | undefined
+): unknown {
   if (body === null || body === undefined) return body;
 
   if (Array.isArray(body)) {
-    return body.map((item) => redactSensitiveBody(item, sensitiveKeys));
+    return body.map((item) => redactSensitiveBodyInternal(item, normalisedKeys, depth + 1, undefined));
   }
 
   // Map: redact every entry value recursively.
   if (body instanceof Map) {
     const out = new Map();
     for (const [k, v] of body.entries()) {
-      out.set(k, redactSensitiveBody(v, sensitiveKeys));
+      out.set(k, redactSensitiveBodyInternal(v, normalisedKeys, depth + 1, undefined));
     }
     return out;
   }
@@ -103,7 +145,7 @@ export function redactSensitiveBody(
   if (body instanceof Set) {
     const out = new Set();
     for (const v of body.values()) {
-      out.add(redactSensitiveBody(v, sensitiveKeys));
+      out.add(redactSensitiveBodyInternal(v, normalisedKeys, depth + 1, undefined));
     }
     return out;
   }
@@ -132,10 +174,6 @@ export function redactSensitiveBody(
   }
 
   const result: Record<string, unknown> = {};
-  // Normalise sensitive key list once: lowercased, dedup'd, sorted by length
-  // descending so longer keys (e.g. 'access-token') match before their
-  // shorter substrings ('access-token' before 'access' before 'token').
-  const normalisedKeys = sensitiveKeys.map((k) => k.toLowerCase()).sort((a, b) => b.length - a.length);
   for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
     const lowerKey = key.toLowerCase();
     // Exact match (not substring): a key like `tokens` (containing the
@@ -145,9 +183,12 @@ export function redactSensitiveBody(
     // etc. so exact match is sufficient.
     const isSensitive = normalisedKeys.some((p) => p === lowerKey);
     if (isSensitive) {
+      // 只收最外层（depth 0）的键名：嵌套命中是参数内部细节，一级键名
+      // 才是规范 redacted_keys 要的粒度。
+      if (depth === 0 && collected) collected.add(key);
       result[key] = '***';
     } else if (typeof value === 'object' && value !== null) {
-      result[key] = redactSensitiveBody(value, sensitiveKeys);
+      result[key] = redactSensitiveBodyInternal(value, normalisedKeys, depth + 1, undefined);
     } else if (typeof value === 'string') {
       result[key] = redactValueContent(value);
     } else {
@@ -159,11 +200,16 @@ export function redactSensitiveBody(
 
 /**
  * Redact well-known PII fields on a SecurityEvent before it is written to the
- * NDJSON sink. The application collector emits `user_prompt`, `system_prompt`,
- * `content`, and `code_content` directly from the runtime hook context — these
+ * NDJSON sink. The application collector emits `user_prompt`, `content`, and
+ * `code_content` directly from the runtime hook context — these
  * can carry API keys, JWTs, AWS access keys, etc. that the param/header
  * redaction path never touches. This function is the single entry point every
  * `collector.report(event)` site must call before emitting.
+ *
+ * `system_prompt` stays in the field list even though the field was removed
+ * from the event schema (content-addressed into security-prompts.jsonl):
+ * redaction here is defense-in-depth for any legacy/foreign event shape that
+ * still carries prompt plaintext.
  *
  * We also walk `headers` / `header` / `raw_headers` / `cookies` /
  * `request_headers` because the runtime hook writes the full HTTP request
@@ -172,7 +218,7 @@ export function redactSensitiveBody(
  * redaction.
  */
 export function redactEventForEmit<T extends Record<string, unknown>>(event: T): T {
-  const fields = ['user_prompt', 'system_prompt', 'content', 'code_content'] as const;
+  const fields = ['user_prompt', 'system_prompt', 'session_title', 'content', 'code_content'] as const;
   const out: Record<string, unknown> = { ...event };
   for (const f of fields) {
     const v = out[f];
@@ -184,9 +230,10 @@ export function redactEventForEmit<T extends Record<string, unknown>>(event: T):
   // Headers / cookies — same recursive redaction as params. The runtime hook
   // emits the literal header line under `header` (singular) and the full
   // request header set under `headers` / `raw_headers` / `request_headers`.
+  // `params` 保留在名单里：本插件事件已不带这个键，但**外部/旧版采集流**
+  // 的事件仍可能携带，统一出口兜底脱敏。
   for (const k of [
     'params',
-    'raw_params',
     'tool_params',
     'headers',
     'header',

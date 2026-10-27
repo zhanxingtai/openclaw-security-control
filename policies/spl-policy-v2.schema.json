@@ -348,7 +348,7 @@
       }
     },
     "flaggedPattern": {
-      "description": "带标志的正则条目：flags 取代 PCRE 内联 (?i:...) 写法；仅允许 JS/Python 公共子集 i/m/s（禁 g/y，避免 stateful lastIndex 交替命中）。",
+      "description": "带标志的正则条目：flags 取代 PCRE 内联 (?i:...) 写法；仅允许 JS/Python 公共子集 i/m/s（禁 g/y，避免 stateful lastIndex 交替命中）。except 为条目级专属豁免：命中任一即视为本条目未匹配，不影响同规则其它条目。",
       "type": "object",
       "required": [
         "pattern"
@@ -361,6 +361,33 @@
         "flags": {
           "type": "string",
           "pattern": "^[ims]*$"
+        },
+        "except": {
+          "description": "条目级专属豁免列表（只支持 pattern/flags，不支持嵌套 except）。",
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "pattern"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "flags": {
+                    "type": "string",
+                    "pattern": "^[ims]*$"
+                  }
+                }
+              }
+            ]
+          }
         }
       }
     },

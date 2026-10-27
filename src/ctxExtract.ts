@@ -81,6 +81,9 @@ export function coalesceString(
 }
 
 export function extractSessionKey(ctx: Record<string, unknown>): string | undefined {
+  // 注意：这里**不收** runId / run_id / run——规范（common.json）只允许
+  // run_id 向下回退 task_id/session_id，反向把 session 键填成 run_id 会把
+  // 不同会话的事件假性关联成同一会话。run 身份走 extractRunId 自己的通道。
   const topLevel = coalesceString(ctx, [
     'sessionKey',
     'session_id',
@@ -98,10 +101,6 @@ export function extractSessionKey(ctx: Record<string, unknown>): string | undefi
     'conversationId',
     'conversation_id',
     'conversation',
-    'runId',
-    'run_id',
-    'runID',
-    'run',
     'id',
   ]);
   if (topLevel) return topLevel;
@@ -118,10 +117,6 @@ export function extractSessionKey(ctx: Record<string, unknown>): string | undefi
       'messageId',
       'message_id',
       'messageID',
-      'runId',
-      'run_id',
-      'runID',
-      'run',
       'threadId',
       'thread_id',
       'threadID',
@@ -385,14 +380,17 @@ export function normalizeAgentStartContext(input: unknown): AgentStartContext | 
     ? { ...agentConfig, ...liftedFields, ...debugInfo }
     : ({ ...liftedFields, ...debugInfo } as AgentStartContext['agentConfig']);
 
-  const runId = extractRunId(ctx);
   return {
     // Prefer the stable sessionKey over raw sessionId: some OpenClaw versions
     // pass both (sessionId as a UUID, sessionKey as agent:main:main), and other
     // hooks only carry sessionKey. Mixing them would break per-session
     // correlation, so sessionKey always wins; sessionId remains a fallback
     // inside extractSessionKey for versions without sessionKey.
-    sessionKey: extractSessionKey(ctx) || runId || 'unknown',
+    //
+    // 规范（common.json）：session 未知必须写 null，只允许 run_id 向下回退
+    // task_id/session_id——反向把 session_id 填成 run_id 会把不同会话的事件
+    // 假性关联成同一会话。拿不到就是 undefined，由 buildBaseEvent 落 null。
+    sessionKey: extractSessionKey(ctx),
     agentId:
       (ctx.agentId as string | undefined) ||
       (ctx.agent_id as string | undefined) ||
@@ -428,7 +426,8 @@ export function normalizeAgentCompleteContext(
 
   const runId = extractRunId(ctx);
   return {
-    sessionKey: extractSessionKey(ctx) || runId || 'unknown',
+    // session 未知就是 undefined（见 normalizeAgentStartContext），不回退 runId。
+    sessionKey: extractSessionKey(ctx),
     agentId: extractAgentId(ctx) || 'unknown',
     runId,
     status,
@@ -449,7 +448,8 @@ export function normalizeSessionEndContext(
   if (!sessionKey && !runId && !extractAgentId(ctx)) return undefined;
 
   return {
-    sessionKey: sessionKey || runId || 'unknown',
+    // session 未知就是 undefined，不回退 runId（规范：session 未知写 null）。
+    sessionKey,
     runId,
     agentId: extractAgentId(ctx),
     status: extractStringField(ctx, ['status', 'runStatus', 'execution_status']),
@@ -471,7 +471,8 @@ export function normalizeSubagentContext(
   const ctx = extractEventContext(input);
 
   const runId = extractRunId(ctx);
-  const sessionKey = extractSessionKey(ctx) || runId || 'unknown';
+  // session 未知就是 undefined，不回退 runId（规范：session 未知写 null）。
+  const sessionKey = extractSessionKey(ctx);
 
   // subagent metadata may be flattened on the ctx or nested under subagent /
   // subagentInfo. Tolerate both.
@@ -515,14 +516,20 @@ export function normalizeCronEventContext(
   const ctx = extractEventContext(input);
 
   const runId = extractRunId(ctx);
-  const sessionKey = extractSessionKey(ctx) || runId || 'unknown';
+  // session 未知就是 undefined，不回退 runId（规范：session 未知写 null）。
+  const sessionKey = extractSessionKey(ctx);
 
   // 8.2 cron_changed payloads nest the job under cron/cronTask; tolerates both.
-  const cron = (
-    (ctx.cron as Record<string, unknown> | undefined) ||
-    (ctx.cronTask as Record<string, unknown> | undefined) ||
-    {}
-  ) as Record<string, unknown>;
+  //
+  // 1.1.0 之前这里是 `(ctx.cron || ctx.cronTask || {})`：`||` 只看真值，
+  // 不看类型。当宿主把 cron **表达式字符串**放在 `ctx.cron` 时，短路后
+  // `ctx.cronTask` 永远不会被探测，而字符串上的 `.id/.name/.schedule`
+  // 全是 undefined —— 作业身份整个丢失（实测 13/13 条 cron_changed 的
+  // metadata 都是 {}）。现在按"第一个是对象的候选"来选容器，并把字符串
+  // 形态的 `ctx.cron` 当成 schedule 收下。
+  const cronJob = pickCronJobObject(ctx);
+  const inlineCronExpr =
+    typeof ctx.cron === 'string' && ctx.cron.length > 0 ? ctx.cron : undefined;
 
   const action = extractStringField(ctx, ['action', 'changeType', 'eventType']);
   return {
@@ -530,19 +537,61 @@ export function normalizeCronEventContext(
     runId,
     agentId: extractAgentId(ctx),
     cronId:
-      coalesceString(ctx, ['cronId', 'cron_id', 'taskId', 'task_id', 'id']) ||
-      (typeof cron.id === 'string' && cron.id ? cron.id : undefined),
+      coalesceString(ctx, ['cronId', 'cron_id', 'jobId', 'job_id', 'taskId', 'task_id', 'id']) ||
+      pickCronJobString(cronJob, ['id', 'jobId', 'job_id', 'taskId', 'task_id', 'key']),
     cronName:
-      coalesceString(ctx, ['cronName', 'cron_name', 'taskName', 'task_name', 'name']) ||
-      (typeof cron.name === 'string' && cron.name ? cron.name : undefined),
+      coalesceString(ctx, ['cronName', 'cron_name', 'jobName', 'job_name', 'taskName', 'task_name', 'name']) ||
+      pickCronJobString(cronJob, ['name', 'jobName', 'job_name', 'taskName', 'task_name', 'title']),
     action,
     schedule:
-      extractStringField(ctx, ['schedule', 'cronExpr', 'cron_expression', 'interval']) ||
-      (typeof cron.schedule === 'string' && cron.schedule ? cron.schedule : undefined),
-    enabled: ctx.enabled as boolean | undefined,
+      extractStringField(ctx, ['schedule', 'cronExpr', 'cron_expression', 'cronExpression', 'interval']) ||
+      pickCronJobString(cronJob, ['schedule', 'cronExpr', 'cron_expression', 'cronExpression', 'interval']) ||
+      inlineCronExpr,
+    enabled: (ctx.enabled ?? (cronJob?.enabled as boolean | undefined)) as boolean | undefined,
     firedResult: ctx.output !== undefined ? ctx.output : ctx.result !== undefined ? ctx.result : undefined,
     metadata: ctx.metadata as Record<string, unknown> | undefined,
   };
+}
+
+/** 宿主可能把 cron 作业对象放在这些键下。 */
+const CRON_JOB_CONTAINER_KEYS = [
+  'cron',
+  'cronTask',
+  'cronJob',
+  'task',
+  'job',
+  'scheduledTask',
+] as const;
+
+/**
+ * 取第一个**是对象**的 cron 作业容器。
+ *
+ * 不能用 `a || b`：`ctx.cron` 若是字符串（cron 表达式）会短路掉
+ * `ctx.cronTask`，作业身份随之丢失。
+ */
+function pickCronJobObject(
+  ctx: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  for (const key of CRON_JOB_CONTAINER_KEYS) {
+    const value = ctx[key];
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+/** 从 cron 作业对象里按别名取第一个非空字符串。 */
+function pickCronJobString(
+  job: Record<string, unknown> | undefined,
+  keys: string[]
+): string | undefined {
+  if (!job) return undefined;
+  for (const key of keys) {
+    const value = job[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
 }
 
 export function extractStringField(
@@ -808,6 +857,102 @@ export function detectInjectedUserContent(content: string): boolean {
   return markers.some((m) => content.includes(m));
 }
 
+/**
+ * 角色同义词归一。
+ *
+ * 宿主对"谁在说话"的叫法不统一：human / user、ai / model / bot / agent、
+ * tool_result / function。落到事件字段上必须收敛成一套，否则下游没法用
+ * 一个等值判断把消息分成"用户输入"和"模型输出"两类。
+ */
+const ROLE_SYNONYMS: Record<string, MessageWriteContext['role']> = {
+  user: 'user',
+  human: 'user',
+  assistant: 'assistant',
+  ai: 'assistant',
+  model: 'assistant',
+  bot: 'assistant',
+  agent: 'assistant',
+  system: 'system',
+  tool: 'tool',
+  tool_result: 'tool',
+  function: 'tool',
+};
+
+/** 把任意角色取值归一成规范角色；无法识别时返回 undefined。 */
+export function normalizeRoleValue(raw: unknown): MessageWriteContext['role'] | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (lower === 'unknown') return undefined; // 'unknown' 是"没拿到"，不是一种角色
+  return ROLE_SYNONYMS[lower] ?? trimmed;
+}
+
+/** 角色判定的来源，写进事件里让下游知道这个角色有多可信。 */
+export type RoleSource = 'explicit' | 'inferred' | 'lifecycle' | 'default';
+
+export interface ResolvedRole {
+  role: MessageWriteContext['role'];
+  source: RoleSource;
+}
+
+/**
+ * 显式定位消息角色。
+ *
+ * 只做"找"，不做"猜"：宿主给了哪个字段就用哪个，一个都没给就回落到
+ * defaultRole（'unknown'），交给上层按会话生命周期推断（见
+ * application-collector 的 inferMessageRole）。
+ *
+ * 探测顺序（先具体后笼统）：
+ *   1. role 字段：ctx / ctx.context / ctx.message / ctx.metadata；
+ *   2. 作者类字段：author / sender / participant / speaker / from；
+ *   3. 会话数组 ctx.messages 里最后一条带 role 的消息；
+ *   4. 形态推断：带 prompt 的是用户输入，带 completion/response 的是模型输出。
+ *
+ * 第 4 步是"形态推断"而不是"读取事实"，所以标记为 inferred；前 3 步都
+ * 是宿主明确给出的，标记为 explicit。
+ */
+export function resolveMessageRole(
+  ctx: Record<string, unknown>,
+  defaultRole: MessageWriteContext['role'] = 'unknown'
+): ResolvedRole {
+  const sources: Array<Record<string, unknown> | undefined> = [
+    ctx,
+    ctx.context as Record<string, unknown> | undefined,
+    ctx.message as Record<string, unknown> | undefined,
+    ctx.metadata as Record<string, unknown> | undefined,
+  ];
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    const role = normalizeRoleValue(source.role);
+    if (role) return { role, source: 'explicit' };
+  }
+
+  for (const key of ['author', 'sender', 'participant', 'speaker', 'from']) {
+    const role = normalizeRoleValue(ctx[key]);
+    if (role) return { role, source: 'explicit' };
+  }
+
+  const messages = Array.isArray(ctx.messages) ? ctx.messages : undefined;
+  if (messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (!message || typeof message !== 'object') continue;
+      const role = normalizeRoleValue((message as Record<string, unknown>).role);
+      if (role) return { role, source: 'explicit' };
+    }
+  }
+
+  if (typeof ctx.prompt === 'string' && ctx.prompt.length > 0) {
+    return { role: 'user', source: 'inferred' };
+  }
+  if (typeof ctx.completion === 'string' || typeof ctx.response === 'string') {
+    return { role: 'assistant', source: 'inferred' };
+  }
+
+  return { role: defaultRole, source: 'default' };
+}
+
 export function normalizeMessageWriteContext(
   input: unknown,
   defaultRole: MessageWriteContext['role'] = 'unknown'
@@ -817,7 +962,13 @@ export function normalizeMessageWriteContext(
 
   // OpenClaw 'command' event shape: { type, action, sessionKey, context, timestamp, messages }
   let content: unknown = ctx.content;
-  let role: MessageWriteContext['role'] = (ctx.role as MessageWriteContext['role']) || defaultRole;
+  // 角色与内容**分开**解析：内容能不能找到，跟角色在不在是两件事。
+  // 之前只有"内容没找到"时才会去会话数组里翻角色，于是宿主在顶层不带
+  // role 时，真实存在的角色也被一起丢掉（实测 6/6 条 agent_message 的
+  // role 都是 'unknown'）。
+  const resolvedRole = resolveMessageRole(ctx, defaultRole);
+  let role: MessageWriteContext['role'] = resolvedRole.role;
+  let roleSource: RoleSource = resolvedRole.source;
 
   // If content is missing or does not look like actual text, try to extract
   // text from a variety of known wrapper shapes.
@@ -855,14 +1006,18 @@ export function normalizeMessageWriteContext(
       matching = messages[messages.length - 1];
     }
     if (matching) {
+      // 会话数组里的 role 是宿主明确给出的，优先于任何推断。
+      const matchedRole = normalizeRoleValue(matching.role);
+      if (matchedRole) {
+        role = matchedRole;
+        roleSource = 'explicit';
+      }
       if (typeof matching.content === 'string') {
         content = matching.content;
-        role = (matching.role as MessageWriteContext['role']) || role;
       } else {
         const text = extractTextFromContentBlocks(matching.content);
         if (text) {
           content = text;
-          role = (matching.role as MessageWriteContext['role']) || role;
         }
       }
     }
@@ -910,6 +1065,15 @@ export function normalizeMessageWriteContext(
   // genuine user input.
   if (role === 'user' && typeof content === 'string' && detectInjectedUserContent(content)) {
     role = 'system';
+    roleSource = 'inferred';
+  }
+
+  // 宿主把框架级提示（"上一轮被网关重启打断"之类）以 "[System] ..." 的
+  // 形式混在消息流里。它不是用户输入——标成 system，免得下游把它当成
+  // 用户 prompt 送去策略引擎评估。
+  if (role === 'user' && typeof content === 'string' && content.trimStart().startsWith('[System]')) {
+    role = 'system';
+    roleSource = 'inferred';
   }
 
   // Extract model and token usage info exposed by OpenClaw for assistant messages.
@@ -938,9 +1102,11 @@ export function normalizeMessageWriteContext(
 
   const runId = extractRunId(ctx);
   return {
-    sessionKey: extractSessionKey(ctx) || runId || 'unknown',
+    // session 未知就是 undefined，不回退 runId（规范：session 未知写 null）。
+    sessionKey: extractSessionKey(ctx),
     runId,
     role,
+    roleSource,
     content: (content || '') as string | unknown,
     reasoning,
     messageId: extractMessageId(ctx),
@@ -1026,7 +1192,8 @@ export function normalizeToolContext(input: unknown): MiddlewareContext | undefi
 
   const runId = extractRunId(ctx);
   return {
-    sessionKey: extractSessionKey(ctx) || runId || 'unknown',
+    // session 未知就是 undefined，不回退 runId（规范：session 未知写 null）。
+    sessionKey: extractSessionKey(ctx),
     agentId: extractAgentId(ctx) || 'unknown',
     runId: runId || 'unknown',
     toolName: toolName as string,

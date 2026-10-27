@@ -24,7 +24,7 @@ function baseEvent() {
     event_type: "test_emit",
     layer: "application",
     ts: Date.now(),
-    schema_version: "1.0.0",
+    schema_version: 1,
     pid: process.pid,
     session_id: null,
     host_id: "test-host",

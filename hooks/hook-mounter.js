@@ -56,6 +56,17 @@ let loaded = 0;
 let skipped = 0;
 let failed = 0;
 
+// 诊断开关。mounter 靠 NODE_OPTIONS 被注入宿主的**每一个** node 进程，
+// 每次安装 / 每次 CLI 调用都会把统计行重复若干遍——那是安装输出里最显眼
+// 的噪音来源，而"两个 hook 都正常加载"本身没有任何信息量。
+// 默认静默，只在"有东西没起来"时出声；需要完整统计时用
+// OPENCLAW_HOOK_MOUNT_DEBUG=1（或总开关 OPENCLAW_HOOK_DEBUG=1）打开。
+const DEBUG =
+  process.env.OPENCLAW_HOOK_MOUNT_DEBUG === 'true' ||
+  process.env.OPENCLAW_HOOK_MOUNT_DEBUG === '1' ||
+  process.env.OPENCLAW_HOOK_DEBUG === 'true' ||
+  process.env.OPENCLAW_HOOK_DEBUG === '1';
+
 for (const name of HOOK_FILES) {
   if (name === 'network.js' && isNetworkHookDisabled()) {
     console.error(
@@ -85,6 +96,10 @@ for (const name of HOOK_FILES) {
   }
 }
 
-console.error(
-  `[openclaw-security-monitor] hooks mounter: loaded=${loaded} skipped=${skipped} failed=${failed}`
-);
+// 统计行只在"有东西不对"时出现：skipped/failed 非零意味着某个 hook 根本没
+// 起来，必须让人看见；全正常时静默（见上面的 DEBUG 注释）。
+if (DEBUG || skipped > 0 || failed > 0) {
+  console.error(
+    `[openclaw-security-monitor] hooks mounter: loaded=${loaded} skipped=${skipped} failed=${failed}`
+  );
+}

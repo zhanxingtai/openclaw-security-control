@@ -262,10 +262,10 @@ describe('ControlUiService read-side schema validation', () => {
     expect(svc.getInvalidLineCount()).toBe(1);
   });
 
-  it('counts tamper_detected and policy audit event types as valid', async () => {
+  it('counts x_openclaw_tamper_detected and policy audit event types as valid', async () => {
     const now = Date.now();
     write([
-      JSON.stringify({ event_id: 't1', event_type: 'tamper_detected', layer: 'asset', ts: now - 200, kind: 'forged_lock' }),
+      JSON.stringify({ event_id: 't1', event_type: 'x_openclaw_tamper_detected', layer: 'asset', ts: now - 200, kind: 'forged_lock' }),
       JSON.stringify({ event_id: 't2', event_type: 'rule_invalid_regex', layer: 'application', ts: now - 100 }),
       JSON.stringify({ event_id: 't3', event_type: 'network_http', layer: 'system', ts: now - 50 }),
       JSON.stringify({ event_id: 't4', event_type: 'asset_add', layer: 'asset', ts: now - 25 }),

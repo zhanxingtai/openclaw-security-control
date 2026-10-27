@@ -41,8 +41,12 @@ const PLUGIN_ID_RE_SRC = '(?:sst-security-control-openclaw|sst-security-control-
  * to contain the plugin id, causing false positives on normal file operations.
  */
 const PROTECTED_PATH_PATTERNS = [
-  // Plugin configuration and data home
-  String.raw`(^|/)\.openclaw[/\\]`,
+  // Plugin configuration and data home.
+  // 2026-10-27 误报收敛：agent 工作区（.openclaw/workspace）不是插件资产，
+  // 承载 agent 自己的 memory/笔记；把它拖进受保护路径会让「把排查笔记写进
+  // memory」因正文出现工作区路径而被当成篡改拦下。插件自有资产（openclaw.json
+  // / 策略文件 / 审计日志 / 扩展目录 / 安装目录）由下方逐条精确模式覆盖。
+  String.raw`(^|/)\.openclaw[/\\](?!workspace\b)`,
   String.raw`(^|/)\.openclaw[/\\]openclaw\.json$`,
   String.raw`(^|/)\.openclaw[/\\]security-policy\.ya?ml$`,
   String.raw`(^|/)\.openclaw[/\\]security-events\.jsonl$`,
@@ -243,6 +247,17 @@ const SHELL_OVERWRITE_VERBS_RE = SELF_PROTECTION_SPEC
 const BLOCK_REASON = '该操作会禁用或卸载安全监控插件，已被系统自我保护机制阻断';
 const BLOCK_CODE = 'SELF_PROTECTION_001';
 
+/**
+ * 网关主配置 openclaw.json 的改写动词。
+ *
+ * 旧实现把 isDestructive 里的 /openclaw\.json/i 全文匹配当作「正在写网关
+ * 配置」——只要命令里出现 openclaw.json 就算破坏性，于是
+ * `cat ~/.openclaw/openclaw.json` 这类纯读取也被当成篡改拦下。
+ * 改为按命令段判定：段内同时出现 openclaw.json 与写类动词/重定向才算改写。
+ */
+const GATEWAY_CONFIG_WRITE_VERB_RE =
+  /\b(?:cp|mv|install|rsync|rm|rmdir|unlink|truncate|tee)\b|\bsed\b[^\n]*-i\b|\b(?:writefile|writefilesync|appendfile|appendfilesync|copyfile|rename)\s*\(/i;
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -366,6 +381,32 @@ function isShellOverwriteOfProtectedData(text: string): boolean {
       if (isProtectedPath(target) || PROTECTED_FILE_BASENAMES.test(target)) {
         return true;
       }
+    }
+  }
+  return false;
+}
+
+/**
+ * 判定「改写网关主配置 openclaw.json」。
+ *
+ * 纯读取（cat / sed -n / jq / grep / less / head）不是破坏性操作；只有
+ * 写类动词、重定向覆盖、脚本写 API 落到 openclaw.json 上才算改写。
+ * 按命令段切分（; & | 换行），读命令与写命令在同一段里也不会互相污染。
+ */
+function isGatewayConfigOverwrite(text: string): boolean {
+  const lower = text.toLowerCase();
+  const segments = lower.split(/[;&|]\s*|\n+/);
+  for (const seg of segments) {
+    if (!seg.includes('openclaw.json')) continue;
+    // 壳层改写/截断类动词与脚本写 API（truncate/tee/sed -i/open(...,'w')…）
+    if (SHELL_OVERWRITE_VERBS_RE.test(seg)) return true;
+    // 复制/移动/删除/改名等直接改写主配置的动词
+    if (GATEWAY_CONFIG_WRITE_VERB_RE.test(seg)) return true;
+    // 重定向覆盖：openclaw.json 紧跟 > / >> 之后
+    const redir = /(?:^|[\s;|&])>+\s*([^\s;|&]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = redir.exec(seg)) !== null) {
+      if (m[1].includes('openclaw.json')) return true;
     }
   }
   return false;
@@ -617,7 +658,9 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
       // Shell-composed overwrite/truncate of a protected file (echo > / truncate / find -delete ...)
       isShellOverwriteOfProtectedData(allParamText) ||
       // Writing to openclaw.json is always suspect, even for benign-looking tools.
-      /openclaw\.json/i.test(allParamText);
+      // 只读（cat / sed -n / jq / grep）不算改写——旧实现按「文本里出现
+      // openclaw.json」判定，把纯读取也当成篡改拦下。
+      isGatewayConfigOverwrite(allParamText);
 
     if (isDestructive) {
       return { blocked: true, decision: blockDecision() };

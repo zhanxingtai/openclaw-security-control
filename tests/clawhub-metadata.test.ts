@@ -48,43 +48,45 @@ function shippedManifestShape(
     homepage: rootPkg.homepage,
     peerDependencies: rootPkg.peerDependencies,
     peerDependenciesMeta: rootPkg.peerDependenciesMeta,
-    openclaw: buildInstallOpenClawMeta(rootPkg, pluginManifest, "./index.js"),
+    openclaw: buildInstallOpenClawMeta(rootPkg, "./index.js"),
   };
 }
 
 describe("buildInstallOpenClawMeta", () => {
-  it("carries compat/build from package.json and install from the plugin manifest", () => {
+  it("carries compat/build/install/plugin from package.json", () => {
     const rootPkg = {
       openclaw: {
         extensions: ["./index.ts"],
         compat: { pluginApi: ">=2026.9.4" },
         build: { openclawVersion: "2026.9.4" },
+        install: { clawhubSpec: "clawhub:@zhanxing/sst-security-control-openclaw" },
+        plugin: { id: "sst-security-control-openclaw", label: "SST Security Control" },
       },
     };
-    const manifest = { openclaw: { install: { clawhubSpec: { owner: "zhanxing" } } } };
 
-    const meta = buildInstallOpenClawMeta(rootPkg, manifest, "./index.js");
+    const meta = buildInstallOpenClawMeta(rootPkg, "./index.js");
 
     expect(meta.extensions).toEqual(["./index.js"]);
     expect(meta.compat).toEqual({ pluginApi: ">=2026.9.4" });
     expect(meta.build).toEqual({ openclawVersion: "2026.9.4" });
-    expect(meta.install).toEqual(manifest.openclaw.install);
+    expect(meta.install).toEqual(rootPkg.openclaw.install);
+    expect(meta.plugin).toEqual(rootPkg.openclaw.plugin);
   });
 
   it("rewrites the entry for the built bundle instead of reusing the repo entry", () => {
     // 仓库根声明的是 TS 源码入口，tgz 里是编译产物 —— 照抄 "./index.ts" 会让
     // ClawHub/宿主在发布包里找一个不存在的文件。
     const rootPkg = { openclaw: { extensions: ["./index.ts"] } };
-    const meta = buildInstallOpenClawMeta(rootPkg, {}, "./index.js");
+    const meta = buildInstallOpenClawMeta(rootPkg, "./index.js");
     expect(meta.extensions).toEqual(["./index.js"]);
     expect(meta.extensions).not.toContain("./index.ts");
   });
 
-  it("omits compat/build/install when the source has none, rather than emitting empty blocks", () => {
+  it("omits compat/build/install/plugin when the source has none, rather than emitting empty blocks", () => {
     // 空块比没有更糟：assertPublishMetadata 会把 {} 当成"字段存在"放过去吗？
     // 不会（它按 undefined 判），但保留 undefined 让 JSON.stringify 整个省掉，
     // 报错信息里的字段名也更干净。
-    const meta = buildInstallOpenClawMeta({ openclaw: {} }, {}, "./index.js");
+    const meta = buildInstallOpenClawMeta({ openclaw: {} }, "./index.js");
     expect(meta).toEqual({ extensions: ["./index.js"] });
     expect("compat" in meta).toBe(false);
     expect("install" in meta).toBe(false);
@@ -101,7 +103,7 @@ describe("assertPublishMetadata", () => {
       extensions: ["./index.js"],
       compat: { pluginApi: ">=2026.9.4" },
       build: { openclawVersion: "2026.9.4" },
-      install: { clawhubSpec: { owner: "zhanxing" } },
+      install: { clawhubSpec: "clawhub:@zhanxing/sst-security-control-openclaw" },
     },
   };
 
@@ -149,6 +151,23 @@ describe("assertPublishMetadata", () => {
     ).toThrow(/||/);
   });
 
+  it("rejects an object-shaped clawhubSpec", () => {
+    // 上架报 manifest-unknown-fields 的根因之一：clawhubSpec 被写成一个
+    // 带 owner/category 的对象。宿主只认 "clawhub:<包名>" 字符串。
+    expect(() =>
+      assertPublishMetadata(
+        {
+          ...complete,
+          openclaw: {
+            ...complete.openclaw,
+            install: { clawhubSpec: { owner: "zhanxing", package: "x" } },
+          },
+        },
+        "test"
+      )
+    ).toThrow(/clawhubSpec/);
+  });
+
   it("names the source so a build-time failure points at the right manifest", () => {
     expect(() => assertPublishMetadata({}, "install 端 package.json")).toThrow(
       /install 端 package\.json/
@@ -168,19 +187,20 @@ describe("repo metadata (real files)", () => {
     // compat 下限跟着 src/openclaw-sdk 的 vendor 基线走，不跟 package.json#version
     // 走（后者是插件发版号）。换 vendor 基线时要一并改这里。
     const rootPkg = readRepoJson("package.json");
-    const manifest = readRepoJson("openclaw.plugin.json");
-    const pluginApi = buildInstallOpenClawMeta(rootPkg, manifest, "./index.js").compat.pluginApi;
-    const minHost = manifest.host_compat[0].min_version;
-    expect(pluginApi).toBe(`>=${minHost}`);
+    const meta = buildInstallOpenClawMeta(rootPkg, "./index.js");
+    const pluginApi = meta.compat.pluginApi;
+    expect(pluginApi).toBe(`>=${meta.build.openclawVersion}`);
     expect(pluginApi).not.toMatch(/\s|\|\|/);
   });
 
-  it("keeps build.openclawVersion in step with the manifest's host_compat floor", () => {
-    // 两处都描述"支持到哪个宿主版本"，漂移会让 ClawHub 报
-    // package-min-host-version-drift。
+  it("keeps every declared host floor in step", () => {
+    // 四处都描述"支持到哪个宿主版本"，漂移会让 ClawHub 报
+    // package-min-host-version-drift，或让宿主按错误下限放行/拦下。
     const rootPkg = readRepoJson("package.json");
-    const manifest = readRepoJson("openclaw.plugin.json");
-    const meta = buildInstallOpenClawMeta(rootPkg, manifest, "./index.js");
-    expect(meta.build.openclawVersion).toBe(manifest.host_compat[0].min_version);
+    const meta = buildInstallOpenClawMeta(rootPkg, "./index.js");
+    const floor = meta.build.openclawVersion;
+    expect(meta.compat.pluginApi).toBe(`>=${floor}`);
+    expect(meta.install.minHostVersion).toBe(`>=${floor}`);
+    expect(rootPkg.peerDependencies.openclaw).toBe(`>=${floor}`);
   });
 });
