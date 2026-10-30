@@ -520,6 +520,8 @@ export class AssetCollector {
         middleware_name: 'sst-security-control-openclaw',
         collector_name: this.name,
       },
+      // `blocked` 恒在：篡改检测事件不是「策略拦截」⇒ 恒为 false（被拦的那条动作另发事件）。
+      blocked: false,
       kind,
       ...detail,
     } as SecurityEvent;
@@ -715,6 +717,8 @@ export class AssetCollector {
       source: 'openclaw.v1',
       collection_method: 'skill_sync',
       collector: { collector_name: this.name },
+      // `blocked` 恒在：资产变更事件不是「策略拦截」⇒ 恒为 false。
+      blocked: false,
       asset_id: asset.assetId,
       asset_type: asset.assetType,
       asset_path: asset.assetPath,

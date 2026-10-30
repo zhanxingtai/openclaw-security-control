@@ -42,15 +42,58 @@ const MAX_ARGUMENTS_TOTAL_LENGTH = parseInt(process.env.OPENCLAW_RUNTIME_HOOK_MA
 // policies/security-policy.spl.yaml（hookPatterns / metadata.flagRegistry），
 // 构建期生成同目录 generated-patterns.json。本文件内的 FALLBACK_* 常量只在
 // 产物缺失/损坏（部分部署包）时兜底，并打 WARN；正常构建不再双写漂移。
+// 产物缺失/损坏时兜底表必须严格镜像 spl.yaml；一致性由 hooks/runtime.test.ts
+// 的「兜底 vs 产物」用例守住（改了一边必须改另一边）。
 const FALLBACK_BLOCKED_FLAGS = [
   'reverse_shell',
   'download_execute',
   'mass_deletion',
   'privilege_escalation',
-  'data_exfiltration',
   'token_in_command',
-  'sensitive_file_access',
   'skill_binary_execution',
+];
+
+// 运行时 hook 的同步阻断模式集（不占 flag 名），与 spl.yaml 的 hookBlockPatterns
+// 段一一对应：模式级 Tier-1 阻断给出具体原因（读口令库 / 读私钥…），flag 级只给 flag 名。
+//
+// ⚠️ 与 hooks/generated-patterns.json 的 blockPatterns 逐条一致
+//    （pattern 原文 + reason + input）——一致性由 hooks/runtime.test.ts 断言。
+const FALLBACK_BLOCK_PATTERNS = [
+  {
+    pattern: '(?:^|\\s|["\'<>])(?:/etc/shadow|/etc/gshadow|/etc/sudoers(?:/|\\b))\\b',
+    input: 'raw',
+    reason: '读取 Tier-1 口令库/提权配置（/etc/shadow、/etc/gshadow、/etc/sudoers）',
+  },
+  {
+    pattern: '(?:^|\\s|["\'<>])/etc/ssh/ssh_host_\\S+',
+    input: 'raw',
+    reason: '读取 SSH 主机私钥（/etc/ssh/ssh_host_*）',
+  },
+  {
+    pattern: '(?:^|\\s|["\'<>])/proc/self/environ\\b',
+    input: 'raw',
+    reason: '读取进程环境变量（/proc/self/environ，常含明文 API Key）',
+  },
+  {
+    pattern: '(?:^|\\s|["\'<>])(?:[^\\s"\'<>]*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)\\b',
+    input: 'raw',
+    reason: '读取 SSH 用户私钥（~/.ssh/id_*）',
+  },
+  {
+    pattern: '(?:^|\\s|["\'<>])(?:[^\\s"\'<>]*/)?\\.aws/credentials\\b',
+    input: 'raw',
+    reason: '读取云厂商凭据文件（~/.aws/credentials）',
+  },
+  {
+    pattern: '(?:^|\\s|["\'<>])(?:[^\\s"\'<>]*/)?\\.(?:git-credentials|netrc)\\b',
+    input: 'raw',
+    reason: '读取 git / netrc 明文凭据文件',
+  },
+  {
+    pattern: '\\bgetent\\s+(?:shadow|gshadow)\\b',
+    input: 'raw',
+    reason: '通过 getent 读取 shadow 口令库',
+  },
 ];
 
 // 内置兜底模式表：与 spl.yaml hookPatterns 一一对应（含 input 语义：
@@ -130,6 +173,23 @@ function compileGeneratedHookPatterns(spec) {
   return out;
 }
 
+/**
+ * 把 blockPatterns 条目编译成可测正则。input 语义同 compileGeneratedHookPatterns；
+ * 无 `g` 标志（共享正则的 stateful lastIndex 会让重复 .test() 交替命中）。
+ */
+function compileBlockPatterns(entries) {
+  const out = [];
+  for (const entry of entries || []) {
+    if (!entry || typeof entry.pattern !== 'string' || entry.pattern.length === 0) continue;
+    out.push({
+      re: new RegExp(entry.pattern),
+      raw: entry.input === 'raw',
+      reason: typeof entry.reason === 'string' ? entry.reason : '',
+    });
+  }
+  return out;
+}
+
 function loadHookPatternSpec() {
   const file = path.join(__dirname, 'generated-patterns.json');
   try {
@@ -139,15 +199,25 @@ function loadHookPatternSpec() {
       Array.isArray(spec.blockedFlags) && spec.blockedFlags.length > 0
         ? spec.blockedFlags.map((f) => String(f))
         : FALLBACK_BLOCKED_FLAGS;
-    return { patterns, blockedFlags };
+    const blockPatterns = compileBlockPatterns(
+      Array.isArray(spec.blockPatterns) && spec.blockPatterns.length > 0
+        ? spec.blockPatterns
+        : FALLBACK_BLOCK_PATTERNS
+    );
+    return { patterns, blockedFlags, blockPatterns };
   } catch (err) {
     log('warn', `generated-patterns.json unavailable (${err && err.message ? err.message : String(err)}); using built-in fallback patterns`);
-    return { patterns: FALLBACK_HOOK_PATTERNS, blockedFlags: FALLBACK_BLOCKED_FLAGS };
+    return {
+      patterns: FALLBACK_HOOK_PATTERNS,
+      blockedFlags: FALLBACK_BLOCKED_FLAGS,
+      blockPatterns: compileBlockPatterns(FALLBACK_BLOCK_PATTERNS),
+    };
   }
 }
 
 const HOOK_PATTERN_SPEC = loadHookPatternSpec();
 const DEFAULT_BLOCKED_FLAGS = HOOK_PATTERN_SPEC.blockedFlags;
+const DEFAULT_BLOCK_PATTERNS = HOOK_PATTERN_SPEC.blockPatterns;
 
 // Enforce mode is read lazily on every check, not captured at preload time:
 // the plugin sets OPENCLAW_RUNTIME_ENFORCE during its own initialize(), which
@@ -502,20 +572,70 @@ function getGlobalContext() {
 }
 
 /**
+ * 取用于阻断判定的命令行文本。
+ *
+ * ⚠️ 优先 options.command_line（原始、未截断、未脱敏）：事件里的 command_line
+ *    已脱敏且截断到 4096 字符，长命令的敏感路径可能落在截断外 ⇒ 漏判。
+ *    判定用原文只用于匹配，从不回写到事件或日志。
+ */
+function pickBlockingCommandLine(event, options) {
+  if (options && typeof options.command_line === 'string' && options.command_line.length > 0) {
+    return options.command_line;
+  }
+  if (event && typeof event.command_line === 'string' && event.command_line.length > 0) {
+    return event.command_line;
+  }
+  return '';
+}
+
+/**
+ * 模式级 Tier-1 阻断的逃生阀：误报时操作员可一键关闭，不必改包升级。
+ * 默认启用；关闭：OPENCLAW_RUNTIME_BLOCK_PATTERNS=0（或 off / false）。
+ */
+function isBlockPatternTierEnabled() {
+  const raw = (readHookEnv('OPENCLAW_RUNTIME_BLOCK_PATTERNS') || '').trim().toLowerCase();
+  if (!raw) return true;
+  return !(raw === '0' || raw === 'off' || raw === 'false' || raw === 'no');
+}
+
+/**
  * Determine whether a runtime event should be blocked based on configured
  * risk flags. Returns a human-readable block reason, or undefined if the
  * event should be allowed.
+ *
+ * 两档判定，互相独立：
+ *   ① flag 级：risk_flags ∩ hookBlockedFlags（可被 OPENCLAW_RUNTIME_BLOCKED_FLAGS 覆盖）。
+ *   ② 模式级（Tier-1）：命令行命中 hookBlockPatterns。
+ *
+ * ⚠️ 两档不能合并成 early-return：flag 名单为空 ≠ 命令安全
+ *    （例：cat ~/.aws/credentials 一个 flag 都不打，但仍是 Tier-1 凭据文件）。
  */
-function shouldBlock(event) {
+function shouldBlock(event, options) {
   if (!isRuntimeEnforceEnabled()) return undefined;
-  const flags = event.risk_flags || [];
-  if (flags.length === 0) return undefined;
 
-  const blockedFlags = getBlockedFlags();
-  const matched = flags.find((f) => blockedFlags.includes(f));
-  if (!matched) return undefined;
+  // ① flag 级阻断名单
+  const flags = (event && event.risk_flags) || [];
+  if (flags.length > 0) {
+    const blockedFlags = getBlockedFlags();
+    const matched = flags.find((f) => blockedFlags.includes(f));
+    if (matched) {
+      return `命令被 OpenClaw runtime hook 拦截（risk flag: ${matched}）`;
+    }
+  }
 
-  return `命令被 OpenClaw runtime hook 拦截（risk flag: ${matched}）`;
+  // ② 模式级 Tier-1 阻断（不占 flag 名）
+  if (!isBlockPatternTierEnabled()) return undefined;
+  const cmdline = pickBlockingCommandLine(event, options);
+  if (!cmdline) return undefined;
+  for (const entry of DEFAULT_BLOCK_PATTERNS) {
+    const text = entry.raw ? cmdline : cmdline.toLowerCase();
+    if (entry.re.test(text)) {
+      const why = entry.reason ? entry.reason : '命中 Tier-1 阻断模式';
+      return `命令被 OpenClaw runtime hook 拦截（Tier-1 敏感文件：${why}）`;
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -635,11 +755,9 @@ function computeRiskFlags(options, redacted) {
   //   - 'explicit_skip'：调用方显式要求跳过传播 → 子进程真的会裸跑 →
   //     覆盖真的丢了 → 这才是 self_protection_bypass。
   //   - 'env_stripped'：调用方给了显式 env 但没带 NODE_OPTIONS → hook 已经
-  //     **把它补回去了**（子进程照样带 hook 跑），覆盖没丢。此前两种情形
-  //     一律打 self_protection_bypass，结果宿主自己的探活命令（execa 之类
-  //     总是显式传 env）每次都被判成"绕过自保护"，再命中
-  //     warn-hook-bypass-attempt 规则：实测 96 小时里 214 条假告警，
-  //     真正的绕过信号被淹没在噪声里。
+  //     **把它补回去了**（子进程照样带 hook 跑），覆盖没丢。两种情形都判
+  //     self_protection_bypass 会把宿主自己的探活命令（execa 之类总是显式
+  //     传 env）打成「绕过自保护」，噪声淹没真正的绕过信号。
   //
   // 补回去的情形改用 hook_env_reinjected 留痕——信号还在，但不再冒充
   // 高危绕过。
@@ -737,6 +855,36 @@ function emitEvent(event) {
 }
 
 /**
+ * Error codes carried by the errors this hook throws at the caller.
+ *
+ *   RUNTIME_HOOK_BLOCK    — the policy decided to deny the command.
+ *   RUNTIME_HOOK_INTERNAL — the hook itself failed (event could not be
+ *                           assembled or evaluated).
+ *
+ * Both deny the command (fail-closed), but only the first is a policy
+ * decision — the caller and the operator must be able to tell them apart.
+ */
+const HOOK_BLOCK_ERROR_CODE = 'RUNTIME_HOOK_BLOCK';
+const HOOK_INTERNAL_ERROR_CODE = 'RUNTIME_HOOK_INTERNAL';
+
+function createHookError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  err.name = 'OpenClawRuntimeHookError';
+  return err;
+}
+
+function hookErrorMessage(err) {
+  if (!err) return 'unknown error';
+  if (err.message) return err.message;
+  return String(err);
+}
+
+function isInternalHookError(err) {
+  return !!err && err.code === HOOK_INTERNAL_ERROR_CODE;
+}
+
+/**
  * 构造命令事件并做拦截判定。
  *
  * 判定与写盘必须拆开：拦截判定要在 spawn **之前**做（否则拦不住），而子
@@ -744,11 +892,27 @@ function emitEvent(event) {
  * 返回"事件 + 是否该拦"，写盘由调用方在合适的时机做。
  */
 function prepareCommandEvent(options) {
-  const event = buildEvent(options);
-  const blockReason = shouldBlock(event);
-  if (blockReason) {
-    event.blocked = true;
-    event.block_reason = blockReason;
+  let event;
+  let blockReason;
+  try {
+    event = buildEvent(options);
+    // options 一起传：模式级判定要用原始未截断的命令行。
+    blockReason = shouldBlock(event, options);
+    if (blockReason) {
+      event.blocked = true;
+      event.block_reason = blockReason;
+    }
+    // spawn 前证明事件可序列化：失败以 RUNTIME_HOOK_INTERNAL 在 spawn 前拒绝
+    // （fail-closed）；挪到 spawn 后验证会退化成「命令跑完才抛错」。
+    if (typeof JSON.stringify(event) !== 'string') {
+      throw new Error('event is not JSON-serializable');
+    }
+  } catch (err) {
+    // Hook 组装/判定失败不是策略决策 — 以内部故障上报，与真实拒绝区分。
+    throw createHookError(
+      HOOK_INTERNAL_ERROR_CODE,
+      `runtime hook internal failure while handling ${options.api}: ${hookErrorMessage(err)}`
+    );
   }
   return { event, blockReason };
 }
@@ -1308,4 +1472,12 @@ module.exports = {
   applyHookPropagation,
   HOOK_MARKER_ENV,
   SKIP_HOOK_PROPAGATION,
+  HOOK_BLOCK_ERROR_CODE,
+  HOOK_INTERNAL_ERROR_CODE,
+  // Exported for the "fallback == generated" parity gate: the built-in fallback
+  // tables must stay identical to policies/security-policy.spl.yaml (via
+  // hooks/generated-patterns.json) so a deployment without the artifact
+  // behaves identically to one that has it.
+  FALLBACK_BLOCKED_FLAGS,
+  FALLBACK_BLOCK_PATTERNS,
 };

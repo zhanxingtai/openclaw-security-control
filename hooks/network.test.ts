@@ -782,3 +782,225 @@ describe('Node.js network hook', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// #469-C（2026-10-29）：**回环默认放行** + **回环带凭据仍拦**
+//
+// 缺陷：默认黑名单第一条 `^127\.` 把全部回环一刀切 ⇒ 容器内平台组件对本地
+// socket.io 服务 127.0.0.1:18789 的正常 WebSocket 重试被 collateral 拦截
+// 12 次（6 个唯一事件 × 2 次）—— 请求头只有 Sec-WebSocket-* / Connection /
+// Upgrade，**没有任何凭据**。
+//
+// 修复：回环移出默认黑名单（回环只能连到本机 ⇒ 出网风险为零），但
+// **「回环 + 敏感头携带凭据」仍拦**（凭据外带 / 侧信道）。
+//
+// 本文件锁住三件事：
+//   1. 工单样例（回环 + 无凭据头）⇒ **放行**；
+//   2. 工单真阳性（回环 + Authorization: Bearer）⇒ **仍然拦截**；
+//   3. 非回环目标（RFC1918 / 元数据端点）⇒ **判定不变**。
+// ---------------------------------------------------------------------------
+describe('#469-C network hook 回环默认放行', () => {
+  let hook: ReturnType<typeof loadHook>;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of [
+      'OPENCLAW_NETWORK_ENFORCE',
+      'OPENCLAW_NETWORK_BLOCKED_HOSTS',
+      'OPENCLAW_NETWORK_HOOK_IGNORE_HOSTS',
+      'OPENCLAW_MONITOR_ENDPOINT',
+    ]) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    // ⛔ 名单在**模块加载时**读一次 ⇒ 必须先清干净再 load。
+    process.env.OPENCLAW_NETWORK_ENFORCE = 'true';
+    hook = loadHook();
+  });
+
+  afterEach(() => {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  describe('应当放行：回环 + 无凭据头（工单原始样例）', () => {
+    it('WebSocket 升级握手（Sec-WebSocket-* / Connection / Upgrade）⇒ 放行', () => {
+      const reason = hook.checkRequestBlocked({
+        options: 'http://127.0.0.1:18789/',
+        method: 'GET',
+        headers: {
+          'Sec-WebSocket-Version': '13',
+          'Sec-WebSocket-Key': 'U/RyfJ+v9gdwKnng2gQsTA==',
+          Connection: 'Upgrade',
+          Upgrade: 'websocket',
+        },
+      });
+      expect(reason).toBeUndefined();
+    });
+
+    it('普通回环请求（无任何头）⇒ 放行', () => {
+      expect(
+        hook.checkRequestBlocked({ options: 'http://127.0.0.1:8080/health', method: 'GET', headers: {} })
+      ).toBeUndefined();
+    });
+
+    it('localhost / [::1] ⇒ 放行', () => {
+      expect(
+        hook.checkRequestBlocked({ options: 'http://localhost:3000/', method: 'GET', headers: {} })
+      ).toBeUndefined();
+      expect(
+        hook.checkRequestBlocked({ options: 'http://[::1]:3000/', method: 'GET', headers: {} })
+      ).toBeUndefined();
+    });
+  });
+
+  describe('仍然拦截：回环 + 携带凭据（工单真阳性 258b182f）', () => {
+    it('Authorization: Bearer <token> ⇒ 拦截', () => {
+      const reason = hook.checkRequestBlocked({
+        options: 'http://127.0.0.1:18789/',
+        method: 'GET',
+        headers: { Authorization: 'Bearer gx1234567890abcdef' },
+      });
+      expect(reason).toContain('loopback-credential');
+      expect(reason).toContain('127.0.0.1:18789');
+    });
+
+    it('x-api-key 头 ⇒ 拦截', () => {
+      expect(
+        hook.checkRequestBlocked({
+          options: 'http://127.0.0.1:18789/',
+          method: 'GET',
+          headers: { 'x-api-key': 'abcdef123456' },
+        })
+      ).toContain('loopback-credential');
+    });
+
+    it('Cookie 头 ⇒ 拦截', () => {
+      expect(
+        hook.checkRequestBlocked({
+          options: 'http://127.0.0.1:18789/',
+          method: 'GET',
+          headers: { Cookie: 'sid=abcdef123456' },
+        })
+      ).toContain('loopback-credential');
+    });
+
+    it('字面量 *** 不算凭据（它不是秘密）⇒ 放行', () => {
+      expect(
+        hook.checkRequestBlocked({
+          options: 'http://127.0.0.1:18789/',
+          method: 'GET',
+          headers: { Authorization: '***' },
+        })
+      ).toBeUndefined();
+    });
+
+    it('空值敏感头不算凭据 ⇒ 放行', () => {
+      expect(
+        hook.checkRequestBlocked({
+          options: 'http://127.0.0.1:18789/',
+          method: 'GET',
+          headers: { Authorization: '   ' },
+        })
+      ).toBeUndefined();
+    });
+  });
+
+  describe('判定不变：非回环目标', () => {
+    it('RFC1918（10.x / 192.168.x）⇒ 仍然拦截', () => {
+      expect(
+        hook.checkRequestBlocked({ options: 'http://10.0.0.5/api', method: 'GET', headers: {} })
+      ).toContain('blocked host');
+      expect(
+        hook.checkRequestBlocked({ options: 'http://192.168.1.10/api', method: 'GET', headers: {} })
+      ).toContain('blocked host');
+    });
+
+    it('云元数据端点 ⇒ 仍然拦截', () => {
+      expect(
+        hook.checkRequestBlocked({ options: 'http://169.254.169.254/notify', method: 'GET', headers: {} })
+      ).toContain('blocked host: 169.254.169.254');
+      expect(
+        hook.checkRequestBlocked({
+          options: new URL('http://metadata.google.internal/x'),
+          method: 'GET',
+          headers: {},
+        })
+      ).toContain('blocked host: metadata.google.internal');
+    });
+
+    it('回环**带凭据**时元数据端点仍走 blocked host 口径（顺序不倒）', () => {
+      expect(
+        hook.checkRequestBlocked({
+          options: 'http://169.254.169.254/notify',
+          method: 'GET',
+          headers: { Authorization: 'Bearer gx1234567890abcdef' },
+        })
+      ).toContain('blocked host');
+    });
+  });
+
+  describe('事件路径（已脱敏的头）', () => {
+    it('脱敏后的 Authorization: Bearer *** ⇒ 拦截', () => {
+      expect(
+        hook.shouldBlockRequest({
+          host: '127.0.0.1:18789',
+          url: '/',
+          header: 'Authorization: Bearer ***',
+        })
+      ).toContain('loopback-credential');
+    });
+
+    it('脱敏后的 Cookie: sid=*** ⇒ 拦截', () => {
+      expect(
+        hook.shouldBlockRequest({
+          host: '127.0.0.1:18789',
+          url: '/',
+          header: 'Cookie: sid=***',
+        })
+      ).toContain('loopback-credential');
+    });
+
+    it('只有 WebSocket 头的回环事件 ⇒ 放行', () => {
+      expect(
+        hook.shouldBlockRequest({
+          host: '127.0.0.1:18789',
+          url: '/',
+          header: 'Sec-WebSocket-Version: 13\r\nConnection: Upgrade\r\nUpgrade: websocket',
+        })
+      ).toBeUndefined();
+    });
+  });
+
+  describe('操作员仍可把回环加回黑名单（整表替换语义）', () => {
+    it('OPENCLAW_NETWORK_BLOCKED_HOSTS=^127\\. ⇒ 回环被拦（部署侧收紧）', () => {
+      process.env.OPENCLAW_NETWORK_BLOCKED_HOSTS = '^127\\.';
+      const reloaded = loadHook();
+      expect(
+        reloaded.checkRequestBlocked({
+          options: 'http://127.0.0.1:18789/',
+          method: 'GET',
+          headers: {},
+        })
+      ).toContain('blocked host');
+      delete process.env.OPENCLAW_NETWORK_BLOCKED_HOSTS;
+    });
+  });
+
+  describe('自上报豁免：本插件自己的上报流量不因"带凭据"被拦', () => {
+    it('目标是 OPENCLAW_MONITOR_ENDPOINT ⇒ 放行', () => {
+      process.env.OPENCLAW_MONITOR_ENDPOINT = 'http://127.0.0.1:9999/api/v1/events';
+      const reloaded = loadHook();
+      expect(
+        reloaded.checkRequestBlocked({
+          options: 'http://127.0.0.1:9999/api/v1/events',
+          method: 'POST',
+          headers: { Authorization: 'Bearer gx1234567890abcdef' },
+        })
+      ).toBeUndefined();
+      delete process.env.OPENCLAW_MONITOR_ENDPOINT;
+    });
+  });
+});

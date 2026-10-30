@@ -31,6 +31,8 @@ import { canonicalizePathParams } from './utils/path-params.js';
 import { InterventionEngineImpl } from './intervention/InterventionEngine.js';
 import { ActionHistory } from './intervention/ActionHistory.js';
 import { narrowCodeModeCommand } from './intervention/code-mode-operands.js';
+import { toEventEvidence } from './intervention/match-evidence.js';
+import { FILE_PATH_PARAM_ALIASES } from './intervention/file-path-params.js';
 import { GENERATED_HOOK_BLOCKED_FLAGS } from './intervention/generated-flag-defaults.js';
 import type { InterventionContext, SecurityDecision, PolicyAuditEvent } from './intervention/types.js';
 import * as SelfProtection from './intervention/SelfProtection.js';
@@ -110,6 +112,9 @@ class EventBridgeCollector {
 
   /** 因幂等被丢弃的重复事件数（可观测）。 */
   private duplicateEventsDropped = 0;
+
+  /** `blocked` 字段契约违例是否已告警过（每实例只告警一次）。 */
+  private blockedFieldWarned = false;
 
   /**
    * 判断这条事件是不是已经落过盘。
@@ -208,7 +213,39 @@ class EventBridgeCollector {
     // credential fields are touched; obf:v1 obfuscated values and the event
     // schema are unaffected, and the call is idempotent for events that were
     // already redacted upstream (e.g. ApplicationCollector's emit helper).
-    const line = JSON.stringify(redactEventForEmit(event as unknown as Record<string, unknown>)) + '\n';
+    const redacted = redactEventForEmit(event as unknown as Record<string, unknown>);
+    // ⭐ **`blocked` 恒在**（#470 缺陷 C）—— 统一出口兜底。
+    //
+    //   类型层已经把这个字段逼成必带（`tsc` 逐个构造点报出来），
+    //   但仍有**绕过类型系统**的路径：hook 侧 JSON、跨版本插件的
+    //   `as SecurityEvent` 断言、外部采集器直接调 `report()`。
+    //   ⇒ 在**唯一出口**补一次 `false` ⇒ 落盘的事件**一律**带这个键。
+    //
+    //   ⚠️ 只在**不是 boolean** 时补 ⇒ 绝不覆盖上游的真实取值
+    //   （`true` / `false` 都原样保留 ⇒ 幂等）。
+    if (typeof redacted.blocked !== 'boolean') {
+      if (redacted.blocked === undefined) {
+        // 「缺省」路径：老版本采集器 / 绕过类型系统的调用方**没写**这个键
+        // ⇒ 安静地补 `false`（这正是 #470 说的「缺省显式 false」）。
+        // ⚠️ **不告警**：老生产方本来就不带这个键 ⇒ 每次都告警等于刷屏
+        // ⇒ 真正的「契约违例」是下面那种「写了但不是布尔」。
+        redacted.blocked = false;
+      } else {
+        // ⚠️ **契约违例**：写了 `blocked` 但不是布尔值 ⇒ 归一成 `false`
+        //   （唯一安全的缺省：在没有证据说「拦住了」时**不宣称**拦住了）
+        //   ⇒ 但**必须告警**：静默吞掉就等于把这个 bug 藏起来。
+        //   （每个 collector 实例只告警一次 ⇒ 高频事件不会刷屏。）
+        if (!this.blockedFieldWarned) {
+          this.blockedFieldWarned = true;
+          console.warn(
+            `[EventBridgeCollector] event ${String(event.event_id ?? '(no id)')} carries a non-boolean ` +
+              `\`blocked\` (${typeof redacted.blocked}) — normalized to false; the producer violates the event contract`,
+          );
+        }
+        redacted.blocked = false;
+      }
+    }
+    const line = JSON.stringify(redacted) + '\n';
     const lineBytes = Buffer.byteLength(line, 'utf8');
     const maxSize = this.cfg?.maxFileSizeBytes ?? 0;
 
@@ -221,6 +258,10 @@ class EventBridgeCollector {
       );
       return;
     }
+
+    // 🔴 落盘幂等由下方锁内「查重 + 追加」两步完成（跨进程安全），
+    //   写前不做任何去重预判——没有 event_id 的事件一律放行，
+    //   宁可多写一行，也不静默吞审计事件。
 
     // Parent-directory ownership / mode check. If the directory is owned by
     // a different user, or is world-writable WITHOUT the sticky bit, refuse
@@ -326,6 +367,8 @@ class EventBridgeCollector {
         // best-effort: do not break hook handlers — but count and surface the
         // failure instead of swallowing it silently.
         this.writeErrorCount += 1;
+        // ⭐ 写失败时不把 event_id 记进幂等表（本就不记）⇒ 这条事件
+        //   后续同 id 的重试不会被误判成"重复"丢弃。
         this.logWriteIssue(`append ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     } finally {
@@ -759,7 +802,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
 
     try {
       const decision = await engine.evaluate(ctx);
-      if (decision && decision.decision !== 'allow' && !event.intervention) {
+      if (decision && decision.decision !== 'allow') {
         // matched_rules 透传到事件层（snake_case），便于面板按 severity
         // 维度聚合与 Event Stream severity 列渲染。matchedPolicies 是决策的内部审计
         // 标注（camelCase），仅在 engine 命中 ≥1 条规则时存在；空数组不写以省字节。
@@ -771,9 +814,17 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
               priority: m.priority,
               risk_level: m.riskLevel,
               category: m.category,
+              // 命中证据（#469-D）：命中了哪个字段 / 哪条 pattern / 哪段文本。
+              // snippet 必然已打码 ⇒ 不把凭据原文抄进事件。
+              ...(m.evidence ? { evidence: toEventEvidence(m.evidence) } : {}),
             }))
           : undefined;
-        event.intervention = {
+        // ⭐⭐ **合并，而不是丢弃**（#470 缺陷 B）——
+        //   原实现是 `!event.intervention` ⇒ 事件上**已有** intervention 时
+        //   这次判定**整个丢掉** ⇒ 额外判定在事件流里**零留痕**。
+        //   ⇒ 现在：权威判定留在 `intervention`，被观测到的额外判定记在
+        //     `observed` + `original_decision` ⇒ 既不覆盖，也不丢。
+        const base = {
           decision: decision.decision,
           policy_id: decision.policyId,
           policy_name: decision.policyName,
@@ -783,6 +834,30 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
           modified_params: canonicalizePathParams(decision.modifiedParams),
           ...(matchedRules ? { matched_rules: matchedRules } : {}),
         };
+        if (!event.intervention) {
+          event.intervention = base;
+        } else {
+          const existing = event.intervention;
+          const sameVerdict =
+            existing.decision === base.decision && existing.policy_id === base.policy_id;
+          event.intervention = {
+            ...existing,
+            ...(sameVerdict
+              ? {}
+              : {
+                  original_decision: existing.decision,
+                  observed: {
+                    decision: base.decision,
+                    ...(base.policy_id ? { policy_id: base.policy_id } : {}),
+                    ...(base.policy_name ? { policy_name: base.policy_name } : {}),
+                    ...(base.reason ? { reason: base.reason } : {}),
+                    ...(base.block_reason ? { block_reason: base.block_reason } : {}),
+                    ...(base.block_code ? { block_code: base.block_code } : {}),
+                    source: 'rule',
+                  },
+                }),
+          };
+        }
       }
     } catch (err) {
       console.error('[SecurityMonitorStore] runtime event intervention evaluation failed:', err);
@@ -825,6 +900,17 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
 
     const enforceEnabled = intervention?.enabled && intervention?.mode === 'enforce' && runtimeHooks?.enabled;
 
+    // ⭐ #469-A：模式级 Tier-1 阻断的开关（默认开启）。
+    //
+    // 关闭 ⇒ 显式写 '0'（runtime.js 认 '0'/'off'/'false'/'no'），并在 pin 里
+    //        钉同一个值 ⇒ 网关进程与它派生的子进程**判定一致**。
+    // 开启 ⇒ **既不删 process.env、也不 pin 这个键** ⇒
+    //        · 网关进程回落读 process.env（操作员手工设的同名变量继续有效）；
+    //        · 子进程继承网关的 env ⇒ 同样有效。
+    //        ⇒ 「应急逃生阀」在两处语义一致（这是 pin 的**缺省键**语义：
+    //        pin 快照是整表替换，没钉的键 = 回落 process.env）。
+    const blockPatternsEnabled = runtimeHooks?.blockPatternsEnabled !== false;
+
     if (!enforceEnabled) {
       delete process.env.OPENCLAW_RUNTIME_ENFORCE;
       delete process.env.OPENCLAW_RUNTIME_BLOCKED_FLAGS;
@@ -852,12 +938,17 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       delete process.env.OPENCLAW_NETWORK_ENFORCE;
     }
 
-    pinHookEnv({
+    const pin: Record<string, string | undefined> = {
       OPENCLAW_RUNTIME_ENFORCE: 'true',
       OPENCLAW_RUNTIME_BLOCKED_FLAGS: blockedFlags.join(','),
       OPENCLAW_NETWORK_ENFORCE: networkEnabled ? 'true' : undefined,
       OPENCLAW_NETWORK_HOOK_ENABLED: networkEnabled ? 'true' : 'false',
-    });
+    };
+    if (!blockPatternsEnabled) {
+      process.env.OPENCLAW_RUNTIME_BLOCK_PATTERNS = '0';
+      pin.OPENCLAW_RUNTIME_BLOCK_PATTERNS = '0';
+    }
+    pinHookEnv(pin);
   }
 
   async initialize(config: Record<string, unknown>): Promise<void> {
@@ -1081,6 +1172,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       console.error('[SecurityMonitorStore] onCronEvent failed:', err);
     }
   }
+
 
   /**
    * Async message_write entry — used by the legacy InternalHookEvent path and
@@ -1471,11 +1563,7 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     // Normalize all of them so policy rules can match without duplicating
     // every path-based rule.
     const result = { ...params };
-    const pathAliases = [
-      'file_path', 'filepath', 'filePath',
-      'path', 'file',
-      'src', 'source', 'target', 'destination',
-    ];
+    const pathAliases = FILE_PATH_PARAM_ALIASES;
     const existingKey = pathAliases.find((k) => typeof result[k] === 'string');
     if (!existingKey) {
       return result;

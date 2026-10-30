@@ -15,7 +15,7 @@ GITHUB_REMOTE="github"
 INTERNAL_REMOTE="origin"
 
 MSG="${1:?用法: bash scripts/oss-sync.sh \"commit message\" [internal-branch]}"
-INTERNAL_BRANCH="${2:-initiative/open-source-compliance}"
+INTERNAL_BRANCH="${2:-open-source}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

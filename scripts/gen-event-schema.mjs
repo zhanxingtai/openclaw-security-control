@@ -53,6 +53,35 @@ while ((am = aliasRe.exec(aliasSrc)) !== null) {
   aliases.set(am[1], value);
 }
 
+// 具名接口解析：展开同文件内 `export interface Foo { ... }`。
+// 具名引用（如 `intervention.semantic?: SemanticTrace`）不展开会退化成 `{}`
+// （只靠 additionalProperties 兜底）⇒ schema 不约束新字段 ⇒ 字段等于没进契约。
+// 只收同文件的 export interface —— 跨文件具名类型不展开（保持既有行为）。
+const interfaces = new Map();
+{
+  const ifaceRe = /export interface ([A-Za-z_][A-Za-z0-9_]*)\s*\{/g;
+  let im;
+  while ((im = ifaceRe.exec(src)) !== null) {
+    const name = im[1];
+    const braceStart = src.indexOf('{', im.index + im[0].length - 1);
+    if (braceStart < 0) continue;
+    let depth = 0;
+    let end = -1;
+    for (let j = braceStart; j < src.length; j++) {
+      if (src[j] === '{') depth++;
+      else if (src[j] === '}') {
+        depth--;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (end < 0) continue;
+    interfaces.set(name, src.slice(braceStart + 1, end));
+  }
+}
+
 /** 把 JSDoc / 行注释洗成一句可读的描述。 */
 function cleanComment(raw) {
   let t = raw;
@@ -188,6 +217,15 @@ function infer(typeText) {
     return { type: 'object', additionalProperties: true };
   }
 
+  // 具名接口（同文件声明）→ 展开成真字段
+  if (interfaces.has(raw)) {
+    return {
+      type: 'object',
+      properties: propertiesOf(interfaces.get(raw)),
+      additionalProperties: true,
+    };
+  }
+
   // 数组
   if (raw.startsWith('Array<') || raw.startsWith('ReadonlyArray<')) {
     const inner = genericArg(raw, raw.indexOf('<') + 1).trim();
@@ -260,6 +298,24 @@ function propertiesOf(text) {
 
 const properties = propertiesOf(body);
 
+/**
+ * 必填清单从 types.ts 推导（非可选顶层字段集），types.ts 仍是唯一事实源
+ * ——写死 required 的话，「schema 说必填、类型说可选」的漂移无法被发现。
+ * MUST_REQUIRED 是推导结果的断言下限：事件身份 / 归属 / 时间 / 拦截标志
+ * 这五个字段绝不可被静默放松，缺一个即抛错拒绝生成。
+ */
+const MUST_REQUIRED = ['event_id', 'event_type', 'layer', 'ts', 'blocked'];
+const derivedRequired = parseFields(body)
+  .filter((f) => !f.optional)
+  .map((f) => f.name);
+for (const key of MUST_REQUIRED) {
+  if (!derivedRequired.includes(key)) {
+    throw new Error(
+      `必填字段 ${key} 在 types.ts 里被标成了可选 —— 事件契约被放松了，拒绝生成 schema`,
+    );
+  }
+}
+
 // 关键字段的说明（其余字段沿用 types.ts 里的 JSDoc）
 const descriptions = {
   event_id: '事件唯一标识（UUID）。',
@@ -285,7 +341,8 @@ const descriptions = {
   tool_call_id: '关联键：一次工具调用的唯一标识（插件合成，权威关联键）。',
   host_tool_call_id: '宿主原始的工具调用 id，仅用于与宿主日志对账。',
   blocked:
-    '是否被策略拦截。恒为布尔值：false 表示未被拦截（不代表未被策略命中，warn/modify 记在 intervention.decision）。',
+    '是否被策略拦截。**恒为布尔值且恒在**（缺省 false）：false 表示未被拦截（不代表未被策略命中，warn/modify 记在 intervention.decision）。' +
+    '键缺失会让「按 blocked 过滤/聚合」的下游口径静默失真（#470 实测 484 条事件缺这个键）⇒ 必填。',
   status: '事件状态，取值随事件类型而异（success/failure、scheduled/started/finished、ended …）。',
   duration: '执行耗时（毫秒）。',
   result_size: '工具结果原始长度（未截断）。',
@@ -316,7 +373,7 @@ const schema = {
     'security-events.jsonl 单行（NDJSON）的结构定义。每个事件对象都必须满足本 schema。' +
     '事件类型清单见 README「Security Events」一节。',
   type: 'object',
-  required: ['event_id', 'event_type', 'layer', 'ts'],
+  required: derivedRequired,
   properties,
   additionalProperties: true,
 };

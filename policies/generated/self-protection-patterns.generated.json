@@ -11,7 +11,10 @@
       "(^|/)\\.openclaw[/\\\\]extensions[/\\\\](sst-security-control-openclaw|openclaw-security-monitor)",
       "(^|/)node_modules[/\\\\]sst-security-control-openclaw",
       "(^|/)node_modules[/\\\\]@zhanxing[/\\\\]sst-security-control-openclaw",
-      "(^|/)\\.openclaw[/\\\\]npm[/\\\\]projects[/\\\\]sst-security-control-openclaw"
+      "(^|/)\\.openclaw[/\\\\]npm[/\\\\]projects[/\\\\]sst-security-control-openclaw",
+      "(^|/)sst-security-control-openclaw[/\\\\]src[/\\\\]store\\.(ts|js)$",
+      "(^|/)sst-security-control-openclaw[/\\\\]src[/\\\\]intervention[/\\\\]",
+      "(^|/)sst-security-control-openclaw[/\\\\]dist[/\\\\]index\\.(ts|js)$"
     ],
     "gateway_config_self_harm": [
       "(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\\.9\\.1|openclaw[-_]?security[-_]?monitor).*\\benabled\\b\\s*[:=]\\s*false",

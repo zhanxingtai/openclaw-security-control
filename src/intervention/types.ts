@@ -9,6 +9,9 @@
 
 import type { ActionRecord } from '../types.js';
 import { GENERATED_ENGINE_HIGH_RISK_FLAGS } from './generated-flag-defaults.js';
+import type { RuleMatchEvidence } from './match-evidence.js';
+
+export type { RuleMatchEvidence } from './match-evidence.js';
 
 export type InterventionDecisionType =
   | 'allow'
@@ -87,6 +90,29 @@ export interface MatchedPolicyHit {
   riskLevel?: 'low' | 'medium' | 'high' | 'critical' | 'extreme';
   /** Rule category (e.g. data_leak_monitoring), 不参与匹配与裁决。 */
   category?: SPLCategory;
+  /**
+   * 命中证据（#469-D）：这条规则**凭哪一段文本**命中。
+   *
+   * ⛔ `snippet` 必然已打码（命中子串替换为 `***`）⇒ 证据可定位，
+   * 但不会把被拦下来的凭据原文抄进事件 / 日志。
+   *
+   * 缺省 = 这条规则不是靠文本正则命中的（`fieldEquals` / `fieldIn` /
+   * `chain` / `sessionRegex` 命中）⇒ **缺证据 ≠ 没命中**。
+   */
+  evidence?: RuleMatchEvidence;
+}
+
+/**
+ * 一条命中规则 + 其命中证据（引擎内部结构）。
+ *
+ * 引擎内部用 `PolicyRule[]` 传命中规则；#469-D 起要同时带证据 ⇒
+ * 改为携带 hit 的结构，采集层再拆回事件形态。
+ */
+export interface RuleHit {
+  /** 命中的规则本体。 */
+  rule: PolicyRule;
+  /** 命中证据（无文本正则命中时缺省）。 */
+  evidence?: RuleMatchEvidence;
 }
 
 export interface GuidanceResult {

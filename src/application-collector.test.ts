@@ -2154,6 +2154,7 @@ describe('ApplicationCollector 工具调用关联 id', () => {
   });
 });
 
+
 /**
  * 会话生命周期事件的门控（1.1.0）。
  *
@@ -2405,5 +2406,145 @@ describe('PromptSidecar 内容寻址', () => {
     const event = reportedEvents.find((e) => e.event_type === 'agent_session_start');
     expect(event?.system_prompt_ref).toMatch(/^[0-9a-f]{16}$/);
     expect(fs.existsSync(badPath)).toBe(false);
+  });
+});
+
+
+/**
+ * 会话开始即归并执行用户身份（user_id 归因）。
+ *
+ * 宿主把用户身份挂在 __openclaw 元数据块（senderIdentity.id /
+ * senderName / senderUsername / senderId）。以前只有消息/工具事件会
+ * 按 userIdField 单字段提取，agent_session_start / agent_start /
+ * subagent_start 一律不带 user_id；现在 onSessionStart 用 coalesceUserId
+ * 的多级回退把身份钉进 sessionCtx，生命周期事件与后续事件共用同一归因。
+ */
+describe('ApplicationCollector 会话开始的 user_id 归因', () => {
+  let reportedEvents: SecurityEvent[];
+
+  beforeEach(() => {
+    reportedEvents = [];
+  });
+
+  function makeCollector(config: Record<string, unknown> = {}): ApplicationCollector {
+    const sink = {
+      report: async (event: SecurityEvent) => {
+        reportedEvents.push(event);
+      },
+      shutdown: async () => {},
+    };
+    return new ApplicationCollector(
+      sink,
+      { enabled: true, captureUserId: true, userIdField: 'userId', ...config },
+      {}
+    );
+  }
+
+  it('onSessionStart 从 userIdField 提取，agent_session_start 与后续消息都带 user_id', async () => {
+    const appCollector = makeCollector();
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-1',
+      metadata: { userId: 'u-100' },
+    } as never);
+    await appCollector.onMessageWrite({
+      sessionKey: 'sess-uid-1',
+      role: 'user',
+      content: '你好',
+    } as never);
+
+    const sessionStart = reportedEvents.find((e) => e.event_type === 'agent_session_start');
+    expect(sessionStart?.user_id).toBe('u-100');
+    const message = reportedEvents.find((e) => e.event_type === 'agent_message');
+    expect(message?.user_id).toBe('u-100');
+  });
+
+  it('userIdField 缺失时按 __openclaw.senderIdentity.id → senderName → senderId 回退', async () => {
+    const appCollector = makeCollector();
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-openclaw',
+      metadata: {
+        __openclaw: { senderIdentity: { id: 'wxid-abc' }, senderName: '张三' },
+      },
+    } as never);
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-name',
+      metadata: { __openclaw: { senderName: '李四' } },
+    } as never);
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-sender',
+      metadata: { senderId: 'sender-42' },
+    } as never);
+
+    const bySession = (sessionId: string) =>
+      reportedEvents.find((e) => e.event_type === 'agent_session_start' && e.session_id === sessionId);
+    expect(bySession('sess-uid-openclaw')?.user_id).toBe('wxid-abc');
+    expect(bySession('sess-uid-name')?.user_id).toBe('李四');
+    expect(bySession('sess-uid-sender')?.user_id).toBe('sender-42');
+  });
+
+  it('captureUserId=false 时不提取也不落 user_id', async () => {
+    const appCollector = makeCollector({ captureUserId: false });
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-off',
+      metadata: { userId: 'u-100' },
+    } as never);
+    await appCollector.onMessageWrite({
+      sessionKey: 'sess-uid-off',
+      role: 'user',
+      content: '你好',
+    } as never);
+
+    const sessionStart = reportedEvents.find((e) => e.event_type === 'agent_session_start');
+    expect(sessionStart?.user_id).toBeUndefined();
+    const message = reportedEvents.find((e) => e.event_type === 'agent_message');
+    expect(message?.user_id).toBeUndefined();
+  });
+
+  it('身份未提前提取时，后续消息事件按 __openclaw 回退补齐并共享给会话', async () => {
+    const appCollector = makeCollector();
+    await appCollector.onSessionStart({ sessionKey: 'sess-uid-late' } as never);
+    await appCollector.onMessageWrite({
+      sessionKey: 'sess-uid-late',
+      role: 'user',
+      content: '你好',
+      metadata: { __openclaw: { senderUsername: 'wangwu' } },
+    } as never);
+    await appCollector.onBeforeToolCall({
+      sessionKey: 'sess-uid-late',
+      runId: 'run-001',
+      agentId: 'agent-001',
+      toolName: 'exec',
+      params: {},
+    } as never);
+
+    const message = reportedEvents.find((e) => e.event_type === 'agent_message');
+    expect(message?.user_id).toBe('wangwu');
+    const toolEvent = reportedEvents.find((e) => e.event_type === 'agent_tool_call');
+    expect(toolEvent?.user_id).toBe('wangwu');
+  });
+
+  it('agent_start 与 subagent_start 回填同一会话归因', async () => {
+    const appCollector = makeCollector();
+    await appCollector.onSessionStart({
+      sessionKey: 'sess-uid-agent',
+      metadata: { userId: 'u-agent' },
+    } as never);
+    await appCollector.onAgentStart({
+      sessionKey: 'sess-uid-agent',
+      agentId: 'agent-001',
+      agentConfig: { name: 'main', model: { provider: 'p', name: 'm' }, tools: ['exec'] },
+    } as never);
+    await appCollector.onSubagentStart({
+      sessionKey: 'sess-uid-agent',
+      runId: 'run-001',
+      subagentId: 'task-1',
+      subagentName: 'researcher',
+      prompt: '调研',
+    } as never);
+
+    const agentStart = reportedEvents.find((e) => e.event_type === 'agent_start');
+    expect(agentStart?.user_id).toBe('u-agent');
+    const subStart = reportedEvents.find((e) => e.event_type === 'x_openclaw_subagent_start');
+    expect(subStart?.user_id).toBe('u-agent');
   });
 });

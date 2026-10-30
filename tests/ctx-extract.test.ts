@@ -12,6 +12,8 @@ import {
   extractToolParams,
   looksLikeToolContext,
   parseJsonObject,
+  coalesceUserId,
+  normalizeMessageWriteContext,
 } from "../src/ctxExtract.js";
 import { hookBridge } from "../src/hook-bridge.js";
 
@@ -182,5 +184,94 @@ describe("hookBridge（typed-hook 入口使用的桥接层）", () => {
     const { ctx } = hookBridge.bridgeToolCall({ toolName: "file_read", sessionKey: "s2" });
     expect(ctx?.toolName).toBe("file_read");
     expect(ctx?.sessionKey).toBe("s2");
+  });
+});
+
+describe("coalesceUserId（执行用户身份多级回退）", () => {
+  it("第一优先级是 metadata[userIdField]（与原单字段提取同口径）", () => {
+    const metadata = {
+      userId: "u-100",
+      __openclaw: { senderIdentity: { id: "wxid-from-openclaw" } },
+      senderId: "sender-9",
+    };
+    expect(coalesceUserId(metadata, "userId")).toBe("u-100");
+  });
+
+  it("userIdField 可配置，取配置的字段", () => {
+    expect(coalesceUserId({ operatorId: "op-7" }, "operatorId")).toBe("op-7");
+  });
+
+  it("userIdField 缺失时回退 __openclaw.senderIdentity.id", () => {
+    const metadata = {
+      __openclaw: { senderIdentity: { id: "wxid-abc" }, senderName: "张三" },
+    };
+    expect(coalesceUserId(metadata, "userId")).toBe("wxid-abc");
+  });
+
+  it("senderIdentity.id 缺失时回退 senderName，再回退 senderUsername", () => {
+    expect(
+      coalesceUserId({ __openclaw: { senderName: "张三", senderUsername: "zhangsan" } }, "userId")
+    ).toBe("张三");
+    expect(
+      coalesceUserId({ __openclaw: { senderUsername: "zhangsan" } }, "userId")
+    ).toBe("zhangsan");
+  });
+
+  it("__openclaw 整层缺失时回退顶层 senderId", () => {
+    expect(coalesceUserId({ senderId: "sender-42" }, "userId")).toBe("sender-42");
+  });
+
+  it("全部缺失 / 空串 / 非对象 metadata 返回 undefined", () => {
+    expect(coalesceUserId({ userId: "", senderId: "" }, "userId")).toBeUndefined();
+    expect(coalesceUserId({}, "userId")).toBeUndefined();
+    expect(coalesceUserId(undefined, "userId")).toBeUndefined();
+    expect(coalesceUserId("not-object" as never, "userId")).toBeUndefined();
+  });
+});
+
+describe("normalizeMessageWriteContext · message.__openclaw 展平", () => {
+  it("message 子对象里的 __openclaw 合并进 metadata", () => {
+    const ctx = normalizeMessageWriteContext({
+      sessionKey: "s1",
+      message: {
+        __openclaw: { senderIdentity: { id: "wxid-1" }, senderIsOwner: true },
+      },
+    });
+    expect(ctx).toBeDefined();
+    expect((ctx?.metadata as Record<string, unknown>).__openclaw).toEqual({
+      senderIdentity: { id: "wxid-1" },
+      senderIsOwner: true,
+    });
+  });
+
+  it("展平不覆盖已存在的 metadata 键", () => {
+    const ctx = normalizeMessageWriteContext({
+      sessionKey: "s1",
+      metadata: { userId: "u-kept", source: "host" },
+      message: {
+        __openclaw: { senderIdentity: { id: "wxid-2" }, senderName: "李四" },
+      },
+    });
+    const metadata = ctx?.metadata as Record<string, unknown>;
+    expect(metadata.userId).toBe("u-kept");
+    expect(metadata.source).toBe("host");
+    // __openclaw 块本身作为整体键进入 metadata，供 coalesceUserId 消费。
+    expect((metadata.__openclaw as Record<string, unknown>).senderName).toBe("李四");
+  });
+
+  it("message 为字符串 / 缺失时不影响 metadata", () => {
+    const fromString = normalizeMessageWriteContext({
+      sessionKey: "s1",
+      message: "纯文本消息",
+      metadata: { userId: "u-1" },
+    });
+    expect((fromString?.metadata as Record<string, unknown>).userId).toBe("u-1");
+    expect((fromString?.metadata as Record<string, unknown>).__openclaw).toBeUndefined();
+
+    const noMessage = normalizeMessageWriteContext({
+      sessionKey: "s1",
+      context: { userId: "u-2" },
+    });
+    expect((noMessage?.metadata as Record<string, unknown>).userId).toBe("u-2");
   });
 });

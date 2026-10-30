@@ -269,6 +269,42 @@ function normalizeFlagRegistry(raw, warn = console.warn) {
 }
 
 /**
+ * hookBlockPatterns 归一化：条目 { pattern, reason?, input? }。
+ * 同步阻断点不走 flag 名（治理字典源已冻结，新 flag 名走不通），
+ * 只能走「不占 flag 名」的模式集（见 yaml 注释）。
+ */
+function normalizeBlockPatterns(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    fail('hookBlockPatterns: expected an array of { pattern, reason?, input? } entries');
+  }
+  return raw.map((item, i) => {
+    const where = `hookBlockPatterns[${i}]`;
+    if (typeof item === 'string') return { pattern: item };
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      fail(`${where}: expected a string or { pattern, reason?, input? } object`);
+    }
+    if (typeof item.pattern !== 'string' || item.pattern.length === 0) {
+      fail(`${where}: missing non-empty "pattern" string`);
+    }
+    const entry = { pattern: item.pattern };
+    if (item.reason !== undefined) {
+      if (typeof item.reason !== 'string' || item.reason.length === 0) {
+        fail(`${where}: invalid "reason" (expected a non-empty string)`);
+      }
+      entry.reason = item.reason;
+    }
+    if (item.input !== undefined) {
+      if (item.input !== 'lowercased' && item.input !== 'raw') {
+        fail(`${where}: invalid input ${JSON.stringify(item.input)} (allowed: lowercased|raw)`);
+      }
+      entry.input = item.input;
+    }
+    return entry;
+  });
+}
+
+/**
  * 从解析后的策略对象收集全部待分发内容。顶层区段与规则级
  * hookPatterns/monitorPatterns（条目 flags 缺省继承规则级 flags）合并。
  */
@@ -293,6 +329,8 @@ export function collectFromPolicy(policy, warn = console.warn) {
   return {
     hookFlags,
     monitorFlags,
+    // 运行时 hook 的同步阻断模式集（不占 flag 名）。
+    blockPatterns: normalizeBlockPatterns(policy.hookBlockPatterns),
     // 项目扩展区段统一为 x- 前缀
     // （与 PolicyFile 类型声明 + SPLRuleLoader 读取保持一致）。
     selfProtection: normalizeSelfProtection(policy['x-openclaw-selfProtection']),
@@ -381,6 +419,10 @@ export function renderHookArtifact(collected) {
   return {
     flags: collected.hookFlags,
     blockedFlags: collected.flagRegistry.hookBlockedFlags,
+    // 运行时 hook 的同步阻断模式集（不占 flag 名）。缺失时 runtime.js 走
+    // 内置兜底表——**两侧必须一致**，由 hooks/runtime.test.ts 的
+    // 「兜底 vs 产物 一致性」用例守住。
+    blockPatterns: collected.blockPatterns,
   };
 }
 
@@ -452,6 +494,13 @@ export function generateArtifacts(policy, dict, warn = console.warn) {
       validateLayeredEntry(entry, where);
       pythonCandidates.push({ where, pattern: entry.pattern, flags: entry.flags });
     }
+  }
+  // hookBlockPatterns：同步阻断模式集（不占 flag 名）——同样要过 JS 试编译与
+  // python re.compile 双侧校验（阻断面比打标面更敏感，绝不能有方言差异）。
+  for (const [i, entry] of collected.blockPatterns.entries()) {
+    const where = `hookBlockPatterns[${i}]`;
+    validateLayeredEntry(entry, where);
+    pythonCandidates.push({ where, pattern: entry.pattern, flags: entry.flags });
   }
   const spFlags = collected.selfProtection.flags;
   validateFlagsField(spFlags, 'x-openclaw-selfProtection.flags');

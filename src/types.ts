@@ -255,6 +255,7 @@ export type EventType =
 // 'system' + collection_method='runtime' on emit.
 export type SourceLayer = 'application' | 'system' | 'asset';
 
+
 export interface SecurityEvent {
   // Common fields (all layers)
   comm?: string;
@@ -472,6 +473,7 @@ export interface SecurityEvent {
   };
   risk_flags?: string[];
   /**
+  /**
    * hook 传播被绕过的具体原因。
    *
    * - `explicit_skip`：调用方显式要求跳过传播 → 子进程真的裸跑，覆盖丢了；
@@ -481,14 +483,24 @@ export interface SecurityEvent {
    */
   bypass_reason?: string;
   /**
-   * 是否被策略拦截。**恒在**（无策略命中时为 false）。
+   * ⭐ **恒在**（#470 缺陷 C）—— 必须是 `boolean`，**不允许缺省/缺失**。
    *
-   * 1.1.0 之前这个键只在部分事件类型上出现（其余事件类型整个键缺失），
-   * 且为 false 时无法区分"未被拦截"与"根本没评估"。现在恒为布尔值，
-   * 下游可以安全地按 `blocked === false` 过滤而不漏掉 warn/modify 类命中
-   * （那类命中记在 `intervention.decision`）。
+   * ## 为什么「缺省 false」不等于「没有这个字段」
+   *
+   *   下游按 `blocked === false` **过滤/聚合**（"没被拦的请求"）⇒
+   *   「键缺失」与「`false`」在 `===` 判定下**完全等价**，但在
+   *   `Object.keys` / `in` / schema 校验 / 「缺失即异常」的批处理里**不等价**
+   *   ⇒ 键缺失 ⇒ 静默失真（#470 实测 484 条 LLM 事件缺这个键）。
+   *
+   * ## 三重护栏
+   *
+   *   1. **类型层**：本字段**必带** ⇒ `tsc` 把每个构造点都逼出来。
+   *   2. **出口层**：`EventBridgeCollector.report` 兜底补 `false`
+   *      （覆盖绕过类型系统的路径：hook JSON、`as` 断言）。
+   *   3. **schema 层**：`schemas/security-event-v1.schema.json` 里
+   *      `blocked` 进 `required` ⇒ 读侧校验会**拒收**缺这个键的存量行。
    */
-  blocked?: boolean;
+  blocked: boolean;
   block_reason?: string;
   /** 关联键：一次工具调用的唯一标识（插件合成，权威）。 */
   tool_call_id?: string | null;
@@ -551,6 +563,34 @@ export interface SecurityEvent {
       priority?: number;
       risk_level?: 'low' | 'medium' | 'high' | 'critical' | 'extreme';
       category?: string;
+      /**
+       * 命中证据（#469-D）：这条规则**凭哪一段文本**命中。
+       *
+       * ⛔ `matched_text` 必然已打码（长度 ≥6 的 token 段替换为 `***`）
+       *   ⇒ 可定位，但不会把被拦下来的凭据原文抄进事件。
+       *
+       * ⚠️ `matched_text` 已打码 ⇒ 其长度**不等于**
+       *   `match_end - match_start`（后者是**原始**字段值里的字符区间）。
+       *
+       * 缺省 = 该规则不是靠文本正则命中的 ⇒ **缺证据 ≠ 没命中**。
+       *
+       * ⭐ 形状与 SDK `MatchEvidence` 逐字段对齐 ⇒ local / SDK 两形态
+       *   同一口径，SDK 侧把 `matched_text` 填实后无需再改插件。
+       */
+      evidence?: {
+        /** 命中的字段名（paramsRegex 的 key / `body` / `sessionId`）。 */
+        field_name?: string;
+        /** 命中的正则原文（来自规则，不是用户数据）。 */
+        pattern?: string;
+        /** 命中类别（paramsRegex / bodyRegex / sessionRegex）。 */
+        match_type?: string;
+        /** 命中片段（⛔ 已打码）。 */
+        matched_text?: string;
+        /** 命中片段在字段原始值中的字符起点。 */
+        match_start?: number;
+        /** 命中片段在字段原始值中的字符终点（不含）。 */
+        match_end?: number;
+      };
     }>;
     modified_params?: Record<string, unknown>;
     substituted_tool_name?: string;
@@ -573,6 +613,39 @@ export interface SecurityEvent {
     mode?: 'audit' | 'enforce';
     priority?: number;
     risk_level?: 'low' | 'medium' | 'high' | 'critical' | 'extreme';
+
+    /**
+     * ⭐ **观测到的额外判定**（#470 缺陷 B）。
+     *
+     * ## 为什么需要它（而不是覆盖 `intervention` 本身）
+     *
+     *   事件上**已经有** intervention 时，后续评估（尤其是**语义**判定）
+     *   原来会被 `!event.intervention` 守卫**整个丢弃** ⇒
+     *   **语义阻断在事件流里零留痕**（#470 实测：418 条 `network_http`
+     *   语义 block，事件流里一条都查不到）。
+     *
+     *   ⇒ 现在改成**合并**：权威判定（谁真正决定了这次动作）留在
+     *     `intervention.decision` / `policy_id`，被观测到的额外判定记在
+     *     `observed` 里 ⇒ **既不覆盖权威判定，也不丢留痕**。
+     *
+     * ⭐ `source` 标明这次观测**来自哪一层**（`semantic` / `rule` / …）。
+     */
+    observed?: {
+      decision: RuntimeDecisionType;
+      policy_id?: string;
+      policy_name?: string;
+      reason?: string;
+      block_reason?: string;
+      block_code?: string;
+      /** 观测来源（`semantic` = 语义层；`rule` = 规则层；…）。 */
+      source: string;
+    };
+    /**
+     * ⭐ **合并前的原始决策**（#470 缺陷 B）——
+     * `observed` 存在时，它记的是**被观测到的那一份**，本字段记的是
+     * **事件上原来那一份** ⇒ 两者可对照（谁先谁后、谁赢）。
+     */
+    original_decision?: RuntimeDecisionType;
   };
 
   // Risk assessment (Phase 1.5)
@@ -1036,6 +1109,7 @@ export interface RuntimeHooksConfig {
    */
   excludeHostInternalProbeCommands?: boolean;
   /**
+  /**
    * runtime 采集事件的单字段最大长度（字符）。
    *
    * 1.1.0 之前 runtime hook 的 `content` 原样透传，不受
@@ -1044,6 +1118,20 @@ export interface RuntimeHooksConfig {
    * 由 `content_truncated` 表达。Default: 2000。
    */
   maxContentLength?: number;
+  /**
+   * 是否启用 runtime hook 的**模式级 Tier-1 阻断**（默认开启）。
+   *
+   * 判定源是 `policies/security-policy.spl.yaml` 的 `hookBlockPatterns` 段
+   * （构建期生成 `hooks/generated-patterns.json.blockPatterns`）——它与
+   * `blockedFlags`（flag 级阻断名单）是**两档独立判定**：
+   *   · flag 级：命令命中某个风险标签且该标签在阻断名单里 ⇒ 拦；
+   *   · 模式级：命令形态命中 Tier-1 模式（读 /etc/shadow、读 ~/.aws/credentials
+   *     …）⇒ 拦，且**不产生任何风险标签**。
+   *
+   * ⚠️ 关掉它 = 只关模式级这一档，flag 级阻断不受影响。
+   * ⚠️ 它与 `OPENCLAW_RUNTIME_BLOCK_PATTERNS` 环境变量同义（配置优先）。
+   */
+  blockPatternsEnabled?: boolean;
   /**
    * Regex patterns for network HTTP requests that should be excluded from
    * collection. Each pattern is tested against the concatenated string

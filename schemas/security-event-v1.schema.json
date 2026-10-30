@@ -8,7 +8,8 @@
     "event_id",
     "event_type",
     "layer",
-    "ts"
+    "ts",
+    "blocked"
   ],
   "properties": {
     "comm": {
@@ -182,7 +183,22 @@
     },
     "previous_actions": {
       "type": "array",
-      "items": {}
+      "items": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "result_status": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
     },
     "step_index": {
       "type": "number"
@@ -353,7 +369,19 @@
           },
           "tools": {
             "type": "array",
-            "items": {},
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "description": "'native' for OpenClaw built-ins; custom kinds come from agent config."
+                }
+              },
+              "additionalProperties": true
+            },
             "description": "Tools brought online by this agent."
           }
         },
@@ -415,11 +443,11 @@
     },
     "bypass_reason": {
       "type": "string",
-      "description": "hook 传播被绕过的具体原因。 - `explicit_skip`：调用方显式要求跳过传播 → 子进程真的裸跑，覆盖丢了； - `env_stripped`：调用方给了不带 NODE_OPTIONS 的 env → hook 已把它 补回去，覆盖没丢（此前这种情形也被算成 `self_protection_bypass`， 宿主自己的探活命令因此刷出大量假告警）。"
+      "description": "/** hook 传播被绕过的具体原因。 - `explicit_skip`：调用方显式要求跳过传播 → 子进程真的裸跑，覆盖丢了； - `env_stripped`：调用方给了不带 NODE_OPTIONS 的 env → hook 已把它 补回去，覆盖没丢（此前这种情形也被算成 `self_protection_bypass`， 宿主自己的探活命令因此刷出大量假告警）。"
     },
     "blocked": {
       "type": "boolean",
-      "description": "是否被策略拦截。恒为布尔值：false 表示未被拦截（不代表未被策略命中，warn/modify 记在 intervention.decision）。"
+      "description": "是否被策略拦截。**恒为布尔值且恒在**（缺省 false）：false 表示未被拦截（不代表未被策略命中，warn/modify 记在 intervention.decision）。键缺失会让「按 blocked 过滤/聚合」的下游口径静默失真（#470 实测 484 条事件缺这个键）⇒ 必填。"
     },
     "block_reason": {
       "type": "string"
@@ -520,6 +548,37 @@
               },
               "category": {
                 "type": "string"
+              },
+              "evidence": {
+                "type": "object",
+                "properties": {
+                  "field_name": {
+                    "type": "string",
+                    "description": "命中的字段名（paramsRegex 的 key / `body` / `sessionId`）。"
+                  },
+                  "pattern": {
+                    "type": "string",
+                    "description": "命中的正则原文（来自规则，不是用户数据）。"
+                  },
+                  "match_type": {
+                    "type": "string",
+                    "description": "命中类别（paramsRegex / bodyRegex / sessionRegex）。"
+                  },
+                  "matched_text": {
+                    "type": "string",
+                    "description": "命中片段（⛔ 已打码）。"
+                  },
+                  "match_start": {
+                    "type": "number",
+                    "description": "命中片段在字段原始值中的字符起点。"
+                  },
+                  "match_end": {
+                    "type": "number",
+                    "description": "命中片段在字段原始值中的字符终点（不含）。"
+                  }
+                },
+                "additionalProperties": true,
+                "description": "命中证据（#469-D）：这条规则**凭哪一段文本**命中。 ⛔ `matched_text` 必然已打码（长度 ≥6 的 token 段替换为 `***`） ⇒ 可定位，但不会把被拦下来的凭据原文抄进事件。 ⚠️ `matched_text` 已打码 ⇒ 其长度**不等于** `match_end - match_start`（后者是**原始**字段值里的字符区间）。 缺省 = 该规则不是靠文本正则命中的 ⇒ **缺证据 ≠ 没命中**。 ⭐ 形状与 SDK `MatchEvidence` 逐字段对齐 ⇒ local / SDK 两形态 同一口径，SDK 侧把 `matched_text` 填实后无需再改插件。"
               }
             },
             "additionalProperties": true
@@ -616,6 +675,36 @@
             "critical",
             "extreme"
           ]
+        },
+        "observed": {
+          "type": "object",
+          "properties": {
+            "decision": {},
+            "policy_id": {
+              "type": "string"
+            },
+            "policy_name": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "block_reason": {
+              "type": "string"
+            },
+            "block_code": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "description": "观测来源（`semantic` = 语义层；`rule` = 规则层；…）。"
+            }
+          },
+          "additionalProperties": true,
+          "description": "⭐ **观测到的额外判定**（#470 缺陷 B）。 ## 为什么需要它（而不是覆盖 `intervention` 本身） 事件上**已经有** intervention 时，后续评估（尤其是**语义**判定） 原来会被 `!event.intervention` 守卫**整个丢弃** ⇒ **语义阻断在事件流里零留痕**（#470 实测：418 条 `network_http` 语义 block，事件流里一条都查不到）。 ⇒ 现在改成**合并**：权威判定（谁真正决定了这次动作）留在 `intervention.decision` / `policy_id`，被观测到的额外判定记在 `observed` 里 ⇒ **既不覆盖权威判定，也不丢留痕**。 ⭐ `source` 标明这次观测**来自哪一层**（`semantic` / `rule` / …）。"
+        },
+        "original_decision": {
+          "description": "⭐ **合并前的原始决策**（#470 缺陷 B）—— `observed` 存在时，它记的是**被观测到的那一份**，本字段记的是 **事件上原来那一份** ⇒ 两者可对照（谁先谁后、谁赢）。"
         }
       },
       "additionalProperties": true,

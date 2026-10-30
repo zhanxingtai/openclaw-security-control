@@ -69,7 +69,7 @@ tar -tzf install/sst-security-control-openclaw-1.0.2.tgz | grep -E "changed/file
 
 ## 5. OSS 分支维护（github-main，强制）
 
-GitHub 公开仓库（remote `github`）走独立孤儿分支 `github-main`，与内网分支（默认 `initiative/open-source-compliance`）双轨维护。
+GitHub 公开仓库（remote `github`）走独立孤儿分支 `github-main`，与内网分支（默认 `open-source`）双轨维护。
 
 ### 5.1 红线
 

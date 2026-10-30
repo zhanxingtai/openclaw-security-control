@@ -22,10 +22,37 @@ import type {
 import { expandActionType } from './splActionType.js';
 import { getCompiledRuleRegexes } from './RuleRegexCache.js';
 import type { CompiledRuleRegexes } from './RuleRegexCache.js';
+import { maskMatchedText } from './match-evidence.js';
+import type { RuleMatchEvidence } from './match-evidence.js';
 
 export interface RuleMatchResult {
   matched: boolean;
   rule?: PolicyRule;
+  /**
+   * 命中证据：命中了哪个字段 / 哪条 pattern / 哪段文本（已打码）。
+   * 非正则维度命中（`fieldEquals` / `fieldIn` / `chain` / `actionType`）
+   * 时没有证据 —— 缺证据 ≠ 没有命中，只表示这条规则不是靠文本正则命中的。
+   */
+  evidence?: RuleMatchEvidence;
+}
+
+/** 单次正则命中在文本上的定位结果（供证据构造用）。 */
+interface PatternHit {
+  /** 命中的 pattern 下标（在该字段的 pattern 列表内，0 基）。 */
+  index: number;
+  /** 命中所在文本（原始值或归一化候选）。 */
+  text: string;
+  /** 命中子串本身。 */
+  matched: string;
+  /** 命中子串在 `text` 中的起始下标。 */
+  matchIndex: number;
+  /**
+   * 命中的文本是原始值还是归一化候选。
+   * ⛔ 归一化候选上的下标不是原始字段值里的下标 ⇒ 证据的
+   *   `matchStart/matchEnd` 只能填 `-1`（占位），否则消费方按区间回查
+   *   原始字段会定位到错误的字符。
+   */
+  normalized: boolean;
 }
 
 export class RuleMatcher {
@@ -61,15 +88,23 @@ export class RuleMatcher {
     if (!this.matchActionName(ctx, match)) return { matched: false };
     if (!this.matchToolName(ctx, match)) return { matched: false };
     if (!this.matchRiskFlags(ctx, match)) return { matched: false };
-    if (!this.matchSessionRegex(ctx, rx)) return { matched: false };
-    if (!this.matchParamsRegex(ctx, match, rx)) return { matched: false };
+    const sessionOutcome = this.matchSessionRegex(ctx, rx);
+    if (!sessionOutcome.matched) return { matched: false };
+    // 命中证据：paramsRegex 命中记「哪个 key / 哪条 pattern / 哪段文本」；
+    // paramsRegex 没命中但 bodyRegex 命中时退回 body 证据；两者都没有但
+    // sessionRegex 命中时退回 sessionId 证据。非正则维度命中时没有证据。
+    const paramsOutcome = this.matchParamsRegex(ctx, match, rx);
+    if (!paramsOutcome.matched) return { matched: false };
+    let evidence = paramsOutcome.evidence ?? sessionOutcome.evidence;
     if (!this.matchParamsNotRegex(ctx, match, rx)) return { matched: false };
     if (!this.matchFieldEquals(ctx, match)) return { matched: false };
     if (!this.matchFieldIn(ctx, match)) return { matched: false };
-    if (!this.matchBodyRegex(ctx, rx)) return { matched: false };
+    const bodyOutcome = this.matchBodyRegex(ctx, rx);
+    if (!bodyOutcome.matched) return { matched: false };
+    if (!evidence) evidence = bodyOutcome.evidence;
     if (!this.matchChain(ctx, rx)) return { matched: false };
 
-    return { matched: true, rule };
+    return { matched: true, rule, evidence };
   }
 
   private static matchActionType(ctxTypes: string[], match: PolicyRule['match']): boolean {
@@ -108,22 +143,62 @@ export class RuleMatcher {
     return true;
   }
 
-  private static matchSessionRegex(ctx: InterventionContext, rx: CompiledRuleRegexes): boolean {
-    if (!rx.sessionRegex) return true;
-    if (!ctx.sessionId) return false;
-    return rx.sessionRegex.some((re) => re.test(ctx.sessionId || ''));
+  /**
+   * sessionId 维度匹配（产出 sessionRegex 证据）。
+   * sessionId 不是敏感值，但"命中了哪条 session 规则"仍是定位信息 ⇒
+   * 与 paramsRegex / bodyRegex 同口径产出证据。
+   */
+  private static matchSessionRegex(
+    ctx: InterventionContext,
+    rx: CompiledRuleRegexes
+  ): { matched: boolean; evidence?: RuleMatchEvidence } {
+    if (!rx.sessionRegex) return { matched: true };
+    if (!ctx.sessionId) return { matched: false };
+    const sessionId = ctx.sessionId;
+    for (let i = 0; i < rx.sessionRegex.length; i++) {
+      const re = rx.sessionRegex[i];
+      re.lastIndex = 0;
+      const m = re.exec(sessionId);
+      if (!m) continue;
+      return {
+        matched: true,
+        evidence: {
+          fieldName: 'sessionId',
+          pattern: re.source ?? '',
+          matchType: 'sessionRegex',
+          matchedText: maskMatchedText(m[0]),
+          matchStart: m.index,
+          matchEnd: m.index + m[0].length,
+        },
+      };
+    }
+    return { matched: false };
   }
 
   private static matchParamsRegex(
     ctx: InterventionContext,
     match: PolicyRule['match'],
     rx: CompiledRuleRegexes
-  ): boolean {
+  ): { matched: boolean; evidence?: RuleMatchEvidence } {
     const map = match.paramsRegex;
-    if (!map) return true;
+    if (!map) return { matched: true };
     const compiledMap = rx.paramsRegex;
     const exceptMap = rx.paramsRegexExcept;
     const params = ctx.params || {};
+
+    // **缺 key 语义 = 跳过该 key**（与 `matchParamsNotRegex` 同口径）。
+    //
+    // 旧行为是「任一声明的 key 在 ctx 里不存在 ⇒ 整条规则不匹配」——多 key
+    // 规则（自保护族 action/path/raw/value/content/data/note 共 7 key）几乎
+    // 永远不命中，形同虚设。规则作者的自带 testCase 写明的预期语义是「缺
+    // key 也拦」（准入路径本身不可放行）⇒ 缺 key 跳过才是预期。
+    //
+    // ⛔ 仍保留「一个 key 都没查 ⇒ 不匹配」（checkedAtLeastOne），不会把
+    //   「ctx 完全没有相关参数」误判成命中。
+    let checkedAtLeastOne = false;
+    // 命中证据只记**第一条**命中的 key（多 key 规则命中时，取遍历序首个）；
+    // 证据的用途是「定位到具体字段」，不是穷举全部命中面。
+    let evidence: RuleMatchEvidence | undefined;
 
     // 热路径用 for-in 遍历，避免每次评估分配 Object.entries。
     for (const key in map) {
@@ -131,7 +206,7 @@ export class RuleMatcher {
       // 该 key 无编译产物只在非法正则时发生（compiled=null 已整体短路），
       // 这里做防御性跳过，保持"跳过该规则"语义。
       const compiled = compiledMap?.[key];
-      if (!compiled) return false;
+      if (!compiled) return { matched: false };
       const except = exceptMap?.[key];
       // 递归提取 key 指向值（含嵌套对象/数组）中的全部字符串逐值
       // 匹配，任一候选命中即算该 key 命中。不再 JSON.stringify——为字符串
@@ -140,19 +215,47 @@ export class RuleMatcher {
       const value = this.getNestedValue(params, key);
       if (typeof value === 'string') {
         // 热路径：字符串值先直测原始值，未命中才归一化（见 testStringWithCandidates）。
-        if (!this.testStringWithCandidatesEx(compiled, except, value)) return false;
+        const hit = this.testStringWithCandidatesEx(compiled, except, value);
+        if (!hit) return { matched: false };
+        checkedAtLeastOne = true;
+        if (!evidence) evidence = this.buildEvidence(key, compiled, hit);
         continue;
       }
       const strings = this.collectMatchStrings(value);
-      if (strings.length === 0) return false;
-      let matched = false;
-      for (let s = 0; s < strings.length && !matched; s++) {
-        matched = this.testStringWithCandidatesEx(compiled, except, strings[s]);
+      if (strings.length === 0) continue;
+      let hit: PatternHit | undefined;
+      for (let s = 0; s < strings.length && !hit; s++) {
+        hit = this.testStringWithCandidatesEx(compiled, except, strings[s]);
       }
-      if (!matched) return false;
+      if (!hit) return { matched: false };
+      checkedAtLeastOne = true;
+      if (!evidence) evidence = this.buildEvidence(key, compiled, hit);
     }
 
-    return true;
+    return { matched: checkedAtLeastOne, evidence };
+  }
+
+  /**
+   * 由一次正则命中构造结构化证据。
+   * `matchedText` 走 {@link maskMatchedText}：命中片段里的 token 段替换为
+   * `***` ⇒ 证据可定位到「哪一段」，但不把凭据原文抄进事件。
+   * `matchStart/matchEnd` 指向原始字段值里的区间；命中发生在归一化候选上时
+   * 置 `-1`（占位）——候选上的下标不是原始值的下标。
+   */
+  private static buildEvidence(
+    field: string,
+    compiled: RegExp[],
+    hit: PatternHit
+  ): RuleMatchEvidence {
+    const located = !hit.normalized;
+    return {
+      fieldName: field,
+      pattern: compiled[hit.index]?.source ?? '',
+      matchType: 'paramsRegex',
+      matchedText: maskMatchedText(hit.matched),
+      matchStart: located ? hit.matchIndex : -1,
+      matchEnd: located ? hit.matchIndex + hit.matched.length : -1,
+    };
   }
 
   private static matchParamsNotRegex(
@@ -216,10 +319,25 @@ export class RuleMatcher {
     return true;
   }
 
-  private static matchBodyRegex(ctx: InterventionContext, rx: CompiledRuleRegexes): boolean {
-    if (!rx.bodyRegex) return true;
+  private static matchBodyRegex(
+    ctx: InterventionContext,
+    rx: CompiledRuleRegexes
+  ): { matched: boolean; evidence?: RuleMatchEvidence } {
+    if (!rx.bodyRegex) return { matched: true };
     const body = ctx.body || ctx.userPrompt || '';
-    return rx.bodyRegex.some((re) => re.test(body));
+    const hit = this.matchTextAgainstPatterns(rx.bodyRegex, undefined, body);
+    if (!hit) return { matched: false };
+    return {
+      matched: true,
+      evidence: {
+        fieldName: 'body',
+        pattern: rx.bodyRegex[hit.index]?.source ?? '',
+        matchType: 'bodyRegex',
+        matchedText: maskMatchedText(hit.matched),
+        matchStart: hit.matchIndex,
+        matchEnd: hit.matchIndex + hit.matched.length,
+      },
+    };
   }
 
   private static matchChain(ctx: InterventionContext, rx: CompiledRuleRegexes): boolean {
@@ -353,7 +471,7 @@ export class RuleMatcher {
    * 未命中且值为 path 形态时再测归一化候选。
    */
   private static testStringWithCandidates(compiled: RegExp[], s: string): boolean {
-    return this.testStringWithCandidatesEx(compiled, undefined, s);
+    return this.testStringWithCandidatesEx(compiled, undefined, s) !== undefined;
   }
 
   /**
@@ -366,39 +484,70 @@ export class RuleMatcher {
    * 豁免与 pattern 必须在同一段文本上比较：pattern 命中原串而豁免只命中
    * 归一化候选（反之亦然）都算"该文本未被豁免"，避免归一化路径把豁免绕开
    * 或凭空生效。
+   *
+   * 返回值带命中定位（哪条 pattern / 哪段文本 / 下标）⇒ 命中证据直接从这里
+   * 构造，不必二次匹配。
    */
   private static testStringWithCandidatesEx(
     compiled: RegExp[],
     except: RegExp[][] | undefined,
     s: string
-  ): boolean {
-    if (this.testTextAgainstPatterns(compiled, except, s)) return true;
+  ): PatternHit | undefined {
+    const direct = this.matchTextAgainstPatterns(compiled, except, s);
+    if (direct) {
+      return {
+        index: direct.index,
+        text: s,
+        matched: direct.matched,
+        matchIndex: direct.matchIndex,
+        normalized: false,
+      };
+    }
     const candidates = this.pathCandidates(s);
     for (let c = 0; c < candidates.length; c++) {
-      if (this.testTextAgainstPatterns(compiled, except, candidates[c])) return true;
+      const hit = this.matchTextAgainstPatterns(compiled, except, candidates[c]);
+      if (hit) {
+        return {
+          index: hit.index,
+          text: candidates[c],
+          matched: hit.matched,
+          matchIndex: hit.matchIndex,
+          normalized: true,
+        };
+      }
     }
-    return false;
+    return undefined;
   }
 
-  /** 同一段文本上：任一 pattern 命中且未被本条专属豁免命中 → 命中。 */
-  private static testTextAgainstPatterns(
+  /**
+   * 同一段文本上：任一 pattern 命中且未被本条专属豁免命中 → 命中，
+   * 并回报是哪一条 pattern、命中了哪段子串、子串在文本里的下标。
+   * 用 `exec`（而非 `test`）是为了拿命中子串与下标 —— 证据构造需要。
+   */
+  private static matchTextAgainstPatterns(
     compiled: RegExp[],
     except: RegExp[][] | undefined,
     text: string
-  ): boolean {
+  ): { index: number; matched: string; matchIndex: number } | undefined {
     for (let i = 0; i < compiled.length; i++) {
-      if (!compiled[i].test(text)) continue;
+      const re = compiled[i];
+      // 规则 flags 只允许 i/m/s（禁 g/y）⇒ lastIndex 恒为 0；这里显式归零
+      // 是防御性的（编译产物是进程内共享实例，不能带状态）。
+      re.lastIndex = 0;
+      const m = re.exec(text);
+      if (!m) continue;
       const own = except?.[i];
       if (own && own.length > 0) {
         let exempted = false;
         for (let e = 0; e < own.length; e++) {
+          own[e].lastIndex = 0;
           if (own[e].test(text)) { exempted = true; break; }
         }
         if (exempted) continue;
       }
-      return true;
+      return { index: i, matched: m[0], matchIndex: m.index };
     }
-    return false;
+    return undefined;
   }
 
   /** 字符串是否按路径形态处理：绝对/相对路径、盘符路径、无空白含分隔符的相对路径。 */

@@ -214,9 +214,9 @@ rules:
         - move
       paramsRegex:
         path:
-          # 2026-10-27 误报收敛：agent 工作区（.openclaw/workspace）不是插件
-          # 资产，agent 往自己的 memory 目录写笔记不应被判成篡改配置。
-          # 插件自有资产仍由下方逐条精确模式覆盖。
+          # agent 工作区（.openclaw/workspace）不是插件资产，agent 往自己
+          # 的 memory 目录写笔记不应被判成篡改配置；插件自有资产仍由下方
+          # 逐条精确模式覆盖。
           - (^|/)\.openclaw/(?!workspace\b)
           - (^|/)\.openclaw[/\\]openclaw\.json$
           - (^|/)\.openclaw[/\\]security-policy\.ya?ml$
@@ -1096,8 +1096,8 @@ rules:
           # "ambiguous repetition boundary"护栏拒收、导致整条规则被静默丢弃；
           # 须用有界间隙 [^;|&\n]{0,80}?\s+（80 字符跨度 + 强制至少 1 空白）。
           #
-          # 2026-10-27 误报收敛：间隙不再跨越 shell 分隔符（; | & 换行）。
-          # 旧形态 [\s\S]{0,80}? 会跨命令边界搭桥——散文里的 "cat passwd
+          # 间隙不跨越 shell 分隔符（; | & 换行）：旧形态 [\s\S]{0,80}? 会跨
+          # 命令边界搭桥——散文里的 "cat passwd
           # file?" 与后半段真实的 "stat /etc/passwd" 被拼成一条
           # "cat ... /etc/passwd" 命中。跨分隔符的 cat 与路径本就不是同
           # 一条命令，不该命中。
@@ -1162,6 +1162,24 @@ rules:
           actionType: agent_tool_call
           toolName: exec
           params: { command: "cat /var/log/app.log" }
+        expectedDecision: allow
+      - name: 复合命令（管道）cat /etc/shadow 2>&1 | head -5 被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "cat /etc/shadow 2>&1 | head -5" }
+        expectedDecision: block
+      - name: 复合命令（分号）cat /etc/shadow; echo done 被阻断
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "cat /etc/shadow; echo done" }
+        expectedDecision: block
+      - name: 复合命令（管道）读普通日志不命中（负向）
+        input:
+          actionType: agent_tool_call
+          toolName: exec
+          params: { command: "cat /var/log/app.log | tail -5" }
         expectedDecision: allow
       - name: 嵌套参数中的敏感读取命令被阻断
         input:
@@ -1827,13 +1845,16 @@ rules:
         - agent_tool_call
       paramsRegex:
         command:
-          # HTTP 头 / 标准凭据字段
-          - (Authorization|X-Api-Key|Api[_-]?Key|access[_-]?token|secret|password|passwd|pwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-\.~+\/=]{12,}
+          # HTTP 头 / 标准凭据字段；值形态排除绝对路径与点相对路径（(?!/)(?!\.{1,2}/)），
+          # 那些是路径不可能是凭据。不用 paramsNotRegex 排除——其语义是「否决整条
+          # 规则」，会把同一条命令里真实的凭据一起放过。
+          - (Authorization|X-Api-Key|Api[_-]?Key|access[_-]?token|secret|password|passwd|pwd)\s*[:=]\s*['"]?(?!/)(?!\.{1,2}/)[A-Za-z0-9_\-\.~+\/=]{12,}
           # Bearer / Basic token（HTTP scheme 大小写不敏感）
           - pattern: (?:bearer\s+[A-Za-z0-9_\-\.=]{12,})
             flags: i
-          # -u user:pass （curl basic auth）
-          - -u\s+\S+:\S+
+          # -u user:pass（curl/wget/httpie basic auth）；形态必须绑定 HTTP 客户端——
+          # 裸 -u\s+\S+:\S+ 会误中 date -u +时间戳这类非凭据命令。
+          - '(?:curl|wget|httpie)\b[^|;&]*(?:-u|--user)(?:=|\s+)\S+:\S+'
           # mysql/psql/redis 连接串带密码
           - (mysql|psql|redis-cli|mongosh)\s+.*-p\s*\S+
           # SSH 私钥 inline 路径引用（Tier-1 私钥本体）
@@ -6469,6 +6490,33 @@ hookPatterns:
       input: raw
     - pattern: 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
       input: raw
+# runtime hook 的同步阻断模式集（不占 flag 名）——hook 在 spawn 之前唯一
+# 的同步阻断点：命中任一 pattern ⇒ 阻断，原因码取该条的 reason。
+# 口径纪律（误报红线）：只收确凿的凭据/系统文件；/etc/passwd、/etc/hosts、
+# authorized_keys、known_hosts、.ssh/config 一律只打标不阻断（IDE/系统
+# 后台诊断进程常见命中，收进来会淹没真实告警）。
+hookBlockPatterns:
+  - pattern: '(?:^|\s|["''<>])(?:/etc/shadow|/etc/gshadow|/etc/sudoers(?:/|\b))\b'
+    input: raw
+    reason: '读取 Tier-1 口令库/提权配置（/etc/shadow、/etc/gshadow、/etc/sudoers）'
+  - pattern: '(?:^|\s|["''<>])/etc/ssh/ssh_host_\S+'
+    input: raw
+    reason: '读取 SSH 主机私钥（/etc/ssh/ssh_host_*）'
+  - pattern: '(?:^|\s|["''<>])/proc/self/environ\b'
+    input: raw
+    reason: '读取进程环境变量（/proc/self/environ，常含明文 API Key）'
+  - pattern: '(?:^|\s|["''<>])(?:[^\s"''<>]*/)?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)\b'
+    input: raw
+    reason: '读取 SSH 用户私钥（~/.ssh/id_*）'
+  - pattern: '(?:^|\s|["''<>])(?:[^\s"''<>]*/)?\.aws/credentials\b'
+    input: raw
+    reason: '读取云厂商凭据文件（~/.aws/credentials）'
+  - pattern: '(?:^|\s|["''<>])(?:[^\s"''<>]*/)?\.(?:git-credentials|netrc)\b'
+    input: raw
+    reason: '读取 git / netrc 明文凭据文件'
+  - pattern: '\bgetent\s+(?:shadow|gshadow)\b'
+    input: raw
+    reason: '通过 getent 读取 shadow 口令库'
 monitorPatterns:
   reverse_shell:
     - pattern: 'bash\s+-i\s+.*(/dev/tcp|/dev/udp)'
@@ -6571,11 +6619,10 @@ x-openclaw-selfProtection:
   flags: 'i'
   groups:
     protected_paths:
-      # 2026-10-27 误报收敛：agent 工作区（~/.openclaw/workspace）不是插件
-      # 资产——它承载 agent 自己的 memory/笔记。原先的通配把整个 .openclaw/
-      # 都列为受保护路径，于是「把这段排查笔记写进 memory」会因为正文里
-      # 出现 workspace 路径而被当成篡改拦下。插件自有资产（openclaw.json /
-      # 策略文件 / 审计日志 / 扩展目录 / 安装目录）由下方逐条精确模式覆盖。
+      # agent 工作区（~/.openclaw/workspace）不是插件资产——它承载 agent
+      # 自己的 memory/笔记；判定只针对操作目标路径，正文引用 workspace 路径
+      # 不会被当成篡改拦下。第 1 条是覆盖 .openclaw/ 的宽通配，下方逐条为
+      # 显式资产清单（在宽通配之上再收紧，而非替代）。
       - '(^|/)\.openclaw[/\\](?!workspace\b)'
       - '(^|/)\.openclaw[/\\]openclaw\.json$'
       - '(^|/)\.openclaw[/\\]security-policy\.ya?ml$'
@@ -6586,6 +6633,11 @@ x-openclaw-selfProtection:
       - '(^|/)node_modules[/\\]sst-security-control-openclaw'
       - '(^|/)node_modules[/\\]@zhanxing[/\\]sst-security-control-openclaw'
       - '(^|/)\.openclaw[/\\]npm[/\\]projects[/\\]sst-security-control-openclaw'
+      # 插件自有源码/构建产物（本 yaml 是 SelfProtection 模式声明的数据源，
+      # 内置常量只是生成产物缺失时的兜底——只写常量不在这里声明不会生效）。
+      - '(^|/)sst-security-control-openclaw[/\\]src[/\\]store\.(ts|js)$'
+      - '(^|/)sst-security-control-openclaw[/\\]src[/\\]intervention[/\\]'
+      - '(^|/)sst-security-control-openclaw[/\\]dist[/\\]index\.(ts|js)$'
     gateway_config_self_harm:
       - '(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor).*\benabled\b\s*[:=]\s*false'
       - '(?:sst-security-control-openclaw|sst-security-control-openclaw-v0\.9\.1|openclaw[-_]?security[-_]?monitor).*\bdisabl'

@@ -15,6 +15,7 @@ import type {
   EventType,
 } from "./types.js";
 import type { SecurityDecision } from './intervention/types.js';
+import { toEventEvidence } from './intervention/match-evidence.js';
 // Inline interface for event reporting.
 interface EventCollectorLike {
   report(event: SecurityEvent): Promise<void>;
@@ -23,7 +24,7 @@ interface EventCollectorLike {
 interface AgentSnapshotReporterLike {
   registerAgent(input: unknown): void | Promise<void>;
 }
-import { inferAgentIdFromSessionKey, inferAgentNameFromAgentDir } from './ctxExtract.js';
+import { inferAgentIdFromSessionKey, inferAgentNameFromAgentDir, coalesceUserId } from './ctxExtract.js';
 import { safeExtract, safeExtractArray } from './safe-extract.js';
 import { truncateString, computeContentLength } from './truncate.js';
 import { sha256Hex, stableStringify } from './asset-hash.js';
@@ -269,6 +270,8 @@ export class ApplicationCollector implements ILayerCollector {
       priority: m.priority,
       risk_level: m.riskLevel,
       category: m.category,
+      // 命中证据：命中字段 / pattern / 文本片段；snippet 已打码，不把凭据原文抄进事件。
+      ...(m.evidence ? { evidence: toEventEvidence(m.evidence) } : {}),
     }));
   }
 
@@ -379,6 +382,10 @@ export class ApplicationCollector implements ILayerCollector {
       tools,
     };
     event.agents = [agentRecord];
+    // 与 agent_session_start / agent_message 同口径回填归因。
+    event.user_id = (this.config.captureUserId ?? true)
+      ? this.getSessionContext(ctx.sessionKey).userId || undefined
+      : undefined;
 
     // 向清单上报器注册该智能体，供 periodic agent-snapshot 使用。
     const sourceAgentId = typeof agentRecord.id === 'string' && agentRecord.id.length > 0
@@ -520,6 +527,9 @@ export class ApplicationCollector implements ILayerCollector {
     event.model_provider = ctx.modelProvider || sessionCtx.agentConfig?.model?.provider || 'unknown';
     event.model_name = ctx.modelName || sessionCtx.agentConfig?.model?.name || 'unknown';
     this.attachSystemPrompt(event, sessionCtx);
+    // userId 已在 onSessionStart / 消息 / 工具元数据路径经多级回退钉进 sessionCtx，
+    // 这里只做落盘回填（captureUserId 关则一律不带）。
+    event.user_id = (this.config.captureUserId ?? true) ? sessionCtx.userId || undefined : undefined;
 
     await this.emit(event);
   }
@@ -537,6 +547,20 @@ export class ApplicationCollector implements ILayerCollector {
       return;
     }
     const sessionCtx = this.getSessionContext(ctx.sessionKey);
+    // 会话开始即把执行用户身份钉进 sessionCtx，agent_session_start 与后续事件共用同一归因。
+    // 宿主的用户身份常在 __openclaw 元数据块里，userIdField 单字段取不到，走 coalesceUserId 多级回退。
+    if (this.config.captureUserId ?? true) {
+      const userId = coalesceUserId(ctx.metadata, this.config.userIdField ?? 'userId');
+      if (userId) {
+        sessionCtx.userId = userId;
+        // getSessionContext 对未登记会话返回的是未入缓存的临时对象，
+        // 必须写回 sessionCache，后续事件才读得到这个归因。
+        this.sessionCache.set(this.skey(ctx.sessionKey), {
+          context: sessionCtx,
+          lastAccessTime: Date.now(),
+        });
+      }
+    }
     const agentId = this.resolveAgentId(sessionCtx.agentId, ctx.sessionKey, ctx.runId);
     await this.emitAgentSessionStartIfNeeded(ctx, agentId, sessionCtx);
   }
@@ -859,10 +883,9 @@ export class ApplicationCollector implements ILayerCollector {
     // Extract userId/plan from tool context metadata if available
     if (ctx.metadata) {
       if (this.config.captureUserId) {
-        const userIdField = this.config.userIdField ?? 'userId';
-        const userIdFromMetadata = safeExtract(() => ctx.metadata?.[userIdField] as string);
-        if (userIdFromMetadata) {
-          sessionCtx.userId = userIdFromMetadata;
+        const userId = coalesceUserId(ctx.metadata, this.config.userIdField ?? 'userId');
+        if (userId) {
+          sessionCtx.userId = userId;
         }
       }
       if (this.config.captureAgentPlan) {
@@ -1280,6 +1303,10 @@ export class ApplicationCollector implements ILayerCollector {
     const effectiveAgentId = this.resolveAgentId(ctx.agentId, ctx.sessionKey, ctx.runId);
     const event = this.buildBaseEvent('x_openclaw_subagent_start', ctx.sessionKey, ctx.runId, effectiveAgentId);
     this.fillSubagentRecord(event, ctx);
+    // 与 agent_start 同口径回填归因。
+    event.user_id = (this.config.captureUserId ?? true)
+      ? this.getSessionContext(ctx.sessionKey).userId || undefined
+      : undefined;
     await this.emit(event);
   }
 
@@ -1825,16 +1852,16 @@ export class ApplicationCollector implements ILayerCollector {
   private updateSessionFromMessage(ctx: MessageWriteContext, role: string = ctx.role): SessionContext {
     const existing = this.getSessionContext(ctx.sessionKey);
 
+
     if (role === 'user' && typeof ctx.content === 'string') {
       existing.userPrompt = ctx.content;
     }
 
     // Extract userId from message metadata if available
     if (this.config.captureUserId) {
-      const userIdField = this.config.userIdField ?? 'userId';
-      const userIdFromMetadata = safeExtract(() => ctx.metadata?.[userIdField] as string);
-      if (userIdFromMetadata) {
-        existing.userId = userIdFromMetadata;
+      const userId = coalesceUserId(ctx.metadata, this.config.userIdField ?? 'userId');
+      if (userId) {
+        existing.userId = userId;
       }
     }
 

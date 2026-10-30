@@ -80,6 +80,56 @@ export function coalesceString(
   return undefined;
 }
 
+/**
+ * 从消息/工具 metadata 里按优先级归并执行用户标识（审计归因）。
+ *
+ * 优先级：`metadata[userIdField]`（默认 'userId'，第一优先级与原单字段
+ * 提取完全同口径）→ `__openclaw.senderIdentity.id` → `__openclaw.senderName`
+ * → `__openclaw.senderUsername` → `senderId`，第一个非空字符串胜出。
+ * 宿主把用户身份挂在消息 `__openclaw` 元数据块里；userIdField 取不到时
+ * 靠这层回退保住归因。`captureUserId === false` 的闸门由调用处负责。
+ */
+export function coalesceUserId(
+  metadata: Record<string, unknown> | undefined,
+  userIdField: string
+): string | undefined {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return undefined;
+  }
+  const direct = metadata[userIdField];
+  if (typeof direct === 'string' && direct.length > 0) return direct;
+
+  const openclaw = metadata.__openclaw;
+  const openclawMeta =
+    openclaw && typeof openclaw === 'object' && !Array.isArray(openclaw)
+      ? (openclaw as Record<string, unknown>)
+      : undefined;
+  if (openclawMeta) {
+    const identity = openclawMeta.senderIdentity;
+    if (identity && typeof identity === 'object' && !Array.isArray(identity)) {
+      const id = (identity as Record<string, unknown>).id;
+      if (typeof id === 'string' && id.length > 0) return id;
+    }
+    const name = openclawMeta.senderName;
+    if (typeof name === 'string' && name.length > 0) return name;
+    const username = openclawMeta.senderUsername;
+    if (typeof username === 'string' && username.length > 0) return username;
+  }
+
+  const senderId = metadata.senderId;
+  if (typeof senderId === 'string' && senderId.length > 0) return senderId;
+  return undefined;
+}
+
+/**
+ * 抽取会话键。
+ *
+ * 注意：这里**不收** runId / run_id / run——规范（common.json）只允许
+ * run_id 向下回退 task_id / session_id；反向把 session 键填成 run_id 会把
+ * 不同会话的事件假性关联成同一会话。平台侧同样要求"无法取得真实编号时保留
+ * 缺失，不能保存假编号"（docs/knowledge/collector-compatibility.md）。
+ * run 身份走 extractRunId 自己的通道。
+ */
 export function extractSessionKey(ctx: Record<string, unknown>): string | undefined {
   // 注意：这里**不收** runId / run_id / run——规范（common.json）只允许
   // run_id 向下回退 task_id/session_id，反向把 session 键填成 run_id 会把
@@ -1096,9 +1146,40 @@ export function normalizeMessageWriteContext(
     }
   }
 
-  const metadata = (ctx.metadata || ctx.context || undefined) as
+  let metadata = (ctx.metadata || ctx.context || undefined) as
     | Record<string, unknown>
     | undefined;
+
+  // 宿主若把 payload 以 message 子对象传入，metadata||context 归一化取不到
+  // message.__openclaw 里的用户身份（senderIdentity.id / senderName / ...）。
+  // 合并进 metadata：__openclaw 块整体挂在 metadata.__openclaw 下供
+  // coalesceUserId 消费，其键也铺到顶层（不覆盖已存在的 metadata 键）。
+  const messageObj =
+    ctx.message && typeof ctx.message === 'object' && !Array.isArray(ctx.message)
+      ? (ctx.message as Record<string, unknown>)
+      : undefined;
+  const openclawMeta = messageObj?.__openclaw;
+  if (
+    openclawMeta &&
+    typeof openclawMeta === 'object' &&
+    !Array.isArray(openclawMeta)
+  ) {
+    const existingOpenclaw =
+      metadata &&
+      metadata.__openclaw &&
+      typeof metadata.__openclaw === 'object' &&
+      !Array.isArray(metadata.__openclaw)
+        ? (metadata.__openclaw as Record<string, unknown>)
+        : undefined;
+    metadata = {
+      ...(openclawMeta as Record<string, unknown>),
+      ...(metadata || {}),
+      __openclaw: {
+        ...(openclawMeta as Record<string, unknown>),
+        ...(existingOpenclaw || {}),
+      },
+    };
+  }
 
   const runId = extractRunId(ctx);
   return {

@@ -107,9 +107,46 @@ describe('事件 JSON Schema', () => {
     }
   });
 
-  it('必填字段是 event_id / event_type / layer / ts', () => {
+  it('必填字段 = event_id / event_type / layer / ts / blocked', () => {
     const schema = loadSchema();
-    expect([...schema.required].sort()).toEqual(['event_id', 'event_type', 'layer', 'ts']);
+    // ⭐ `blocked` 是 #470 缺陷 C 加进来的：它必须**恒在**
+    //   （缺省 false）⇒ 键缺失会让「按 blocked 过滤/聚合」的下游静默失真。
+    expect([...schema.required].sort()).toEqual([
+      'blocked',
+      'event_id',
+      'event_type',
+      'layer',
+      'ts',
+    ]);
+  });
+
+  it('⭐ 必填集与 types.ts 的「非可选字段」集完全一致（唯一事实源）', () => {
+    // 生成脚本从 types.ts 推导必填集 ⇒ 这里断言两侧**相等**，
+    // 而不是断言某个写死的清单 ⇒ 「类型改了、schema 没重生成」会被发现。
+    const schema = loadSchema();
+    const optional = new Set<string>();
+    const src = readFileSync(typesPath, 'utf8');
+    const start = src.indexOf('export interface SecurityEvent {');
+    expect(start).toBeGreaterThan(-1);
+    let depth = 0;
+    let end = -1;
+    for (let j = src.indexOf('{', start); j < src.length; j++) {
+      if (src[j] === '{') depth++;
+      else if (src[j] === '}') {
+        depth--;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    const body = src.slice(src.indexOf('\n', start) + 1, end);
+    const required: string[] = [];
+    for (const m of body.matchAll(/^  ([a-zA-Z_][a-zA-Z0-9_]*)(\??):/gm)) {
+      if (m[2] === '?') optional.add(m[1]!);
+      else required.push(m[1]!);
+    }
+    expect([...schema.required].sort()).toEqual(required.sort());
   });
 
   it('layer 的取值被约束为 application / system / asset', () => {
@@ -134,6 +171,30 @@ describe('事件 JSON Schema', () => {
     expect(schema.properties.redacted_keys?.type).toBe('array');
     expect(schema.properties.redacted_keys?.items?.type).toBe('string');
     expect(schema.properties.raw_params_hash?.type).toBe('string');
+  });
+
+  it('event_type 描述里的取值清单完整（防联合注释分号截断回归）', () => {
+    const schema = loadSchema();
+    const desc = schema.properties.event_type.description ?? '';
+    // 清单从 types.ts 的 EventType 联合生成；截断 bug 曾让它只剩前 14 个
+    // 成员（停在 code_mode_exec）。哨兵成员全部位于截断点之后，缺任何一个
+    // 都说明别名解析再次被注释里的分号截断。数量下限随类型扩充只增不减。
+    const SENTINELS = [
+      'command_execution',
+      'file_read',
+      'network_http',
+      'process_start',
+      'process_exit',
+      'asset_snapshot',
+      'x_openclaw_protection_degraded',
+      'x_openclaw_tamper_detected',
+      'x_openclaw_runtime_hook_unloaded',
+    ];
+    for (const member of SENTINELS) {
+      expect(desc, `event_type 清单缺 ${member}（疑似截断回归）`).toContain(member);
+    }
+    const list = desc.split('取值：')[1]?.split('。')[0]?.split('、') ?? [];
+    expect(list.length).toBeGreaterThanOrEqual(30);
   });
 
   it('嵌套对象字面量被展开（collector / agents[] 不是空壳）', () => {

@@ -829,6 +829,8 @@ export class RuntimeHookCollector implements ILayerCollector {
         middleware_name: 'sst-security-control-openclaw',
         collector_name: this.name,
       },
+      // `blocked` 恒在：进程退出没有「被拦」语义（拦的是启动那条）⇒ 恒为 false。
+      blocked: false,
       runtime: parsed.runtime,
       api: parsed.api,
       cmdline: parsed.command_line,

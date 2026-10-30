@@ -33,6 +33,7 @@ const JSON_ONLY_KEYS: Record<string, string> = {
   "application.runtimeHooks.excludeHostInternalProcesses": "宿主内部 worker 排除开关（开关会静默少采子进程，JSON-only）",
   "application.runtimeHooks.excludeHostInternalProbeCommands": "宿主只读探针排除开关（开关会静默少采宿主自身探活事件，JSON-only）",
   "application.runtimeHooks.maxContentLength": "runtime 采集事件单字段长度上限（调优参数）",
+  "application.runtimeHooks.blockPatternsEnabled": "runtime hook 模式级 Tier-1 阻断开关（关掉即少一档阻断能力，JSON-only）",
   // ── network：整层未实现占位（network.enabled 不进 UI；其余子项亦为占位），
   //    网络拦截请走 Runtime Hooks ──
   "network.enabled": "网络层总开关未实现（占位，未来功能；手改 JSON 仍触发 dangerous 警告）",

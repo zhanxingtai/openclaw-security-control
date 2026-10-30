@@ -15,6 +15,7 @@ import type {
   FailStrategy,
   PolicyAuditEvent,
   PolicyAuditEventType,
+  RuleHit,
 } from './types.js';
 import { DEFAULT_HIGH_RISK_FLAGS } from './types.js';
 import { RuleLoader } from './RuleLoader.js';
@@ -247,10 +248,10 @@ export class InterventionEngineImpl {
     if (loadError) {
       return { decision: this.policyLoadFailureDecision(ctx, loadError), matchedRules: [] };
     }
-    // matchedRules 在 try 外声明并与 findMatches 共享引用：匹配中途抛错时
+    // matchedHits 在 try 外声明并与 findMatches 共享引用：匹配中途抛错时
     // 兜底决策仍能拿到已命中的规则（fail_open_high_risk_only 的高危判定），
     // 而不是一律退化为空数组放行。
-    let matchedRules: PolicyRule[] = [];
+    let matchedHits: RuleHit[] = [];
     try {
       const policy = this.loader.getPolicy();
       const sortedRules = this.getSortedRules(policy.rules);
@@ -259,11 +260,12 @@ export class InterventionEngineImpl {
       // 未知 actionType 在此记 warn（宿主行为变化可观测）。
       const canonicalCtx = { ...ctx, actionType: canonicalizeContextActionType(ctx.actionType, this.options.logger) };
       const enforceShortCircuit = (this.options.mode || policy.mode) === 'enforce';
-      matchedRules = this.findMatches(canonicalCtx, sortedRules, enforceShortCircuit, matchedRules);
+      matchedHits = this.findMatches(canonicalCtx, sortedRules, enforceShortCircuit, matchedHits);
+      const matchedRules = matchedHits.map((h) => h.rule);
       // composeDetailed 同时返回完整命中标注。enforce 短路本身保留
       // （命中 block 即停扫，性能语义不变），短路点之前已匹配的 warn/modify 等
       // 规则随 matchedPolicies 进入决策对象，由采集层写入事件审计标注。
-      const { decision, matched } = this.composer.composeDetailed(canonicalCtx, matchedRules);
+      const { decision, matched } = this.composer.composeDetailed(canonicalCtx, matchedHits);
       if (matched.length > 0) {
         decision.matchedPolicies = matched;
       }
@@ -285,6 +287,7 @@ export class InterventionEngineImpl {
       // Partial matched rules accumulated before the throw are passed through so
       // fail_open_high_risk_only can still see high-risk hits;
       // with none available the fallback uses ctx.riskFlags as secondary signal.
+      const matchedRules = matchedHits.map((h) => h.rule);
       return { decision: this.fallbackDecision(ctx, err, matchedRules), matchedRules };
     }
   }
@@ -329,8 +332,8 @@ export class InterventionEngineImpl {
     ctx: InterventionContext,
     rules: PolicyRule[],
     enforceShortCircuit: boolean,
-    matched: PolicyRule[] = []
-  ): PolicyRule[] {
+    matched: RuleHit[] = []
+  ): RuleHit[] {
     for (const rule of rules) {
       // 单规则隔离——非法 / 灾难性回溯正则的规则跳过并留痕，
       // 其余规则照常评估，不再整次 fail-open 放行。
@@ -351,7 +354,9 @@ export class InterventionEngineImpl {
       }
       const result = RuleMatcher.match(ctx, rule, compiled);
       if (result.matched && result.rule) {
-        matched.push(result.rule);
+        // 命中证据（#469-D）随命中一起带出 ⇒ 事件层能回答
+        // 「这条规则凭哪一段文本命中」。
+        matched.push({ rule: result.rule, evidence: result.evidence });
         if (enforceShortCircuit && this.isBlockRule(rule)) {
           break;
         }

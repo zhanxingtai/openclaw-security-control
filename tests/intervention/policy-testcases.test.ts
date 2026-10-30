@@ -98,7 +98,7 @@ describe('policy-testcases runner', () => {
     // 防止静默丢失整组用例；跳过清单（disabled 规则的用例）在下方断言为空
     // 以外的部分由 console.log 输出供审计。
     expect(summary.rules).toBe(92); // 70 + 7（通用攻击面规则组：paste/gist 外传、远端传输、多语言反弹、capabilities、进程终止、procfs）+ 13（自保护规则组：cron 写入、防火墙清空、SELinux 降级、ptrace、审计文件篡改、插件路径、磁盘覆写）+ 1（self-protection-block-gateway-config-write：收窄 gateway config 写轴误拦时新增）+ 1（warn-sensitive-user-enumeration：账号枚举类敏感读取降 warn）
-    expect(summary.executableCases).toBe(492); // 350 + 27（match 取强补充用例：imds/ssrf/rm-root/db-dump/db-live/proc-mem）+ 100（自保护规则组 + cron/firewall/SELinux/ptrace/审计/插件路径/磁盘覆写 等新增用例）+ 8（gateway config 写轴收窄：self-protection-block-gateway-action 净增 2 条 + 新规则 6 条）+ 7（warn-sensitive-user-enumeration 4 条 + 条目级豁免回归 3 条）
+    expect(summary.executableCases).toBe(495); // 基线 492（350 + 27（match 取强补充用例：imds/ssrf/rm-root/db-dump/db-live/proc-mem）+ 100（自保护规则组 + cron/firewall/SELinux/ptrace/审计/插件路径/磁盘覆写 等新增用例）+ 8（gateway config 写轴收窄）+ 4（warn-sensitive-user-enumeration 4 条）+ 3（余量））+ 3（#469-A 复合命令/管道形态：管道 /etc/shadow、分号 /etc/shadow、管道读普通日志负向）
     console.log(JSON.stringify(summary, null, 2));
   });
 

@@ -117,19 +117,26 @@ function isNetworkHookDisabled() {
   const v = readHookEnv('OPENCLAW_NETWORK_HOOK_ENABLED');
   return v === 'false' || v === '0';
 }
-// Default blocklist: loopback / RFC1918 / link-local and the cloud metadata
-// endpoints — generic targets any deployment should cut off in enforce mode.
+// Default blocklist: RFC1918 / link-local and the cloud metadata endpoints —
+// generic targets any deployment should cut off in enforce mode.
 // Intentionally vendor-neutral: deployment-specific entries (vendor APIs,
 // internal C2 domains, etc.) belong in OPENCLAW_NETWORK_BLOCKED_HOSTS, a
 // comma-separated regex list read at module load.
+//
+// 回环地址（127.0.0.0/8 · ::1 · localhost）刻意不在默认黑名单里：回环只能连到
+// 本机，出网风险为零；真正要防的是「把本机凭据投递到某个本地端口」，那一条由
+// 下面的「回环 + 敏感头携带凭据 ⇒ 仍拦」兜住。
+//
+// ⚠️ 两个环境变量的语义完全不同（容易误配）：
+//   · OPENCLAW_NETWORK_BLOCKED_HOSTS = 整表替换（`||`）——设了它默认名单全部失效
+//     （不是追加！），想保留默认必须逐条抄全。
+//   · OPENCLAW_NETWORK_HOOK_IGNORE_HOSTS = 追加（`??`）——默认忽略名单仍然生效。
 const DEFAULT_BLOCKED_HOSTS = [
-  '^127\\.',
   '^0\\.0\\.0\\.0',
   '^10\\.',
   '^172\\.(1[6-9]|2[0-9]|3[01])\\.',
   '^192\\.168\\.',
   '^169\\.254\\.',
-  '^\\[::1\\]',
   '^metadata\\.google\\.internal',
   '^169\\.254\\.169\\.254',
 ].join(',');
@@ -137,6 +144,22 @@ const BLOCKED_HOSTS = (process.env.OPENCLAW_NETWORK_BLOCKED_HOSTS || DEFAULT_BLO
   .split(',')
   .map((h) => h.trim())
   .filter(Boolean);
+
+// 回环地址判定（默认放行，带凭据时仍拦）。覆盖 127.0.0.0/8 · ::1 · localhost；
+// host 字符串可能带端口（`127.0.0.1:18789`）⇒ 一律按前缀/整串匹配。
+const LOOPBACK_HOST_PATTERNS = [
+  '^127\\.',
+  '^localhost(:\\d+)?$',
+  '^\\[::1\\](:\\d+)?$',
+  '^::1$',
+];
+const LOOPBACK_HOST_RES = LOOPBACK_HOST_PATTERNS.map((pattern) => {
+  try {
+    return new RegExp(pattern, 'i');
+  } catch {
+    return null;
+  }
+});
 // Precompile the host block patterns once at load: the old
 // isBlockedHost did `new RegExp(pattern)` per pattern PER REQUEST on the
 // hot path. A pattern that fails to compile keeps the literal-match fallback.
@@ -289,6 +312,64 @@ function getGlobalContext() {
 
 function isSensitiveHeader(key) {
   return SENSITIVE_HEADERS.has(key.toLowerCase());
+}
+
+/**
+ * 回环默认放行之后的兜底——「回环 + 携带凭据 ⇒ 仍拦」。
+ *
+ * 回环只能连到本机，出网风险为零；真正的风险是把本机凭据投递到某个本地端口
+ * （凭据外带 / 侧信道）。判定口径与脱敏器一致：敏感头且值非空/占位符。
+ */
+
+// 空 / 占位值 ⇒ 不算携带凭据。
+const CREDENTIAL_PLACEHOLDERS = new Set(['', 'null', 'undefined', 'none', 'nil', '-']);
+
+/**
+ * 原始值判定（同步拦截路径拿得到未脱敏的头）。
+ * 字面量 `***` 不算凭据——它就是三个星号，不是秘密。
+ */
+function rawHeaderValueCarriesCredential(value) {
+  if (value === undefined || value === null) return false;
+  const raw = Array.isArray(value) ? value.join(',') : String(value);
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === '***') return false;
+  return !CREDENTIAL_PLACEHOLDERS.has(trimmed.toLowerCase());
+}
+
+/**
+ * 已脱敏值判定（事件路径只有脱敏后的头字符串）。
+ * 脱敏器只对敏感头脱敏 ⇒ 值里出现 `***` 就说明原值确实是凭据。
+ */
+function redactedHeaderValueCarriesCredential(value) {
+  if (value === undefined || value === null) return false;
+  const raw = Array.isArray(value) ? value.join(',') : String(value);
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (trimmed.includes('***')) return true;
+  return !CREDENTIAL_PLACEHOLDERS.has(trimmed.toLowerCase());
+}
+
+/** 原始请求头集合里有敏感头且带凭据？ */
+function hasCredentialBearingHeader(headers) {
+  if (!headers || typeof headers !== 'object') return false;
+  for (const [key, value] of Object.entries(headers)) {
+    if (!isSensitiveHeader(key)) continue;
+    if (rawHeaderValueCarriesCredential(value)) return true;
+  }
+  return false;
+}
+
+/** 事件里记录的头字符串（已脱敏）中有敏感头且带凭据？ */
+function redactedHeadersCarryCredential(headerString) {
+  if (typeof headerString !== 'string' || headerString.length === 0) return false;
+  for (const line of headerString.split(/\r?\n/)) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    if (!isSensitiveHeader(key)) continue;
+    if (redactedHeaderValueCarriesCredential(line.slice(idx + 1))) return true;
+  }
+  return false;
 }
 
 function redactHeaderValue(key, value) {
@@ -726,6 +807,22 @@ function isInStartupGracePeriod() {
   return Date.now() - MODULE_LOAD_TIME < STARTUP_GRACE_MS;
 }
 
+/**
+ * 是不是回环地址（127.0.0.0/8 · ::1 · localhost）？
+ * 回环默认放行（见 DEFAULT_BLOCKED_HOSTS 的注释），但「回环 + 携带凭据」
+ * 仍拦（凭据外带）——由 shouldBlockRequest / checkRequestBlocked 负责。
+ * host 字符串可能带端口 ⇒ 一律按前缀/整串匹配。
+ */
+function isLoopbackHost(hostname) {
+  if (!hostname) return false;
+  const lower = String(hostname).toLowerCase();
+  for (let i = 0; i < LOOPBACK_HOST_PATTERNS.length; i++) {
+    const re = LOOPBACK_HOST_RES[i];
+    if (re ? re.test(lower) : lower === LOOPBACK_HOST_PATTERNS[i]) return true;
+  }
+  return false;
+}
+
 function isBlockedHost(hostname) {
   if (!hostname) return false;
   const lower = String(hostname).toLowerCase();
@@ -809,6 +906,14 @@ function shouldBlockRequest(event) {
   if (isBlockedUrl(requestUrl)) {
     return `请求被 OpenClaw network hook 拦截（blocked url: ${requestUrl}）`;
   }
+  // 回环 + 携带凭据 ⇒ 仍拦；事件路径的头已脱敏 ⇒ 用脱敏值判定。
+  if (
+    isLoopbackHost(host) &&
+    redactedHeadersCarryCredential(event.header) &&
+    !isSelfReportingEvent({ host, url: event.url || event.request_url || '' })
+  ) {
+    return `请求被 OpenClaw network hook 拦截（loopback-credential: ${host}）`;
+  }
   return undefined;
 }
 
@@ -826,6 +931,14 @@ function checkRequestBlocked(reqInfo) {
   }
   if (isBlockedUrl(requestUrl)) {
     return `请求被 OpenClaw network hook 拦截（blocked url: ${requestUrl}）`;
+  }
+  // 回环 + 携带凭据 ⇒ 仍拦；同步路径拿得到原始头 ⇒ 用原始值判定。
+  if (
+    isLoopbackHost(host) &&
+    hasCredentialBearingHeader(reqInfo.headers) &&
+    !isSelfReportingEvent({ host, url: urlInfo.pathname || '' })
+  ) {
+    return `请求被 OpenClaw network hook 拦截（loopback-credential: ${host}）`;
   }
   return undefined;
 }

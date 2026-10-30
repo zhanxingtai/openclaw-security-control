@@ -293,7 +293,8 @@ const EN = {
   ].join("\n"),
   "cfg.help.application.userIdField": [
     "Field name to read userId from in message events. OpenClaw 9.4 defaults to 'userId';",
-    "on hosts that disagree the audit attribution comes out empty.",
+    "falls back to __openclaw.senderIdentity.id → senderName/senderUsername → senderId,",
+    "so audit attribution survives hosts that use a different field.",
   ].join("\n"),
   "cfg.help.application.panelLocale": [
     "auto: follow ?lang=, then Accept-Language, else English.",
@@ -610,7 +611,7 @@ const ZH: Record<DictKey, string> = {
   "cfg.help.application.captureUserId":
     "按 userIdField 指定的字段名从消息 / 工具元数据提取用户 ID，用于审计归因；关闭后事件不再携带 user_id。",
   "cfg.help.application.userIdField":
-    "从消息事件中取 userId 的字段名。OpenClaw 9.4 默认 'userId'；其他宿主若不一致会导致审计归因为空。",
+    "从消息事件中取 userId 的字段名。OpenClaw 9.4 默认 'userId'；取不到时按 __openclaw.senderIdentity.id → senderName/senderUsername → senderId 多级回退，宿主字段不一致也能保住审计归因。",
   "cfg.help.application.panelLocale": [
     "auto：依次按 ?lang=、Accept-Language 协商，都没有则英文。",
     "en / zh：无视浏览器偏好，把面板钉死为该语言。",

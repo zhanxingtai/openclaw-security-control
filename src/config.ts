@@ -107,6 +107,15 @@ export const DEFAULT_CONFIG: SecurityMonitorConfig = {
       // 默认阻断名单唯一数据源是 spl.yaml metadata.flagRegistry
       // .hookBlockedFlags（构建期生成 generated-flag-defaults.ts）。
       blockedFlags: [...GENERATED_HOOK_BLOCKED_FLAGS],
+      // ⭐ #469-A：runtime hook 的**模式级 Tier-1 阻断**（spl.yaml
+      // `hookBlockPatterns` 段 → generated-patterns.json.blockPatterns）。
+      // 与 blockedFlags 是**两档独立判定**：flag 级按风险标签名单拦，模式级
+      // 按命令形态拦（读 /etc/shadow、读 ~/.aws/credentials …）。
+      //
+      // ⛔ 这是**新增的阻断行为** ⇒ 必须留操作员一键关闭的口子（FP 治理红线：
+      //    「block 必须高准确率」⇒ 误报时只能改包升级是不可接受的）。
+      //    关闭后仅关模式级这一档，flag 级阻断不受影响。
+      blockPatternsEnabled: true,
       excludeCommandLines: [],
       excludeNetworkUrls: [],
       // 宿主自有内部 worker 的子进程事件（sqlite 只读子进程等）默认排除：
@@ -314,6 +323,7 @@ const runtimeHooksSchema: Record<string, Rule> = {
   maxLogSizeBytes: (v, d) => (v !== undefined ? Math.max(0, Number(v)) : d),
   maxEvaluationBacklog: (v, d) => (v !== undefined ? Math.max(0, Number(v)) : d),
   blockedFlags: arr,
+  blockPatternsEnabled: bool,
   excludeCommandLines: arr,
   excludeNetworkUrls: arr,
   excludeHostInternalProcesses: bool,

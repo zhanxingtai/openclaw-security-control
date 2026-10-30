@@ -21,6 +21,7 @@ import type {
   PolicyRuleActionBlock,
   PolicyRuleActionModify,
   MatchedPolicyHit,
+  RuleHit,
 } from './types.js';
 import type { GuidanceEngine } from './GuidanceEngine.js';
 
@@ -94,26 +95,37 @@ export class DecisionComposer {
    * compose + 完整命中标注。决策合成逻辑与 compose 完全一致，
    * 额外返回每条命中规则的标注（含被更高优先级决策掩盖的规则），
    * 供 enforce 短路场景下事件审计仍能列出全部命中规则。
+   *
+   * 入参两种形态都吃（#469-D 起引擎内部传带证据的 `RuleHit[]`）：
+   * - `RuleHit[]` —— 带命中证据；
+   * - `PolicyRule[]` —— 旧调用方（单测 / 外部直接调用），无证据。
    */
-  composeDetailed(_ctx: InterventionContext, rules: PolicyRule[]): ComposeDetailedResult {
+  composeDetailed(_ctx: InterventionContext, rules: PolicyRule[] | RuleHit[]): ComposeDetailedResult {
     if (!rules || rules.length === 0) {
       return { decision: { decision: this.defaultAction }, matched: [] };
     }
 
+    // 归一化成 RuleHit[]：旧形态（裸 PolicyRule）补一个空证据位。
+    const hits: RuleHit[] = rules.map((r) =>
+      (r as RuleHit).rule ? (r as RuleHit) : { rule: r as PolicyRule }
+    );
+
     // Build decisions for every matched rule (rules are already priority-sorted).
-    const decisions = rules.map((rule) => this.buildDecision(_ctx, rule));
+    const decisions = hits.map((hit) => this.buildDecision(_ctx, hit.rule));
     if (decisions.length === 0) {
       return { decision: { decision: this.defaultAction }, matched: [] };
     }
 
-    const matched: MatchedPolicyHit[] = rules.map((rule, i) => ({
-      policyId: rule.id,
-      policyName: rule.name || rule.id,
+    const matched: MatchedPolicyHit[] = hits.map((hit, i) => ({
+      policyId: hit.rule.id,
+      policyName: hit.rule.name || hit.rule.id,
       decision: decisions[i].decision,
-      priority: rule.priority,
+      priority: hit.rule.priority,
       // 顶层 severity 字段取代 evaluate.riskLevel。
-      riskLevel: rule.severity,
-      category: rule.category,
+      riskLevel: hit.rule.severity,
+      category: hit.rule.category,
+      // 命中证据（#469-D）：仅在规则是靠文本正则命中时有值。
+      ...(hit.evidence ? { evidence: hit.evidence } : {}),
     }));
 
     // Group by decision type and pick the highest-priority group.

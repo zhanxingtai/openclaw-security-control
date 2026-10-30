@@ -131,10 +131,25 @@ describe('SelfProtection → SPL 引擎 分层决策', () => {
       {
         // 无 value 的准入路径写入：载荷不在 params 里，intent 判别无从下手，
         // 由 self-protection-block-gateway-config-write 的 path 锚点接住。
+        //
+        // ⭐ **治理记录变更**（#469 RuleMatcher 缺 key 语义对齐）：
+        //   本条现在**两条自保护规则同时命中**：
+        //     · self-protection-block-gateway-config-self-harm
+        //       （action=config.patch ✓ + path=plugins.allow ✓；raw/value/content/
+        //        data/note **未回灌 ⇒ 跳过**，不构成否决）
+        //     · self-protection-block-gateway-config-write（action ✓ + path ✓）
+        //   ⇒ 命中集合由「1 条」变「2 条」；**定案权归 self-harm**
+        //     （同优先级 1100 ⇒ 取策略文件序第一条）。
+        //   变更根因 = RuleMatcher 的 paramsRegex 缺 key 语义：
+        //     改前为「任一声明 key 缺失 ⇒ 整条不匹配」⇒ 多 key 自保护规则
+        //     形同虚设；改后「缺 key ⇒ 跳过该 key（不构成否决）」，
+        //     与规则作者 testCase 本意一致（「无 value 也拦」）。
+        //   ⇒ 判定结论不变（block），变的是**命中集合与定案规则**。
         name: 'config.patch 改 plugins.allow（无 value，准入路径本身不可放行）',
         tool: 'gateway',
         params: { action: 'config.patch', path: 'plugins.allow' },
-        layer: 'self-protection-block-gateway-config-write',
+        layer: 'self-protection-block-gateway-config-self-harm,self-protection-block-gateway-config-write',
+        settledBy: 'self-protection-block-gateway-config-self-harm',
       },
     ];
 

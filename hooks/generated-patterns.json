@@ -216,5 +216,42 @@
     "privilege_escalation",
     "token_in_command",
     "skill_binary_execution"
+  ],
+  "blockPatterns": [
+    {
+      "pattern": "(?:^|\\s|[\"'<>])(?:/etc/shadow|/etc/gshadow|/etc/sudoers(?:/|\\b))\\b",
+      "reason": "读取 Tier-1 口令库/提权配置（/etc/shadow、/etc/gshadow、/etc/sudoers）",
+      "input": "raw"
+    },
+    {
+      "pattern": "(?:^|\\s|[\"'<>])/etc/ssh/ssh_host_\\S+",
+      "reason": "读取 SSH 主机私钥（/etc/ssh/ssh_host_*）",
+      "input": "raw"
+    },
+    {
+      "pattern": "(?:^|\\s|[\"'<>])/proc/self/environ\\b",
+      "reason": "读取进程环境变量（/proc/self/environ，常含明文 API Key）",
+      "input": "raw"
+    },
+    {
+      "pattern": "(?:^|\\s|[\"'<>])(?:[^\\s\"'<>]*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)\\b",
+      "reason": "读取 SSH 用户私钥（~/.ssh/id_*）",
+      "input": "raw"
+    },
+    {
+      "pattern": "(?:^|\\s|[\"'<>])(?:[^\\s\"'<>]*/)?\\.aws/credentials\\b",
+      "reason": "读取云厂商凭据文件（~/.aws/credentials）",
+      "input": "raw"
+    },
+    {
+      "pattern": "(?:^|\\s|[\"'<>])(?:[^\\s\"'<>]*/)?\\.(?:git-credentials|netrc)\\b",
+      "reason": "读取 git / netrc 明文凭据文件",
+      "input": "raw"
+    },
+    {
+      "pattern": "\\bgetent\\s+(?:shadow|gshadow)\\b",
+      "reason": "通过 getent 读取 shadow 口令库",
+      "input": "raw"
+    }
   ]
 }

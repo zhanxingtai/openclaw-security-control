@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import type { InterventionContext, SecurityDecision } from './types.js';
 import { DEFAULT_DESTRUCTIVE_WRITE_TOOLS } from './destructive-tools.js';
+import { FILE_PATH_PARAM_ALIASES } from './file-path-params.js';
 
 export interface SelfProtectionResult {
   /** True if the action would harm the plugin and must be blocked. */
@@ -42,10 +43,10 @@ const PLUGIN_ID_RE_SRC = '(?:sst-security-control-openclaw|sst-security-control-
  */
 const PROTECTED_PATH_PATTERNS = [
   // Plugin configuration and data home.
-  // 2026-10-27 误报收敛：agent 工作区（.openclaw/workspace）不是插件资产，
-  // 承载 agent 自己的 memory/笔记；把它拖进受保护路径会让「把排查笔记写进
-  // memory」因正文出现工作区路径而被当成篡改拦下。插件自有资产（openclaw.json
-  // / 策略文件 / 审计日志 / 扩展目录 / 安装目录）由下方逐条精确模式覆盖。
+  // agent 工作区（.openclaw/workspace）不是插件资产，承载 agent 自己的
+  // memory/笔记；把它纳入受保护路径会让「正文引用工作区路径」被当成篡改
+  // 拦下。插件自有资产（openclaw.json / 策略文件 / 审计日志 / 扩展目录 /
+  // 安装目录）由下方逐条精确模式覆盖。
   String.raw`(^|/)\.openclaw[/\\](?!workspace\b)`,
   String.raw`(^|/)\.openclaw[/\\]openclaw\.json$`,
   String.raw`(^|/)\.openclaw[/\\]security-policy\.ya?ml$`,
@@ -244,8 +245,38 @@ const SHELL_OVERWRITE_VERBS_RE = SELF_PROTECTION_SPEC
   ? new RegExp(SELF_PROTECTION_SPEC.structural.shell_overwrite_verbs!, SELF_PROTECTION_FLAGS)
   : /\b(?:truncate|tee)\b|\b(?:cp|install)\s+\/?dev\/null\b|\bfind\b[^\n]*-delete\b|\bdd\b[^\n]*\bof=|\bsed\b[^\n]*-i\b|\bos\.(?:rename|replace)\b|\bshutil\.(?:copy2?|copyfile|move)\b|\bPath\.write_text\b|\b\.write\s*\(|\bopen\s*\(\s*["'][^"']*["']\s*,\s*["']w/i;
 
-const BLOCK_REASON = '该操作会禁用或卸载安全监控插件，已被系统自我保护机制阻断';
 const BLOCK_CODE = 'SELF_PROTECTION_001';
+
+/**
+ * 命中类型 → 阻断原因文案（按命中类型给出具体文案，理由与实际命中内容对齐）。
+ *
+ * ⚠️ blockCode 保持不变（`SELF_PROTECTION_001`）：下游面板与审计按码聚合，
+ *    改码会断掉历史归因；文案可变、码不可变。
+ */
+type SelfHarmKind =
+  /** 步骤 1：破坏性自毁命令（rm / uninstall / disable…）。 */
+  | 'self_harm_command'
+  /** 步骤 2：网关 / 插件管理配置停用。 */
+  | 'gateway_config'
+  /** 步骤 3：参数文本显式要求停用 / 卸载插件。 */
+  | 'self_harm_message'
+  /** 步骤 3.5：内联解释器删除插件自有数据。 */
+  | 'indirect_deletion'
+  /** 步骤 4：写入插件自有资产（策略 / 审计日志 / 扩展目录 / 安装目录）。 */
+  | 'protected_path_write';
+
+const BLOCK_REASONS: Record<SelfHarmKind, string> = {
+  self_harm_command:
+    '该操作会禁用或卸载安全监控插件，已被系统自我保护机制阻断',
+  gateway_config:
+    '该操作会改写网关或插件配置以停用安全监控插件，已被系统自我保护机制阻断',
+  self_harm_message:
+    '该操作会禁用或卸载安全监控插件，已被系统自我保护机制阻断',
+  indirect_deletion:
+    '该操作会通过内联解释器删除安全监控插件的自有数据，已被系统自我保护机制阻断',
+  protected_path_write:
+    '该操作会写入安全监控插件的自有资产（策略文件/审计日志/扩展目录），已被系统自我保护机制阻断',
+};
 
 /**
  * 网关主配置 openclaw.json 的改写动词。
@@ -321,6 +352,63 @@ function anyMatch(text: string, patterns: RegExp[]): boolean {
 
 function isProtectedPath(value: string): boolean {
   return anyMatch(value, PROTECTED_PATH_REX);
+}
+
+/**
+ * 找出受保护路径的命中片段，把阻断原因与实际命中内容对齐（操作员据此判断
+ * 真篡改还是误报）。
+ * ⛔ 只回传片段（截断到 120 字符），不回传整段文本——整段可能含凭据。
+ * `PROTECTED_PATH_REX` 不带 `g` 标志 ⇒ `exec` 无 lastIndex 状态污染。
+ */
+const PROTECTED_PATH_SNIPPET_MAX = 120;
+
+/** 截断片段（只回传前 N 字符——整段可能含凭据）。 */
+function truncateSnippet(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > PROTECTED_PATH_SNIPPET_MAX
+    ? `${trimmed.slice(0, PROTECTED_PATH_SNIPPET_MAX)}…`
+    : trimmed;
+}
+
+function findProtectedPathMatch(value: string): string | undefined {
+  for (const re of PROTECTED_PATH_REX) {
+    const m = re.exec(value);
+    if (m && m[0]) {
+      return truncateSnippet(m[0]);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 路径型参数名（=「操作目标」所在的参数键）——单源。
+ * 与 `src/store.ts` 的 `normalizeFilePathParams` 共用同一张别名表
+ * （`src/intervention/file-path-params.ts`）：宿主框架对目标路径参数命名
+ * 不统一，两边必须看到同一组键，否则某一侧看不到目标。
+ */
+const PATH_PARAM_KEYS = FILE_PATH_PARAM_ALIASES;
+
+/**
+ * 抽取「操作目标路径」文本（**不含写入正文**）。
+ * 路径型写工具只按目标路径判定：拿 params 里所有字符串（含写入正文）去扫
+ * 会让「正文里引用一个 .openclaw 路径」被误判成篡改插件；命令型工具仍扫
+ * 整条命令（命令本身即意图）。
+ * 抽不到任何目标路径 ⇒ 返回空串，调用方回退到全文本扫描（保守方向：宁可
+ * 多拦一次，也不能因为没认出参数名就放行）。
+ */
+function collectTargetPathText(params: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const key of PATH_PARAM_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(params, key)) continue;
+    const value = params[key];
+    if (typeof value === 'string') {
+      parts.push(value);
+      continue;
+    }
+    if (value && typeof value === 'object') parts.push(...collectStrings(value));
+  }
+  return parts.join('\n');
 }
 
 function isSelfHarmCommand(text: string): boolean {
@@ -587,15 +675,17 @@ function isPluginAllowListRemoval(params: Record<string, unknown>): boolean {
   return containsAllowListWithoutPlugin(raw) || containsAllowListWithoutPlugin(params);
 }
 
-function blockDecision(): SecurityDecision {
+function blockDecision(kind: SelfHarmKind, detail?: string): SecurityDecision {
+  const base = BLOCK_REASONS[kind];
+  const reason = detail ? `${base}（命中：${detail}）` : base;
   return {
     decision: 'block',
-    blockReason: BLOCK_REASON,
+    blockReason: reason,
     blockCode: BLOCK_CODE,
     appealable: false,
     policyId: 'self-protection',
     policyName: 'Self-Protection',
-    reason: BLOCK_REASON,
+    reason,
   };
 }
 
@@ -608,7 +698,7 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
 
   // 1. Destructive commands (exec, bash, shell, run_command, etc.)
   if (isSelfHarmCommand(allParamText)) {
-    return { blocked: true, decision: blockDecision() };
+    return { blocked: true, decision: blockDecision('self_harm_command') };
   }
 
   // 2. Gateway / plugin-manager config operations that disable or remove the plugin.
@@ -619,7 +709,7 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
   //    plugin_manager disable/remove actions.
   if (isGatewayConfigTool(ctx.toolName || '')) {
     if (isGatewayRestartWithUninstallIntent(params, allParamText)) {
-      return { blocked: true, decision: blockDecision() };
+      return { blocked: true, decision: blockDecision('gateway_config') };
     }
     if (
       isGatewayDisablingPlugin(ctx.toolName || '', params, allParamText) ||
@@ -628,32 +718,44 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
       isPluginAllowListRemoval(params) ||
       (isConfigModifyingAction(params) && isGatewayModifyingPluginConfig(allParamText))
     ) {
-      return { blocked: true, decision: blockDecision() };
+      return { blocked: true, decision: blockDecision('gateway_config') };
     }
   }
 
   // 3. Any tool parameter text that explicitly asks to uninstall/disable the
   //    plugin (e.g. the "note" field of a gateway call) is also self-harm.
   if (isSelfHarmMessage(allParamText)) {
-    return { blocked: true, decision: blockDecision() };
+    return { blocked: true, decision: blockDecision('self_harm_message') };
   }
 
   // 3.5 Inline-interpreter deletion of protected data (python3 -c / node -e /
   //     shutil.rmtree). Bypasses native rm command patterns.
   if (isIndirectDeletionOfProtectedData(allParamText)) {
-    return { blocked: true, decision: blockDecision() };
+    return { blocked: true, decision: blockDecision('indirect_deletion') };
   }
 
   // 4. File operations targeting protected paths (read/write/delete/edit)
-  if (isProtectedPath(allParamText)) {
+  //
+  // 按「操作目标」判定，不按「全部参数文本」判定：allParamText 含写入正文，
+  // 直接扫会让正文引用受保护路径的写操作被误判成篡改。
+  // 口径：
+  //   · 路径型写工具（file_write/write/edit/delete…）⇒ 只扫目标路径参数
+  //   · 命令型工具（exec/bash/shell…）⇒ 仍扫整条命令（命令本身即意图）
+  //   · 抽不到目标路径 ⇒ 回退全文本扫描（保守方向：宁可多拦一次）
+  const toolName = ctx.toolName || '';
+  const isPathBearingWrite = DEFAULT_DESTRUCTIVE_WRITE_TOOLS.has(toolName);
+  const targetPathText = isPathBearingWrite ? collectTargetPathText(params) : '';
+  const protectedScope =
+    isPathBearingWrite && targetPathText.length > 0 ? targetPathText : allParamText;
+
+  if (isProtectedPath(protectedScope)) {
     // Only block destructive or config-modifying operations; allow reads of the
     // policy / events for legitimate inspection unless the content is a command.
     // 默认字典见 src/intervention/destructive-tools.ts —— 单源、保守默认；
     // 超出默认的工具由插件 manifest 声明 capabilities.destructive_write_tools
     // 后再纳入，不在 SelfProtection 层硬编码扩字典。
-    const toolName = ctx.toolName || '';
     const isDestructive =
-      DEFAULT_DESTRUCTIVE_WRITE_TOOLS.has(toolName) ||
+      isPathBearingWrite ||
       isSelfHarmCommand(allParamText) ||
       // Shell-composed overwrite/truncate of a protected file (echo > / truncate / find -delete ...)
       isShellOverwriteOfProtectedData(allParamText) ||
@@ -663,7 +765,12 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
       isGatewayConfigOverwrite(allParamText);
 
     if (isDestructive) {
-      return { blocked: true, decision: blockDecision() };
+      // 阻断文案带上实际命中的路径：路径型写工具用目标路径原文，其余工具
+      // 用正则命中片段。
+      const detail = isPathBearingWrite
+        ? truncateSnippet(targetPathText)
+        : findProtectedPathMatch(protectedScope);
+      return { blocked: true, decision: blockDecision('protected_path_write', detail) };
     }
   }
 
@@ -676,7 +783,7 @@ function evaluateToolCall(ctx: InterventionContext): SelfProtectionResult {
 export function evaluateMessageWrite(ctx: InterventionContext): SelfProtectionResult {
   const text = ctx.body || ctx.userPrompt || '';
   if (isSelfHarmMessage(text)) {
-    return { blocked: true, decision: blockDecision() };
+    return { blocked: true, decision: blockDecision('self_harm_message') };
   }
   return { blocked: false };
 }
