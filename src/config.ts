@@ -87,6 +87,10 @@ export const DEFAULT_CONFIG: SecurityMonitorConfig = {
     maxCodeContentLength: 5000,
     sessionTtlMs: 30 * 60 * 1000, // 30 minutes
     maxPreviousActions: 50,
+    // ⭐ exec「Command still running」/ wait completed·waiting
+    // 等中间态工具结果折叠（不产 agent_tool_result 事件；call 事件已足够
+    // 表达，异常 result 与任何干预决策仍即时原样落盘）。
+    foldIntermediateToolResults: true,
     defaultAgentId: '',
     // 面板语言。auto = 按 ?lang= / Accept-Language 协商（默认）；显式 en/zh
     // 则忽略浏览器偏好，面板右上角的切换控件写入的就是这个键。
@@ -129,6 +133,26 @@ export const DEFAULT_CONFIG: SecurityMonitorConfig = {
       // 命中已知只读探针形态」两道闸门同时成立，带凭据的命令不受影响。
       // 需要完整审计时置 false。
       excludeHostInternalProbeCommands: true,
+      // ⭐ 宿主自检命令（gh auth token / claude auth
+      // status / openclaw plugins|skills list / 宿主 worker 轮询）分钟级
+      // 聚合——首个实例即时落盘，同分钟重复折叠进
+      // x_openclaw_self_traffic_aggregate 计数事件。与上面的「排除」并存：
+      // probe 管排除，本开关管压缩。需要完整审计时置 false。
+      aggregateHostSelfChecks: true,
+      // ⭐ 网关 LLM 自有流量（pid=1/comm=openclaw 打向
+      // 已知 LLM API host）识别名单（后缀匹配）与采样比。命中流量的
+      // body/content 降级为 SHA-256，按「每窗口每 host+method+path 落
+      // llmSelfTrafficSampleRate 条」采样（首个实例即时落），窗口内其余
+      // 折叠进聚合计数。blocked / 带 risk_flags 的事件不采样、不降级。
+      llmSelfTrafficHosts: [
+        'minimaxi.com',
+        'anthropic.com',
+        'openai.com',
+        'deepseek.com',
+        'moonshot.cn',
+      ],
+      llmSelfTrafficSampleRate: 1,
+      llmSelfTrafficSampleWindowMs: 300000, // 5 minutes
       // runtime 采集事件的单字段最大长度。1.1.0 之前 runtime hook 的
       // content 原样透传，不受 application.maxContentLength 约束。
       maxContentLength: 2000,
@@ -301,6 +325,7 @@ const applicationSchema: Record<string, Rule> = {
   },
   maxPreviousActions: (v, d) => (v !== undefined ? Number(v) : d ?? 50),
   defaultAgentId: str,
+  foldIntermediateToolResults: bool,
   // 手改 openclaw.json 写进未收录的值时回落 auto，不让面板拿到非法语言。
   panelLocale: en(['auto', 'en', 'zh']),
 };
@@ -328,6 +353,10 @@ const runtimeHooksSchema: Record<string, Rule> = {
   excludeNetworkUrls: arr,
   excludeHostInternalProcesses: bool,
   excludeHostInternalProbeCommands: bool,
+  aggregateHostSelfChecks: bool,
+  llmSelfTrafficHosts: arr,
+  llmSelfTrafficSampleRate: (v, d) => (v !== undefined ? Math.max(0, Math.floor(Number(v))) : d),
+  llmSelfTrafficSampleWindowMs: (v, d) => (v !== undefined ? Math.max(1000, Number(v)) : d),
   maxContentLength: (v, d) => (v !== undefined ? Math.max(0, Number(v)) : d),
 };
 

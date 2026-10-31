@@ -22,7 +22,7 @@
     },
     "event_type": {
       "type": "string",
-      "description": "事件类型。本插件实际会写出的取值：agent_start、agent_stop、agent_session_start、agent_session_end、x_openclaw_subagent_start、x_openclaw_subagent_progress、x_openclaw_subagent_end、cron_changed、x_openclaw_cron_run、agent_message、agent_tool_call、agent_tool_result、code_mode_exec、reasoning、runtime_log、trace_span、command_execution、file_read、file_write、file_delete、file_privilege、network_http、network_connect、network_dns、process_start、x_openclaw_process_change、process_exit、x_openclaw_process_snapshot、x_openclaw_cgroup_snapshot、x_openclaw_cgroup_anomaly、asset_add、asset_change、asset_remove、asset_snapshot、x_openclaw_protection_degraded、x_openclaw_tamper_detected、x_openclaw_runtime_hook_unloaded。宿主可能扩展自定义类型，因此不设 enum 约束。"
+      "description": "事件类型。本插件实际会写出的取值：agent_start、agent_stop、agent_session_start、agent_session_end、x_openclaw_subagent_start、x_openclaw_subagent_progress、x_openclaw_subagent_end、cron_changed、x_openclaw_cron_run、agent_message、agent_tool_call、agent_tool_result、code_mode_exec、reasoning、runtime_log、trace_span、command_execution、file_read、file_write、file_delete、file_privilege、network_http、network_connect、network_dns、process_start、x_openclaw_process_change、process_exit、x_openclaw_process_snapshot、x_openclaw_cgroup_snapshot、x_openclaw_cgroup_anomaly、asset_add、asset_change、asset_remove、asset_snapshot、x_openclaw_protection_degraded、x_openclaw_tamper_detected、x_openclaw_runtime_hook_unloaded、x_openclaw_enforce_state、x_openclaw_self_traffic_aggregate。宿主可能扩展自定义类型，因此不设 enum 约束。"
     },
     "layer": {
       "type": "string",
@@ -487,6 +487,57 @@
       "additionalProperties": true,
       "description": "采集侧降级留痕：runtime hook 事件的干预评估队列积压达到 上限时，该事件跳过评估、仅落盘，原因记于此字段。评估被跳过意味着 `intervention` 决策缺失（非 allow），chain 规则的时序也不再保证。"
     },
+    "aggregate": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "host_self_check",
+            "llm_self_traffic"
+          ],
+          "description": "降噪通道：宿主自检进程 / 网关 LLM 自有流量。"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "命中形态名（如 `gh_auth_token`）或流量键（`host METHOD path`）。"
+        },
+        "source_event_type": {
+          "type": "string",
+          "description": "被折叠的源事件类型（process_start / process_exit / network_http）。"
+        },
+        "window_ms": {
+          "type": "number",
+          "description": "聚合窗口长度（毫秒）：宿主自检 60s，LLM 自有流量默认 300s。"
+        },
+        "window_start": {
+          "type": "number",
+          "description": "窗口起点（Unix 毫秒）。"
+        },
+        "count": {
+          "type": "number",
+          "description": "窗口内命中总次数（含首个即时落盘实例）。"
+        },
+        "first_ts": {
+          "type": "number",
+          "description": "窗口内首次命中的源端时间戳。"
+        },
+        "last_ts": {
+          "type": "number",
+          "description": "窗口内末次命中的源端时间戳。"
+        },
+        "body_sha256": {
+          "type": "string",
+          "description": "llm_self_traffic：首个实例 body 的 SHA-256（内容寻址去重参照）。"
+        },
+        "content_length_total": {
+          "type": "number",
+          "description": "llm_self_traffic：窗口内 content_length 合计（体积参照）。"
+        }
+      },
+      "additionalProperties": true,
+      "description": "⭐ 事件降噪—— `x_openclaw_self_traffic_aggregate` 聚合计数事件的载荷。宿主自检命令（gh auth token / claude auth status / openclaw plugins|skills list / 宿主 worker 轮询）与网关 LLM 自有流量 （pid=1/comm=openclaw 打向已知 LLM API host）按窗口折叠： **首个实例即时原样落盘**（保延迟可见性），窗口内后续命中只累计计数， 窗口翻转（或关停/周期冲刷）时落一条本事件。 `count` 是窗口内命中总次数（含已即时落盘的首个实例）； `first_ts` / `last_ts` 是窗口内首/末次命中的源端时间戳。"
+    },
     "intervention": {
       "type": "object",
       "properties": {
@@ -676,6 +727,19 @@
             "extreme"
           ]
         },
+        "blocked_attribution": {
+          "type": "string",
+          "enum": [
+            "rule",
+            "escalation",
+            "semantic"
+          ],
+          "description": "⭐ **blocked 归因**—— 区分「规则自身 block」与 「升级后 block」。 背景：规则级 audit 决策可被升级路径（语义升级状态机 / 决策链 / 引导预算耗尽等）升级为 block，`blocked` 布尔只如实反映「工具被拦」 区分不了**是谁拦的** —— 审计方看到 audit 规则的 block 事件会误判为 归因矛盾。 取值： - `'rule'` —— matched_rules 里**存在** decision='block' 的规则， 最终 block 直接来自该规则自身的裁决； - `'escalation'` —— 最终 block **不来自**任何单条规则的 block 裁决， 是升级产物（语义升级 `upgradedBy` / 组合-链升级）。 - `'semantic'` —— 语义层**独立**裁决（policy_id 属 `semantic:*`， 非升级路径）。 仅 block 系决策落此字段；allow / audit / warn 等不标（缺省 = 无归因信息）。"
+        },
+        "upgraded_from": {
+          "type": "string",
+          "description": "升级来源标识（blocked_attribution = 'escalation' / 'semantic' 时给出）： 升级路径的 policyId（如 `semantic_escalation:<sessionKey>`）或升级者 标识（如 `'semantic_escalation'`）。"
+        },
         "observed": {
           "type": "object",
           "properties": {
@@ -828,6 +892,18 @@
     "content_truncated": {
       "type": "boolean",
       "description": "载荷是否被截断。true 时 content_length 仍是原始长度。"
+    },
+    "body_sha256": {
+      "type": "string",
+      "description": "⭐ 事件降噪 —— 网关 LLM 自有流量（pid=1/comm=openclaw 打向 `llmSelfTrafficHosts` 清单）的 body 降级字段：原文不留存，只留 SHA-256 指纹（内容寻址去重/变化检测）。blocked / 带 risk_flags 的事件 不降级。"
+    },
+    "content_sha256": {
+      "type": "string",
+      "description": "同 `body_sha256`，针对 canonical `content` 字段。"
+    },
+    "response_body_sha256": {
+      "type": "string",
+      "description": "同 `body_sha256`，针对 `response_body` 字段。"
     },
     "local_ip": {
       "type": "string",

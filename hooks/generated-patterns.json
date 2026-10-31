@@ -7,7 +7,13 @@
     ],
     "pipe_to_shell": [
       {
-        "pattern": "\\|[^|]*\\bsh\\b|\\|[^|]*\\bbash\\b|\\beval\\b|\\bbase64\\b"
+        "pattern": "\\|\\s+(?:\\S*/)?(?:sh|bash)\\b"
+      },
+      {
+        "pattern": "\\beval[\\s]+[\"'$/\\\\(]"
+      },
+      {
+        "pattern": "\\bbase64\\b"
       }
     ],
     "mass_deletion": [
@@ -49,6 +55,9 @@
         "pattern": "(?:^|\\s|[\\\"'<>])(?:/etc/(?:passwd|shadow|gshadow|sudoers|hosts|ssh/\\S*)|/root/\\S*|/proc/self/environ|(?:.*/)?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|config))\\b"
       },
       {
+        "pattern": "(?:^|\\s|[\"'<>])(?:.*/)?\\.openclaw/openclaw\\.json\\b"
+      },
+      {
         "pattern": "\\bgetent\\s+(passwd|shadow|group)\\b"
       }
     ],
@@ -80,6 +89,16 @@
         "pattern": "Authorization\\s*[:=]|Bearer\\s+[A-Za-z0-9_\\-\\.~+\\/=]{12,}|api[_-]?key\\s*[:=]\\s*\\S+|access[_-]?token\\s*[:=]\\s*\\S+|secret\\s*[:=]\\s*\\S+|password\\s*[:=]\\s*\\S+",
         "flags": "i",
         "input": "raw"
+      },
+      {
+        "pattern": "openclaw\\s+config\\s+set\\s+\\S*(?:token|secret|password|api[_-]?key)",
+        "flags": "i",
+        "input": "raw"
+      }
+    ],
+    "supply_chain": [
+      {
+        "pattern": "\\bnpm\\s+(?:install|i|add)\\s+(?:-\\S+\\s+)*\\S*(?:git\\+(?:https?|ssh)?:|https?:\\/\\/)\\S*"
       }
     ],
     "background_execution": [

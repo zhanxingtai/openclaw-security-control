@@ -128,6 +128,48 @@ describe('Node.js network hook', () => {
     expect(event.pid).toBe(process.pid);
   });
 
+  // 网络通道 risk_flags 最小 emitter。
+  describe('network risk_flags', () => {
+    function eventFor(options: unknown) {
+      return hook.buildNetworkEvent(
+        { options, method: 'GET', headers: {} },
+        { statusCode: 200, endTime: Date.now() },
+        Date.now()
+      );
+    }
+
+    it('flags internal_host for loopback / RFC1918 / link-local targets', () => {
+      for (const url of [
+        'http://127.0.0.1:8989/x',
+        'http://localhost:3000/x',
+        'http://10.0.0.5/x',
+        'http://172.16.3.4/x',
+        'http://172.31.255.255/x',
+        'http://192.168.1.1/x',
+        'http://169.254.169.254/latest/meta-data',
+        'http://0.0.0.0:8080/x',
+      ]) {
+        expect(eventFor(url).risk_flags, url).toContain('internal_host');
+      }
+    });
+
+    it('does not flag public targets', () => {
+      const event = eventFor('https://api.example.com/data');
+      expect(event.risk_flags).toBeUndefined();
+    });
+
+    it('flags network_tool for non-http(s) protocols', () => {
+      const event = eventFor({ protocol: 'gopher:', hostname: 'evil.example.com', path: '/x' });
+      expect(event.risk_flags).toContain('network_tool');
+      expect(event.risk_flags).not.toContain('internal_host');
+    });
+
+    it('keeps http/https protocol unflagged', () => {
+      const event = eventFor({ protocol: 'https:', hostname: 'api.example.com', path: '/x' });
+      expect(event.risk_flags || []).not.toContain('network_tool');
+    });
+  });
+
   it('redacts sensitive headers in raw header string', () => {
     const raw = hook.headersToRawString({
       'Content-Type': 'application/json',

@@ -16,6 +16,7 @@ import type {
 } from "./types.js";
 import type { SecurityDecision } from './intervention/types.js';
 import { toEventEvidence } from './intervention/match-evidence.js';
+import { extractCodeModeOperands, isCommandSurfaceKey } from './intervention/code-mode-operands.js';
 // Inline interface for event reporting.
 interface EventCollectorLike {
   report(event: SecurityEvent): Promise<void>;
@@ -156,6 +157,8 @@ export class ApplicationCollector implements ILayerCollector {
   // 同一模式。
   private sessionTitles: Map<string, { title: string; lastAccessTime: number }> = new Map();
   private agentSnapshotReporter?: AgentSnapshotReporterLike;
+  /** ⭐ 被折叠（未落盘）的中间态工具结果计数。 */
+  private foldedToolResults = 0;
 
   constructor(
     collector: EventCollectorLike,
@@ -220,6 +223,7 @@ export class ApplicationCollector implements ILayerCollector {
       sessionCacheSize: this.sessionCache.size,
       pendingCallTimers: this.callStartTimes.size,
       runIdAgentCacheSize: this.runIdAgentCache.size,
+      foldedToolResults: this.foldedToolResults,
     };
   }
 
@@ -273,6 +277,80 @@ export class ApplicationCollector implements ILayerCollector {
       // 命中证据：命中字段 / pattern / 文本片段；snippet 已打码，不把凭据原文抄进事件。
       ...(m.evidence ? { evidence: toEventEvidence(m.evidence) } : {}),
     }));
+  }
+
+  /**
+   * ⭐ **blocked 归因**—— 区分「规则自身 block」与「升级后
+   * block」。
+   *
+   * 背景：规则级 audit 决策被语义升级状态机升级为
+   * block 后，`blocked=true` 与 matched_rules 里全是 audit 规则**并存** ——
+   * 审计方看到「audit 规则却拦了」的归因矛盾。`event.blocked` 语义不动
+   * （它如实反映「工具被拦」），只补归因字段。
+   *
+   * 判定口径（blocked_attribution 取值见 src/types.ts intervention 块注释）：
+   *   ① `upgradedBy` 显式留痕（语义升级状态机 / 外部级联）⇒ 升级；
+   *   ② policy_id 形态兜底（`semantic_escalation:*` / `semantic:*`）⇒ 升级/语义；
+   *   ③ 任一命中规则自身 decision='block' ⇒ 规则自身裁决；
+   *   ④ 其余 block（决策链 / 引导预算耗尽等组合升级）⇒ 升级。
+   *
+   * 仅 block 系决策返回归因；allow / audit / warn 等返回 undefined（不落字段）。
+   */
+  private blockedAttributionOf(
+    decision: SecurityDecision,
+  ): { blocked_attribution: 'rule' | 'escalation' | 'semantic'; upgraded_from?: string } | undefined {
+    if (decision.decision !== 'block') return undefined;
+    if (typeof decision.upgradedBy === 'string' && decision.upgradedBy.length > 0) {
+      return { blocked_attribution: 'escalation', upgraded_from: decision.upgradedBy };
+    }
+    const policyId = typeof decision.policyId === 'string' ? decision.policyId : '';
+    if (policyId.startsWith('semantic_escalation:')) {
+      return { blocked_attribution: 'escalation', upgraded_from: policyId };
+    }
+    if (policyId.startsWith('semantic:')) {
+      return { blocked_attribution: 'semantic', upgraded_from: policyId };
+    }
+    const hasRuleBlock = (decision.matchedPolicies ?? []).some((m) => m?.decision === 'block');
+    if (hasRuleBlock) return { blocked_attribution: 'rule' };
+    // 最终 block 但不来自任何单条规则的 block 裁决 ⇒ 组合/链升级
+    // （如 guidance 预算耗尽）。upgraded_from 指向触发升级的 policyId。
+    return { blocked_attribution: 'escalation', ...(policyId ? { upgraded_from: policyId } : {}) };
+  }
+
+  /**
+   * ⭐ code-mode「整段程序命中」申诉标记。
+   *
+   * 背景：code-mode 的 params.command 装的是整段 JS
+   * 程序；`narrowCodeModeCommand` 抽不到**工具实参位**时按底线保留整段程序
+   * 当命令面 ⇒ 攻击形态字符串出现在程序**字符串字面量**里也会命中命令形态
+   * 规则被拦。匹配语义根治在判定侧；插件侧先做申诉缓释 —— 命中面
+   * 是「整段程序文本」而非提取出的实参时，在 block_reason 追加区分标记，
+   * 让审计方能识别此类可申诉误拦。**判定结果不变**（只改留痕）。
+   *
+   * 判定条件（三条同时成立才标记）：
+   *   1. code-mode 事件（event.is_code_mode）；
+   *   2. 决策为 block 系；
+   *   3. 从程序里**抽不到任何实参**（否则 command 键已被收窄成实参列表，
+   *      command 键命中 = 实参命中）且存在「命令面键」（command/code_content）
+   *      上的 paramsRegex 命中证据。
+   *
+   * 无命中证据时（缺证据 ≠ 没命中）不标记 —— 不猜。
+   */
+  private annotateCodeModeProgramHit(
+    event: SecurityEvent,
+    decision: SecurityDecision,
+    codeSource: string | undefined,
+  ): void {
+    if (!event.is_code_mode || !codeSource || !event.intervention) return;
+    if (decision.decision !== 'block') return;
+    if (extractCodeModeOperands(codeSource).length > 0) return;
+    const wholeProgramHit = (decision.matchedPolicies ?? []).some(
+      (m) => m?.evidence?.matchType === 'paramsRegex' && isCommandSurfaceKey(m.evidence.fieldName),
+    );
+    if (!wholeProgramHit) return;
+    const marker = '（整段程序命中，非实参）';
+    const reason = event.intervention.block_reason;
+    event.intervention.block_reason = reason ? `${reason}${marker}` : marker;
   }
 
   // ---------------------------------------------------------------------------
@@ -421,6 +499,8 @@ export class ApplicationCollector implements ILayerCollector {
         mode: mode || 'audit',
         priority: decision.priority,
         risk_level: decision.riskLevel,
+        // ⭐ blocked 归因（5.1）：规则自身 block vs 升级后 block。
+        ...this.blockedAttributionOf(decision),
       };
     }
 
@@ -783,6 +863,8 @@ export class ApplicationCollector implements ILayerCollector {
         mode: mode || 'audit',
         priority: decision.priority,
         risk_level: decision.riskLevel,
+        // ⭐ blocked 归因（5.1）：规则自身 block vs 升级后 block。
+        ...this.blockedAttributionOf(decision),
       };
     }
 
@@ -1098,6 +1180,18 @@ export class ApplicationCollector implements ILayerCollector {
     event.agent_name = this.resolveAgentName(ctx.sessionKey);
     event.metadata = safeExtract(() => ctx.metadata);
 
+    // ⭐ wait 工具的正常终态（status:"completed"）与中间态
+    // （status:"waiting"）result 会被折叠（见 shouldFoldToolResult）——
+    // call 事件已带 tool_params.runId，足以表达「等的是哪次后台运行」。
+    // 在 call 事件上预先留痕，审计侧可区分「结果已按降噪策略折叠」与
+    // 「结果丢失」。异常（failed/error）result 不受影响，即时原样落盘。
+    if (ctx.toolName === 'wait') {
+      event.metadata = {
+        ...(event.metadata ?? {}),
+        result_elision: 'wait_terminal_completed_or_intermediate_waiting_folded',
+      };
+    }
+
     if (decision) {
       // audit 模式下 plugin 不实际阻断，event.blocked 反映真实执行结果而非决策意图
       event.blocked = decision.decision === 'block' && mode !== 'audit';
@@ -1137,7 +1231,12 @@ export class ApplicationCollector implements ILayerCollector {
         mode: mode || 'audit',
         priority: decision.priority,
         risk_level: decision.riskLevel,
+        // ⭐ blocked 归因（5.1）：规则自身 block vs 升级后 block。
+        ...this.blockedAttributionOf(decision),
       };
+      // ⭐ code-mode 整段程序命中申诉标记（5.2）：命中面是整段程序文本
+      //   （非提取出的实参）时在 block_reason 追加区分标记，判定结果不变。
+      this.annotateCodeModeProgramHit(event, decision, rawCodeContent);
       event.risk_assessment = decision.riskSignal
         ? {
             risk_score: decision.riskSignal.riskScore,
@@ -1265,6 +1364,8 @@ export class ApplicationCollector implements ILayerCollector {
         appealable: resultDecision.appealable,
         remediation_hint: resultDecision.remediationHint,
         matched_rules: this.mapMatchedRules(resultDecision),
+        // ⭐ blocked 归因（5.1）：规则自身 block vs 升级后 block。
+        ...this.blockedAttributionOf(resultDecision),
         guidance: resultDecision.guidance
           ? {
               adjustment_id: resultDecision.guidance.adjustmentId,
@@ -1278,7 +1379,17 @@ export class ApplicationCollector implements ILayerCollector {
       };
     }
 
-    await this.emit(event);
+    // ⭐ 中间态工具结果折叠 —— exec 的「Command still
+    // running」与 wait 的 completed/waiting 形态不产 result 事件（call 事件
+    // 已足够表达；后台终态由后续 process 工具/进程生命周期事件表达）。
+    // 任何干预决策（decision/resultDecision）存在时原样落盘，折叠只发生
+    // 在干净路径上。updateSessionAfterToolCall 仍要跑（结果里可能藏着
+    // agent 归属信息）。
+    if (!this.shouldFoldToolResult(ctx.toolName, result, decision, resultDecision)) {
+      await this.emit(event);
+    } else {
+      this.foldedToolResults += 1;
+    }
     this.updateSessionAfterToolCall(ctx, result);
   }
 
@@ -2227,6 +2338,76 @@ export class ApplicationCollector implements ILayerCollector {
           safeExtract(() => String((result as { error?: unknown }).error))
         : undefined,
     };
+  }
+
+  /** exec「后台仍在跑」中间态 result 的首段文本形态（宿主文案前缀匹配）。 */
+  private static readonly EXEC_STILL_RUNNING_RE = /^Command still running\b/;
+
+  /**
+   * ⭐ 中间态工具结果折叠判定。
+   *
+   * 返回 true = 该 agent_tool_result 事件**不落盘**：
+   * - `exec` 结果首段文本是「Command still running …」——后台命令仍在跑，
+   *   本次前台调用的 result 只带 session/pid 指针；终态由后续 process 工具
+   *   调用 / 进程生命周期事件表达；
+   * - `wait` 结果 JSON 的 `status` 是 `completed`（正常终态，call 事件的
+   *   `tool_params.runId` 已足够表达）或 `waiting`（中间态，折叠进终态）。
+   *
+   * 安全边界：任何干预决策（调用期 decision / 事后 resultDecision）存在时
+   * **原样落盘**——折叠只发生在干净路径上；非 completed/waiting 的 wait
+   * 异常（failed/error）也即时落盘。可用 `foldIntermediateToolResults:false`
+   * 整体关闭。
+   */
+  private shouldFoldToolResult(
+    toolName: string | undefined,
+    result: unknown,
+    decision: SecurityDecision | undefined,
+    resultDecision: SecurityDecision | undefined
+  ): boolean {
+    if (this.config.foldIntermediateToolResults === false) return false;
+    if (decision || resultDecision) return false;
+    if (toolName === 'exec') {
+      const text = this.extractResultPrimaryText(result);
+      return text.length > 0 && ApplicationCollector.EXEC_STILL_RUNNING_RE.test(text);
+    }
+    if (toolName === 'wait') {
+      const status = this.extractWaitStatus(this.extractResultPrimaryText(result));
+      return status === 'completed' || status === 'waiting';
+    }
+    return false;
+  }
+
+  /**
+   * 从工具结果里抽取**首段文本**：宿主结果形态是
+   * `{content:[{type:"text",text:"…"}],details:{…}}`；裸字符串结果原样返回。
+   * 抽取失败返回空串（调用方按「不折叠」处理，宁落不误杀）。
+   */
+  private extractResultPrimaryText(result: unknown): string {
+    if (typeof result === 'string') return result;
+    if (!result || typeof result !== 'object') return '';
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.content)) {
+      for (const item of record.content) {
+        if (item && typeof item === 'object') {
+          const text = (item as Record<string, unknown>).text;
+          if (typeof text === 'string') return text;
+        }
+      }
+    }
+    if (typeof record.text === 'string') return record.text;
+    return '';
+  }
+
+  /** 解析 wait 结果 JSON 的 `status` 字段；非该形态返回 null。 */
+  private extractWaitStatus(text: string): string | null {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('{')) return null;
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      return typeof parsed.status === 'string' ? parsed.status : null;
+    } catch {
+      return null;
+    }
   }
 }
 

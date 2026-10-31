@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -1162,5 +1163,332 @@ describe('RuntimeHookCollector 子进程退出事件', () => {
 
     expect(reported).toHaveLength(3);
     expect(reported.map((e) => e.child_pid).sort()).toEqual([5151, 5152, 5153]);
+  });
+});
+
+
+// ⭐ 事件降噪 —— 宿主自检聚合与网关 LLM 自有流量采样。
+describe('RuntimeHookCollector 降噪聚合', () => {
+  let logFile: string;
+  let collector: { report: (event: SecurityEvent) => Promise<void>; shutdown: () => Promise<void> };
+  let reported: SecurityEvent[];
+  let runtimeCollector: RuntimeHookCollector;
+
+  /** 分钟/5 分钟窗口都对齐的起点（1793326200000 同时是 60s 与 300s 的整数倍）。 */
+  const WINDOW_BASE = 1793326200000;
+
+  beforeEach(() => {
+    reported = [];
+    logFile = path.join(os.tmpdir(), `openclaw-runtime-collector-agg-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+    fs.writeFileSync(logFile, '', 'utf8');
+    collector = {
+      report: async (event: SecurityEvent) => {
+        reported.push(event);
+      },
+      shutdown: async () => {},
+    };
+  });
+
+  afterEach(async () => {
+    await runtimeCollector?.shutdown();
+    for (const suffix of ['', '.offset', '.rotated', '.rotated.offset']) {
+      try {
+        fs.unlinkSync(logFile + suffix);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  function selfCheckEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      event_type: 'process_start',
+      event_id: `evt-${Math.random().toString(36).slice(2)}`,
+      ts: WINDOW_BASE,
+      command_line: 'gh auth token --hostname github.com',
+      executable: 'gh',
+      pid: 133,
+      ppid: 1,
+      ...overrides,
+    };
+  }
+
+  function llmEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      event_type: 'network_http',
+      event_id: `net-${Math.random().toString(36).slice(2)}`,
+      ts: WINDOW_BASE,
+      pid: 1,
+      comm: 'openclaw',
+      method: 'POST',
+      url: '/anthropic/v1/messages',
+      host: 'api.minimaxi.com',
+      code: 200,
+      content: '{"response":1}',
+      content_length: 14,
+      body: '{"prompt":1}',
+      ...overrides,
+    };
+  }
+
+  it('4.1 同分钟重复命中：首个实例即时落盘，其余折叠进聚合计数事件', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    // 同一分钟窗口内、不同 pid（真实重 spawn）的三次自检。
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 133 })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 134, ts: WINDOW_BASE + 1000 })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 135, ts: WINDOW_BASE + 2000 })) + '\n', 'utf8');
+
+    await waitForReported(reported, 1);
+    // 首个实例即时可见。
+    expect(reported).toHaveLength(1);
+    expect(reported[0].event_type).toBe('process_start');
+    expect(reported[0].cmdline).toBe('gh auth token --hostname github.com');
+
+    // 关停冲刷聚合计数。
+    await runtimeCollector.shutdown();
+    await waitForReported(reported, 2);
+
+    expect(reported).toHaveLength(2);
+    const aggregate = reported[1];
+    expect(aggregate.event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(aggregate.aggregate?.category).toBe('host_self_check');
+    expect(aggregate.aggregate?.pattern).toBe('gh_auth_token');
+    expect(aggregate.aggregate?.source_event_type).toBe('process_start');
+    expect(aggregate.aggregate?.count).toBe(3);
+    expect(aggregate.aggregate?.first_ts).toBe(WINDOW_BASE);
+    expect(aggregate.aggregate?.last_ts).toBe(WINDOW_BASE + 2000);
+    expect(aggregate.aggregate?.window_ms).toBe(60000);
+    expect(aggregate.cmdline).toBe('gh auth token --hostname github.com');
+    expect(aggregate.blocked).toBe(false);
+  });
+
+  it('4.1 跨分钟命中不折叠：各自即时落盘且不产聚合计数事件', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 133 })) + '\n', 'utf8');
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(selfCheckEvent({ pid: 134, ts: WINDOW_BASE + 60000 })) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 2);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(2);
+    expect(reported.every((e) => e.event_type === 'process_start')).toBe(true);
+  });
+
+  it('4.1 blocked / 带 risk_flags / 有 agent 归属的自检事件永不聚合', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(
+        selfCheckEvent({ pid: 133, blocked: true, block_reason: 'blocked by runtime hook' })
+      ) + '\n',
+      'utf8'
+    );
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(selfCheckEvent({ pid: 134, risk_flags: ['hook_env_reinjected'] })) + '\n',
+      'utf8'
+    );
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(selfCheckEvent({ pid: 135, tool_call_id: 'call-1', session_id: 'sess-1' })) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 3);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(3);
+    expect(reported.every((e) => e.event_type === 'process_start')).toBe(true);
+    expect(reported.find((e) => e.tool_call_id === 'call-1')).toBeDefined();
+  });
+
+  it('4.1 宿主 worker 的 process_exit 同样按分钟聚合（source_event_type=process_exit）', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    const exit = (pid: number, ts: number) =>
+      selfCheckEvent({
+        event_type: 'process_exit',
+        pid: 1,
+        child_pid: pid,
+        exit_code: 0,
+        command_line: '/usr/local/bin/node /app/dist/process/spawn-broker/worker.js',
+        ts,
+      });
+    fs.appendFileSync(logFile, JSON.stringify(exit(3001, WINDOW_BASE)) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(exit(3002, WINDOW_BASE + 1000)) + '\n', 'utf8');
+
+    await waitForReported(reported, 1);
+    await runtimeCollector.shutdown();
+    await waitForReported(reported, 2);
+
+    expect(reported).toHaveLength(2);
+    expect(reported[1].event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(reported[1].aggregate?.pattern).toBe('spawn_broker_worker');
+    expect(reported[1].aggregate?.source_event_type).toBe('process_exit');
+    expect(reported[1].aggregate?.count).toBe(2);
+  });
+
+  it('4.1 aggregateHostSelfChecks=false 时全部即时落盘', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      aggregateHostSelfChecks: false,
+    });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 133 })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 134 })) + '\n', 'utf8');
+
+    await waitForReported(reported, 2);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(2);
+    expect(reported.every((e) => e.event_type === 'process_start')).toBe(true);
+  });
+
+  it('4.2 LLM 自有流量：首个实例即时落盘且 body/content 降级为 SHA-256，其余折叠进计数', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      llmSelfTrafficHosts: ['minimaxi.com'],
+    });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ body: 'body-1' })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: WINDOW_BASE + 1000, body: 'body-2' })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: WINDOW_BASE + 2000, body: 'body-3' })) + '\n', 'utf8');
+
+    await waitForReported(reported, 1);
+    const first = reported[0];
+    expect(first.event_type).toBe('network_http');
+    // 载荷降级：原文不留存，只留指纹。
+    expect(first.body).toBeUndefined();
+    expect(first.content).toBeUndefined();
+    expect(first.body_sha256).toBe(createHash('sha256').update('body-1').digest('hex'));
+    expect(first.content_sha256).toBe(createHash('sha256').update('{"response":1}').digest('hex'));
+    // 体积信号保留。
+    expect(first.content_length).toBe(14);
+
+    await runtimeCollector.shutdown();
+    await waitForReported(reported, 2);
+
+    expect(reported).toHaveLength(2);
+    const aggregate = reported[1];
+    expect(aggregate.event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(aggregate.aggregate?.category).toBe('llm_self_traffic');
+    expect(aggregate.aggregate?.pattern).toBe('api.minimaxi.com POST /anthropic/v1/messages');
+    expect(aggregate.aggregate?.count).toBe(3);
+    expect(aggregate.aggregate?.window_ms).toBe(300000);
+    expect(aggregate.aggregate?.body_sha256).toBe(first.body_sha256);
+    expect(aggregate.aggregate?.content_length_total).toBe(42);
+  });
+
+  it('4.2 blocked / 带 risk_flags 的 LLM 自流量不采样、不降级', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      llmSelfTrafficHosts: ['minimaxi.com'],
+    });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(
+        llmEvent({ blocked: true, block_reason: 'blocked by network hook', body: 'secret-body-1' })
+      ) + '\n',
+      'utf8'
+    );
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(llmEvent({ risk_flags: ['internal_host'], body: 'secret-body-2' })) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 2);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(2);
+    for (const event of reported) {
+      expect(event.event_type).toBe('network_http');
+      expect(typeof event.body).toBe('string');
+      expect(event.body_sha256).toBeUndefined();
+    }
+  });
+
+  it('4.2 llmSelfTrafficSampleRate=2 时每窗口即时落两条，其余折叠', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      llmSelfTrafficHosts: ['minimaxi.com'],
+      llmSelfTrafficSampleRate: 2,
+    });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ body: 'b1' })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: WINDOW_BASE + 1000, body: 'b2' })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: WINDOW_BASE + 2000, body: 'b3' })) + '\n', 'utf8');
+
+    await waitForReported(reported, 2);
+    await runtimeCollector.shutdown();
+    await waitForReported(reported, 3);
+
+    expect(reported).toHaveLength(3);
+    expect(reported[0].event_type).toBe('network_http');
+    expect(reported[1].event_type).toBe('network_http');
+    expect(reported[2].event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(reported[2].aggregate?.count).toBe(3);
+  });
+
+  it('4.2 llmSelfTrafficHosts 未配置时特征关闭（既有测试语义的守卫）', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ pid: 1, body: 'plain-body' })) + '\n', 'utf8');
+
+    await waitForReported(reported, 1);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(1);
+    expect(reported[0].body).toBe('plain-body');
+    expect(reported[0].body_sha256).toBeUndefined();
+  });
+
+  it('4.2 非清单 host 的网关流量不受影响', async () => {
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      llmSelfTrafficHosts: ['minimaxi.com'],
+    });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(
+      logFile,
+      JSON.stringify(llmEvent({ host: 'clawhub.ai', url: '/v1/feeds/plugins', body: 'feed-body' })) + '\n',
+      'utf8'
+    );
+
+    await waitForReported(reported, 1);
+    await runtimeCollector.shutdown();
+    await wait(200);
+
+    expect(reported).toHaveLength(1);
+    expect(reported[0].body).toBe('feed-body');
+    expect(reported[0].body_sha256).toBeUndefined();
   });
 });

@@ -101,7 +101,14 @@ const FALLBACK_BLOCK_PATTERNS = [
 // 无 /g 标志：共享正则的 stateful lastIndex 会让重复 .test() 交替命中。
 const FALLBACK_HOOK_PATTERNS = {
   network_tool: [{ re: /\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bnmap\b/ }],
-  pipe_to_shell: [{ re: /\|[^|]*\bsh\b|\|[^|]*\bbash\b|\beval\b|\bbase64\b/ }],
+  // pipe_to_shell：与 spl.yaml hookPatterns.pipe_to_shell 同口径（FP
+  // 收敛）——管道臂要求管道目标是 sh/bash 命令本身；eval 臂要求 eval 后紧跟
+  // 引号/$/( /反斜杠；base64 臂保持原口径。
+  pipe_to_shell: [
+    { re: /\|\s+(?:\S*\/)?(?:sh|bash)\b/ },
+    { re: /\beval[\s]+["'$/\\(]/ },
+    { re: /\bbase64\b/ },
+  ],
   // mass_deletion: any recursive + force rm, or --no-preserve-root, is treated as high-risk.
   mass_deletion: [
     { re: /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive)\b/ },
@@ -111,14 +118,23 @@ const FALLBACK_HOOK_PATTERNS = {
   // sensitive_file_access: any reference to common sensitive system files or
   // SSH keys, anywhere in the command line (including shell redirect input
   // like `while read ... < /etc/passwd`); getent 等价于读 /etc/passwd 等。
+  // 补 openclaw.json 读取臂（与 spl.yaml 同口径）。
   sensitive_file_access: [
     { re: /(?:^|\s|["'<>])(?:\/etc\/(?:passwd|shadow|gshadow|sudoers|hosts|ssh\/\S*)|\/root\/\S*|\/proc\/self\/environ|(?:.*\/)?\.ssh\/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|config))\b/ },
+    { re: /(?:^|\s|["'<>])(?:.*\/)?\.openclaw\/openclaw\.json\b/ },
     { re: /\bgetent\s+(passwd|shadow|group)\b/ },
   ],
   privilege_escalation: [{ re: /\bsudo\b|\bsu\b|\bchmod\b.*\+s|\bsetuid\s*\(/ }],
   // Authorization / Bearer / 标准凭据字段名（不论是否已被 redact）。
   token_in_command: [
     { re: /Authorization\s*[:=]|Bearer\s+[A-Za-z0-9_\-\.~+\/=]{8,}|api[_-]?key\s*[:=]\s*\S+|access[_-]?token\s*[:=]\s*\S+|secret\s*[:=]\s*\S+|password\s*[:=]\s*\S+/i, raw: true },
+    // openclaw config set 写含 token/secret/password/api_key 的轴（凭据写形态）。
+    { re: /openclaw\s+config\s+set\s+\S*(?:token|secret|password|api[_-]?key)/i, raw: true },
+  ],
+  // 供应链：npm 安装 git+https / git+ssh / 直接 http(s) URL 形态（与 spl.yaml
+  // hookPatterns.supply_chain 同口径；registry 普通包名安装不打）。
+  supply_chain: [
+    { re: /\bnpm\s+(?:install|i|add)\s+(?:-\S+\s+)*\S*(?:git\+(?:https?|ssh)?:|https?:\/\/)\S*/ },
   ],
   background_execution: [{ re: /nohup\b|&\s*$|\bdetach\b/ }],
   // Reverse shell patterns: bash -i >& /dev/tcp/..., nc -e /bin/sh, python socket.
@@ -610,6 +626,32 @@ function isBlockPatternTierEnabled() {
  * ⚠️ 两档不能合并成 early-return：flag 名单为空 ≠ 命令安全
  *    （例：cat ~/.aws/credentials 一个 flag 都不打，但仍是 Tier-1 凭据文件）。
  */
+/**
+ * ⭐ 认证配置写豁免（2026-10-31 可用性红线）：`openclaw config <set|write|
+ * update|put|patch>` 且参数轴命中认证语义（gateway\.auth\. / token / secret /
+ * password / api[_-]?key）的命令行形态。
+ *
+ * 背景：认证配置文件（~/.openclaw/openclaw.json，含 gateway.auth.token 等）的
+ * 改写在任何模式、任何通路下**只告警不阻断**——误拦会导致客户系统无法登录，
+ * 损害不可逆。上批为「openclaw config set 凭据轴」打的 token_in_command 仍
+ * 照打（warn 性质留痕，事件照落），但 shouldBlock 命中本豁免 ⇒ 不阻断。
+ * 其他 token_in_command 场景（echo $TOKEN、curl 明文凭据等凭证外泄）阻断不变。
+ *
+ * 锚定纪律：按命令段（; | & \n 切分）逐段要求段首就是 `openclaw config <verb>`
+ * ——普通命令正文/参数里**提到**该形态不享受豁免，防止借豁免逃逸。
+ */
+const CREDENTIAL_CONFIG_VERB_RE = /^\s*(?:\S+\/)?openclaw\s+config\s+(?:set|write|update|put|patch)\b/;
+const CREDENTIAL_AXIS_RE = /gateway\.auth\.|\b(?:token|secret|password|api[_-]?key)\b/;
+
+function isCredentialConfigWrite(cmdline) {
+  if (typeof cmdline !== 'string' || !cmdline) return false;
+  const text = cmdline.toLowerCase();
+  for (const seg of text.split(/[;|&\n]/)) {
+    if (CREDENTIAL_CONFIG_VERB_RE.test(seg) && CREDENTIAL_AXIS_RE.test(seg)) return true;
+  }
+  return false;
+}
+
 function shouldBlock(event, options) {
   if (!isRuntimeEnforceEnabled()) return undefined;
 
@@ -619,7 +661,13 @@ function shouldBlock(event, options) {
     const blockedFlags = getBlockedFlags();
     const matched = flags.find((f) => blockedFlags.includes(f));
     if (matched) {
-      return `命令被 OpenClaw runtime hook 拦截（risk flag: ${matched}）`;
+      // 认证配置写豁免：token_in_command 打标照旧（warn 留痕），但认证配置
+      // 写形态不阻断。红线豁免，勿删；其余 token_in_command 场景阻断不变。
+      if (matched === 'token_in_command' && isCredentialConfigWrite(pickBlockingCommandLine(event, options))) {
+        log('debug', `token_in_command blocked-flag exempted (credential config write): ${(event && event.command_line) || ''}`);
+      } else {
+        return `命令被 OpenClaw runtime hook 拦截（risk flag: ${matched}）`;
+      }
     }
   }
 
@@ -746,6 +794,220 @@ function isSkillBinaryExecution(executable) {
   return /\/skills\/[^/]+\/bin\/[^/]+$/i.test(normalized);
 }
 
+// ---------------------------------------------------------------------------
+// 代码驱动判定（非纯正则 cmdline 匹配）：FP 收敛 + 死 flag 补 emitter。
+// 模式文件（hookPatterns）保持单纯，上下文判定（读类命令 / 目标路径 / argv
+// 结构）统一在这里实现。
+// ---------------------------------------------------------------------------
+
+/** 读类命令：只有这些命令把 argv 里的敏感路径当作「读取目标」。 */
+const READ_CLASS_COMMANDS = new Set([
+  'cat', 'less', 'more', 'head', 'tail', 'grep', 'egrep', 'rg', 'stat', 'file', 'bat',
+]);
+
+/** `sh -c "` / `bash -lc '` 类包装前缀：剥掉后段内仍是独立命令。 */
+const SHELL_DASH_C_PREFIX_RE = /^\s*(?:\/\S+\/)?(?:sh|bash|dash|zsh|ksh|ash|fish)\s+-[a-z]*c[a-z]*\s+["']\s*/;
+
+/** 段首无害包装词（变量赋值 / sudo 类 / nice / timeout / 其参数）。 */
+const SEGMENT_BENIGN_TOKEN_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S+|sudo|doas|command|env|nice|timeout|xargs|-[a-zA-Z]+|-\d+[\w.:]*|\d+(?:\.\d+){0,3}[\w:]*)$/;
+
+/** 段首词是否为读类命令（允许 sudo / nice -n 10 / timeout 60 等前置包装）。 */
+function segmentHeadCommand(seg) {
+  let s = seg;
+  for (;;) {
+    const m = SHELL_DASH_C_PREFIX_RE.exec(s);
+    if (!m) break;
+    s = s.slice(m[0].length);
+  }
+  const tokens = s.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < tokens.length && i < 5; i++) {
+    if (!SEGMENT_BENIGN_TOKEN_RE.test(tokens[i])) {
+      return tokens[i].replace(/^["']+|["']+$/g, '');
+    }
+  }
+  return '';
+}
+
+function segmentHasReadCommand(seg) {
+  return READ_CLASS_COMMANDS.has(segmentHeadCommand(seg));
+}
+
+/** cmdline（已小写化）里是否存在由读类命令治理的段。 */
+function cmdHasReadSegment(cmd) {
+  return cmd.split(/[;|&\n]/).some((seg) => segmentHasReadCommand(seg));
+}
+
+/** matchIndex 所在命令段（以 ; | & \n 切分）。 */
+function segmentOfIndex(cmd, idx) {
+  let start = 0;
+  for (let k = idx - 1; k >= 0; k--) {
+    const c = cmd[k];
+    if (c === ';' || c === '|' || c === '&' || c === '\n') {
+      start = k + 1;
+      break;
+    }
+  }
+  return cmd.slice(start);
+}
+
+/**
+ * 敏感路径命中位置是否处于「读取语境」：
+ *   - 重定向读入（`< /etc/passwd`，含 while-read 形态）；或
+ *   - 所在命令段由读类命令治理（含 `sh -c "cat ..."` 包装形态）。
+ * 2026-10-27/30 FP 收敛：printf/echo 写文件形态里**提到**敏感路径
+ * （如排查笔记正文引用 /etc/shadow）不打标——只有真的读才打。
+ */
+function isReadGoverned(cmd, matchIndex) {
+  let j = matchIndex - 1;
+  while (j >= 0 && (cmd[j] === ' ' || cmd[j] === '\t')) j--;
+  if (j >= 0 && cmd[j] === '<') return true;
+  return segmentHasReadCommand(segmentOfIndex(cmd, matchIndex));
+}
+
+/**
+ * sensitive_file_access 的判定：路径臂与 getent 臂都要求命中位置处于读取
+ * 语境（路径臂见 isReadGoverned；getent 臂要求 getent 是所在段的段首命令——
+ * printf 笔记里引用 "getent passwd 全量账号" 是文本提及不是真读）。
+ * entries 来自构建期产物（或兜底表），路径集合仍是模式文件单一数据源，
+ * 这里只做语境门控。
+ */
+function isReadClassSensitiveAccess(cmd, entries) {
+  const getentRe = /\bgetent\s+(?:passwd|shadow|group)\b/g;
+  let gm;
+  while ((gm = getentRe.exec(cmd)) !== null) {
+    if (segmentHeadCommand(segmentOfIndex(cmd, gm.index)) === 'getent') return true;
+    if (gm.index === getentRe.lastIndex) getentRe.lastIndex++;
+  }
+  for (const entry of entries) {
+    if (entry.re.source.indexOf('getent') !== -1) continue;
+    const g = new RegExp(entry.re.source, 'g');
+    let m;
+    while ((m = g.exec(cmd)) !== null) {
+      if (isReadGoverned(cmd, m.index)) return true;
+      if (m.index === g.lastIndex) g.lastIndex++;
+    }
+  }
+  return false;
+}
+
+/**
+ * file_deletion 收窄：「rm 目标全部位于 /tmp|/var/tmp 且非递归」
+ * 的例行清理/备份轮替不打标。逐段解析：
+ *   - 含递归形态（-r/-R/--recursive）⇒ 保留 flag（任意路径）；
+ *   - 任一目标解析后不在 /tmp|/var/tmp 下 ⇒ 保留 flag；
+ *   - 裸 rm（段首、无可见目标，目标不可知）⇒ 保守保留；
+ *   - xargs 形态（rm 非段首、无可见目标，目标来自管道流）⇒ 按清理形态放行。
+ * 变量解析：同 cmdline 内 `P=/tmp/x` 赋值可回填 `$P`/`${P}` 目标。
+ */
+function isRoutineTempCleanup(cmd) {
+  const assignments = new Map();
+  const assignRe = /\b([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&]+)/g;
+  let am;
+  while ((am = assignRe.exec(cmd)) !== null) assignments.set(am[1], am[2]);
+
+  const resolveVars = (token) => {
+    let out = token;
+    for (let pass = 0; pass < 2; pass++) {
+      out = out.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name) =>
+        assignments.has(name) ? assignments.get(name) : whole
+      );
+    }
+    return out.replace(/^["']+|["']+$/g, '');
+  };
+  const isTempPath = (p) => /^(?:\/tmp|\/var\/tmp)(?:\/|$)/.test(p);
+
+  const segments = cmd.split(/[;|&\n]/);
+  let sawRm = false;
+  for (const seg of segments) {
+    const rmMatch = /\brm\b/.exec(seg);
+    if (!rmMatch) continue;
+    sawRm = true;
+    const rmIsHead = /^\s*rm\b/.test(seg);
+    const tokens = seg.slice(rmMatch.index + 2).split(/\s+/).filter(Boolean);
+    const targets = [];
+    for (const t of tokens) {
+      if (t === '--') continue;
+      if (/^--?[-a-zA-Z]+$/.test(t)) {
+        const body = t.replace(/^-+/, '');
+        if (body === 'recursive' || body.indexOf('r') !== -1) return false; // 递归：任意路径都保留
+        continue;
+      }
+      if (/^\d*(>>?|<)/.test(t)) break; // 重定向不是目标
+      if (/^[A-Za-z_][A-Za-z0-9_]*=\S*/.test(t)) continue;
+      targets.push(t);
+    }
+    for (const t of targets) {
+      if (!isTempPath(resolveVars(t))) return false;
+    }
+    if (targets.length === 0 && rmIsHead) return false; // 裸 rm：目标不可知，保守保留
+  }
+  return sawRm;
+}
+
+/**
+ * self_protection_behavior 补 emitter（字典有、此前无 emitter 的死
+ * flag）：读类命令读取受保护策略/审计文件。名单语义对齐
+ * src/intervention/SelfProtection.ts 的受保护路径（x-openclaw-selfProtection
+ * 区段是其唯一数据源），本常量至少覆盖 security-policy.yaml /
+ * security-policy.spl.yaml / policies 目录下 yaml / 审计日志。
+ */
+const PROTECTED_POLICY_FILE_RE = /(?:^|\s|["'<>])(?:[^\s"'<>]*\/)?(?:policies\/[^\s"'<>]+\.ya?ml|security-policy\.spl\.ya?ml|security-policy\.ya?ml|security-events(?:-runtime)?\.jsonl)\b/;
+
+/**
+ * scratch_dir_spawn 补 emitter（字典有、此前无 emitter 的死 flag）：
+ * ① exe 在 /tmp|/var/tmp|/dev/shm 且 comm 是常见解释器（node/python/bash/...）
+ *    或文件名是脚本后缀（.js/.mjs/.cjs/.py/.sh）——规格字面口径；
+ * ② 解释器 + scratch 脚本相邻形态（argv 或 cmdline 令牌）——覆盖 sh -c 包装
+ *    下的 `node /tmp/x.mjs`（采样中 exe 是 /usr/bin/sh
+ *    包装器，被跑的 node 脚本在 -c 字符串内）。
+ */
+const SCRATCH_DIR_PREFIX_RE = /^\/(?:tmp|var\/tmp|dev\/shm)\//;
+const SCRATCH_INTERPRETERS = new Set(['node', 'python', 'python3', 'bash', 'sh', 'dash', 'ruby', 'perl']);
+const SCRIPT_SUFFIX_RE = /\.(?:js|mjs|cjs|py|sh)$/;
+
+function isScratchDirSpawn(options, cmd) {
+  const norm = (p) => p.replace(/\\/g, '/').replace(/^["']+|["']+$/g, '');
+  // ① exe 本身在 scratch 目录（直接执行投放脚本或解释器副本）。
+  if (typeof options.executable === 'string' && options.executable) {
+    const e = norm(options.executable);
+    if (SCRATCH_DIR_PREFIX_RE.test(e)) {
+      const base = e.slice(e.lastIndexOf('/') + 1);
+      const stem = base.replace(SCRIPT_SUFFIX_RE, '');
+      if (SCRATCH_INTERPRETERS.has(stem.toLowerCase()) || SCRIPT_SUFFIX_RE.test(base)) return true;
+    }
+  }
+  // ② 解释器 + scratch 脚本相邻（argv 与 cmdline 令牌并集；exec 系无 args
+  //   数组时 cmdline 令牌兜底）。
+  const tokens = [];
+  if (Array.isArray(options.args)) {
+    for (const a of options.args) if (typeof a === 'string' && a) tokens.push(a);
+  }
+  if (typeof cmd === 'string') tokens.push(...cmd.split(/\s+/));
+  for (let i = 0; i < tokens.length; i++) {
+    const base = norm(tokens[i]).split('/').pop().toLowerCase();
+    if (!SCRATCH_INTERPRETERS.has(base)) continue;
+    for (let j = i + 1; j < Math.min(i + 4, tokens.length); j++) {
+      const t = norm(tokens[j]);
+      if (t.startsWith('-')) continue;
+      if (SCRATCH_DIR_PREFIX_RE.test(t) && SCRIPT_SUFFIX_RE.test(t)) return true;
+      break;
+    }
+  }
+  return false;
+}
+
+/**
+ * 宿主 exec 包装器豁免（FP 收敛）：宿主用
+ * `sh -c export PATH="${OPENCLAW_PREPEND_PATH}..."; unset ...; <cmd>` 包装每一次
+ * exec，包装 spawn 带显式 env（无 NODE_OPTIONS）⇒ 此前每条都留 hook_env_reinjected
+ * 噪音（采样 ~156 条）。包装形态本身不是 env 剥离信号——hook 已重注入——豁免。
+ */
+const HOST_EXEC_WRAPPER_RE = /^\s*(?:\/\S+\/)?(?:sh|bash)\s+-[a-z]*c[a-z]*\s+[^\n]*?OPENCLAW_PREPEND_PATH/;
+
+function isHostExecWrapper(cmdline) {
+  return typeof cmdline === 'string' && HOST_EXEC_WRAPPER_RE.test(cmdline);
+}
+
 function computeRiskFlags(options, redacted) {
   const flags = [];
   const cmd = redacted.toLowerCase();
@@ -760,22 +1022,49 @@ function computeRiskFlags(options, redacted) {
   //     传 env）打成「绕过自保护」，噪声淹没真正的绕过信号。
   //
   // 补回去的情形改用 hook_env_reinjected 留痕——信号还在，但不再冒充
-  // 高危绕过。
+  // 高危绕过。FP 收敛：宿主 exec 包装器形态（见 isHostExecWrapper）
+  // 不再打该 flag。
+  //
+  // TODO(字典): hook_env_reinjected 未登记在 risk-flags.json 字典 enum
+  // （canonical 与 experimental 通道均无），待 project_standards 仓登记后
+  // 同步本字面量。
   if (options.bypass_reason === 'explicit_skip') {
     flags.push('self_protection_bypass');
   } else if (options.bypass_reason) {
-    flags.push('hook_env_reinjected');
+    const rawCmdline = typeof options.command_line === 'string' ? options.command_line : redacted;
+    if (!isHostExecWrapper(rawCmdline)) {
+      flags.push('hook_env_reinjected');
+    }
   }
 
   // 代码驱动 flag（非纯正则 cmdline 匹配）：保持代码判定，不进 pattern 表。
   if (options.shell_involved) flags.push('shell_involved');
   if (isSkillBinaryExecution(options.executable)) flags.push('skill_binary_execution');
+  if (isScratchDirSpawn(options, cmd)) flags.push('scratch_dir_spawn');
+  // 读类命令读取受保护策略/审计文件 ⇒ 插件自身被异常访问留痕。
+  if (cmdHasReadSegment(cmd) && PROTECTED_POLICY_FILE_RE.test(cmd)) {
+    flags.push('self_protection_behavior');
+  }
 
   // 纯正则 flag 一律走构建期产物（缺失时内置兜底表）。input 语义：
   // raw → 匹配原始大小写 redacted（AKIA/JWT 等大小写敏感模式）；缺省 → 匹配
   // 小写化 redacted。flags 由条目自带（编译期已合并规则级默认）。
+  //
+  // 两个 flag 在此做代码级语境门控（模式文件保持单纯）：
+  //   - sensitive_file_access：只有读取语境命中才打标（见 isReadClassSensitiveAccess）；
+  //   - file_deletion：/tmp|/var/tmp 非递归例行清理不打标（见 isRoutineTempCleanup）。
   for (const flag of Object.keys(HOOK_PATTERN_SPEC.patterns)) {
     const entries = HOOK_PATTERN_SPEC.patterns[flag];
+    if (flag === 'sensitive_file_access') {
+      if (isReadClassSensitiveAccess(cmd, entries)) flags.push(flag);
+      continue;
+    }
+    if (flag === 'file_deletion') {
+      if (entries.some((entry) => entry.re.test(entry.raw ? redacted : cmd)) && !isRoutineTempCleanup(cmd)) {
+        flags.push(flag);
+      }
+      continue;
+    }
     for (const entry of entries) {
       if (entry.re.test(entry.raw ? redacted : cmd)) {
         flags.push(flag);
@@ -1087,6 +1376,13 @@ const SHELL_NAMES = new Set([
   'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
 ]);
 
+// FP 收敛：argv 里的 -c 只有在**前缀词本身是 shell**（shell 名或
+// 路径指向 shell）时才表示「shell 解释执行一段命令」。git -c、cut -c、head -c
+// 等非 shell 程序的 -c 是各自的配置/字节数参数——采样里
+// `git -c maintenance.autoDetach=false ...`（spawn argv 直传）与
+// `nice -n 10 git -c ...` 被误标 shell_involved。
+const SHELL_COMMAND_PATH_RE = /(?:^|[\/\\])(?:sh|bash|dash|ksh|zsh|fish|ash)(?:\.exe)?$/i;
+
 /**
  * Detect whether a spawn/execFile invocation effectively involves a shell.
  * This handles the common case where callers spawn('sh', ['-c', 'cmd'])
@@ -1107,9 +1403,13 @@ function detectShellInvocation(command, args, options) {
     return { shell_involved: true, shell: command };
   }
 
-  // Arguments like -c or /c strongly indicate a shell interpreting a command.
+  // Arguments like -c or /c strongly indicate a shell interpreting a command —
+  // but only when the spawned command itself is a shell (see SHELL_COMMAND_PATH_RE
+  // above): non-shell programs use -c for their own options (git -c, cut -c).
   if (Array.isArray(args) && args.some((arg) => typeof arg === 'string' && /^[-/]c$/i.test(arg))) {
-    return { shell_involved: true, shell: command };
+    if (SHELL_NAMES.has(base) || SHELL_COMMAND_PATH_RE.test(command)) {
+      return { shell_involved: true, shell: command };
+    }
   }
 
   return { shell_involved: false, shell: undefined };
@@ -1468,6 +1768,10 @@ module.exports = {
   getCallerLocation,
   computeRiskFlags,
   shouldBlock,
+  // Exported for unit tests: shell-invocation 判定（2.1 -c 前缀词收窄）。
+  detectShellInvocation,
+  // Exported for unit tests: 认证配置写豁免（token_in_command 阻断短路）。
+  isCredentialConfigWrite,
   // Exported for unit tests: pure env-mutation helper, no I/O.
   applyHookPropagation,
   HOOK_MARKER_ENV,

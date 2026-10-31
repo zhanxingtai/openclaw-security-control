@@ -559,6 +559,23 @@ export class AssetCollector {
   }
 
   /**
+   * Advance the lock state machine by exactly one leader-election round
+   * (plus one scan when leadership is held) — **the same code path the
+   * scan timer drives** (`setInterval(() => this.tick())`).
+   *
+   * Exposed so tests (and future manual triggers) can drive lock
+   * transitions **deterministically** instead of waiting on wall-clock
+   * timer ticks: timer-based lock tests are flaky under machine load
+   * because every assertion window multiplies the chance of a starved
+   * event loop. Lock semantics are unchanged — this is the timer body,
+   * callable on demand. Tests should pair it with a large
+   * `scanIntervalMs` so the timer stays out of the picture entirely.
+   */
+  async runLeaderCycle(): Promise<void> {
+    return this.tick();
+  }
+
+  /**
    * Run one incremental scan: emit added/changed/removed events only.
    * Public so tests (and future manual triggers) can drive scans directly.
    */

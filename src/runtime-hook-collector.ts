@@ -11,6 +11,8 @@ import type {
 import { generateUUID } from './uuid.js';
 import { pidBindingStore } from './utils/pid-binding-store.js';
 import { hasAgentAttribution, matchHostInternalProbe } from './host-internal-probe.js';
+import { matchHostSelfCheckPattern } from './host-self-check-aggregate.js';
+import { sha256Hex } from './asset-hash.js';
 
 // Keep an inline minimal interface so the test mock and the real
 // implementation share the same surface.
@@ -104,6 +106,31 @@ interface ParsedRuntimeEvent {
 }
 
 /**
+ * 窗口内待冲刷的聚合记录。
+ *
+ * `emittedInstances` 是窗口内已即时落盘的实例数（首个实例 + 采样比允许
+ * 的后续实例）；`folded` 是被折叠、只体现在最终 count 里的实例数。
+ */
+interface PendingAggregate {
+  category: 'host_self_check' | 'llm_self_traffic';
+  /** 形态名（`gh_auth_token`）或流量键（`host METHOD path`）。 */
+  pattern: string;
+  sourceEventType: string;
+  windowMs: number;
+  windowStart: number;
+  emittedInstances: number;
+  folded: number;
+  firstTs: number;
+  lastTs: number;
+  /** host_self_check：首个实例的命令行（审计代表）。 */
+  cmdline?: string;
+  /** llm_self_traffic：首个实例 body 的 SHA-256（去重参照）。 */
+  bodySha256?: string;
+  /** llm_self_traffic：窗口内 content_length 合计。 */
+  contentLengthTotal: number;
+}
+
+/**
  * Runtime hook collector.
  *
  * Reads JSON Lines events produced by language-specific runtime hooks (e.g.
@@ -133,6 +160,12 @@ export class RuntimeHookCollector implements ILayerCollector {
     eventsExcludedHostProbes: 0,
     /** 各探针类别的排除计数（探针名 → 条数）。 */
     hostInternalProbes: {} as Record<string, number>,
+    /** ⭐ 降噪：被折叠进聚合计数、未单独落盘的事件数。 */
+    eventsFolded: 0,
+    /** ⭐ 降噪：已落盘的聚合计数事件条数。 */
+    aggregatesEmitted: 0,
+    /** ⭐ 降噪：各形态/流量键的折叠计数。 */
+    aggregatePatterns: {} as Record<string, number>,
   };
   private hooks: RuntimeHookEventHooks;
   // 事件评估→落盘串行队列：chain 规则依赖事件顺序（先脱库后外传），
@@ -184,6 +217,22 @@ export class RuntimeHookCollector implements ILayerCollector {
     '--openclaw-sqlite-readonly-child',
     '--openclaw-database-verify-child',
   ];
+
+  /** 宿主自检聚合（4.1）的窗口长度：分钟级。 */
+  private static readonly HOST_SELF_CHECK_WINDOW_MS = 60_000;
+  /** LLM 自有流量采样（4.2）的默认窗口长度：5 分钟（可用配置覆盖）。 */
+  private static readonly DEFAULT_LLM_SAMPLE_WINDOW_MS = 300_000;
+  /** 待冲刷聚合表的上限：超出时冲刷最早的一条，保证内存有界。 */
+  private static readonly MAX_PENDING_AGGREGATES = 256;
+
+  /**
+   * 窗口内待冲刷的聚合记录。
+   *
+   * 键 = `category|pattern|源事件类型`；每条记录只持有**当前窗口**的计数，
+   * 窗口翻转（同键事件落到新窗口）时旧记录先冲刷成
+   * `x_openclaw_self_traffic_aggregate` 事件再开新窗口。
+   */
+  private pendingAggregates = new Map<string, PendingAggregate>();
 
   constructor(
     collector: EventCollectorLike,
@@ -275,6 +324,9 @@ export class RuntimeHookCollector implements ILayerCollector {
     // fallback so we still observe new log data within ~100 ms.
     const pollIntervalMs = this.config.pollIntervalMs ?? 100;
     this.pollingTimer = setInterval(() => {
+      // ⭐ 顺带冲刷窗口已过期的聚合计数，避免「整日志安静时
+      // 聚合事件迟迟不落盘」。
+      this.flushExpiredAggregates(Date.now());
       if (!this.logPath) return;
       try {
         const size = statSync(this.logPath).size;
@@ -305,6 +357,8 @@ export class RuntimeHookCollector implements ILayerCollector {
       unwatchFile(this.logPath, this.watchListener);
       this.watchListener = undefined;
     }
+    // ⭐ 关停时把窗口未结束的聚合计数全部冲刷落盘，避免丢计数。
+    this.flushAllAggregates();
   }
 
   getStats(): Record<string, unknown> {
@@ -621,6 +675,19 @@ export class RuntimeHookCollector implements ILayerCollector {
     }
 
     const event = this.normalizeEvent(parsed);
+
+    // ⭐ 宿主自检命令的分钟级聚合。命中的事件要么按
+    // 「首个实例/采样比内」即时落盘，要么折叠进聚合计数（返回 true）。
+    if (this.tryFoldHostSelfCheck(parsed, event)) {
+      return;
+    }
+
+    // ⭐ 网关 LLM 自有流量的窗口采样（首个实例即时落，
+    // 同窗口后续折叠进计数）。blocked / risk_flags 事件在识别阶段即绕行。
+    if (this.tryFoldLlmSelfTraffic(parsed, event)) {
+      return;
+    }
+
     this.dispatchEvent(event);
   }
 
@@ -743,6 +810,229 @@ export class RuntimeHookCollector implements ILayerCollector {
         return false;
       }
     });
+  }
+
+  /**
+   * ⭐ 宿主自检事件的聚合闸门。
+   *
+   * 返回命中的自检形态名；不该聚合时返回 null。三道闸门：
+   *   - 开关 `aggregateHostSelfChecks`（默认开）；
+   *   - 命令行命中自检聚合名单（见 host-self-check-aggregate.ts）；
+   *   - 干净事件：blocked / 带 risk_flags / 有 agent 归属一律绕行
+   *     （agent 行为必须逐条留痕）。
+   */
+  private hostSelfCheckPatternFor(parsed: ParsedRuntimeEvent): string | null {
+    if (this.config.aggregateHostSelfChecks === false) return null;
+    if (!this.isCommandEvent(parsed) && !this.isProcessExitEvent(parsed)) return null;
+    if (parsed.blocked === true) return null;
+    if (Array.isArray(parsed.risk_flags) && parsed.risk_flags.length > 0) return null;
+    if (hasAgentAttribution(parsed)) return null;
+    const cmd = parsed.command_line || parsed.command_line_raw || '';
+    return matchHostSelfCheckPattern(cmd);
+  }
+
+  /**
+   * ⭐ 网关 LLM 自有流量的识别。
+   *
+   * 返回采样键（`host METHOD path`）；不该采样时返回 null。判定：
+   *   - `llmSelfTrafficHosts` 已配置（默认名单由 DEFAULT_CONFIG 注入）；
+   *   - 事件来自宿主自身：pid=1 或 comm=openclaw（本采集器读到的 network
+   *     事件全部出自 network.js 预载，容器内网关 pid 即 1）；
+   *   - 目标 host 命中清单（大小写不敏感的后缀匹配，`api.x.com` 命中
+   *     `x.com`；host 串可能带端口，匹配前剥掉）；
+   *   - blocked / 带 risk_flags 的事件不采样（保持全保真，走正常通道）。
+   *
+   * 注：agent 归属（tool_call_id）**不**绕行本通道 —— 采样中待压缩的事件
+   * 大部分带 agent 归属（宿主在 agent turn 期间的自有模型调用），它们是
+   * 本通道要折叠的主体；干预决策若存在仍照常回灌（评估发生在
+   * 落盘前，哈希降级见 normalizeNetworkEvent 的权衡说明）。
+   */
+  private llmSelfTrafficKey(parsed: ParsedRuntimeEvent): string | null {
+    const hosts = this.config.llmSelfTrafficHosts;
+    if (!hosts || hosts.length === 0) return null;
+    if (!(parsed.pid === 1 || parsed.comm === 'openclaw')) return null;
+    const host = String(parsed.host || '').toLowerCase().split(':')[0].replace(/\.+$/, '');
+    if (!host) return null;
+    const hit = hosts.some((entry) => {
+      const e = String(entry).toLowerCase().replace(/^\.+|\.+$/g, '');
+      return e.length > 0 && (host === e || host.endsWith(`.${e}`));
+    });
+    if (!hit) return null;
+    if (parsed.blocked === true) return null;
+    if (Array.isArray(parsed.risk_flags) && parsed.risk_flags.length > 0) return null;
+    const method = (parsed.method || 'GET').toUpperCase();
+    const path = parsed.url || parsed.request_url || '/';
+    return `${parsed.host} ${method} ${path}`;
+  }
+
+  /** 4.1 入口：返回 true = 已折叠（不落盘）。 */
+  private tryFoldHostSelfCheck(parsed: ParsedRuntimeEvent, event: SecurityEvent): boolean {
+    const pattern = this.hostSelfCheckPatternFor(parsed);
+    if (!pattern) return false;
+    return this.tryFoldIntoAggregate(parsed, event, {
+      category: 'host_self_check',
+      pattern,
+      windowMs: RuntimeHookCollector.HOST_SELF_CHECK_WINDOW_MS,
+      rate: 1,
+    });
+  }
+
+  /** 4.2 入口：返回 true = 已折叠（不落盘）。 */
+  private tryFoldLlmSelfTraffic(parsed: ParsedRuntimeEvent, event: SecurityEvent): boolean {
+    if (!this.isNetworkEvent(parsed)) return false;
+    const key = this.llmSelfTrafficKey(parsed);
+    if (!key) return false;
+    const rate = Math.max(0, Math.floor(this.config.llmSelfTrafficSampleRate ?? 1));
+    if (rate === 0) return false; // 采样关闭：全部即时落盘（仍做 hash 降级）
+    const windowMs = Math.max(
+      1000,
+      this.config.llmSelfTrafficSampleWindowMs ?? RuntimeHookCollector.DEFAULT_LLM_SAMPLE_WINDOW_MS
+    );
+    return this.tryFoldIntoAggregate(parsed, event, {
+      category: 'llm_self_traffic',
+      pattern: key,
+      windowMs,
+      rate,
+    });
+  }
+
+  /**
+   * 窗口聚合核心（4.1/4.2 共用）。
+   *
+   * 窗口键 = `category|pattern|源事件类型`。同键事件：
+   *   - 落入新窗口 ⇒ 先冲刷旧窗口的聚合记录（有折叠才落计数事件），再开新窗；
+   *   - 窗口内且 `emittedInstances < rate` ⇒ 本实例即时落盘（返回 false）；
+   *   - 窗口内且已达采样比 ⇒ 折叠进计数（返回 true）。
+   */
+  private tryFoldIntoAggregate(
+    parsed: ParsedRuntimeEvent,
+    event: SecurityEvent,
+    opts: { category: 'host_self_check' | 'llm_self_traffic'; pattern: string; windowMs: number; rate: number }
+  ): boolean {
+    const windowStart = Math.floor(event.ts / opts.windowMs) * opts.windowMs;
+    const key = `${opts.category}|${opts.pattern}|${event.event_type}`;
+
+    let agg = this.pendingAggregates.get(key);
+    if (agg && agg.windowStart !== windowStart) {
+      this.pendingAggregates.delete(key);
+      this.flushAggregate(agg);
+      agg = undefined;
+    }
+    if (!agg) {
+      agg = {
+        category: opts.category,
+        pattern: opts.pattern,
+        sourceEventType: event.event_type,
+        windowMs: opts.windowMs,
+        windowStart,
+        emittedInstances: 0,
+        folded: 0,
+        firstTs: event.ts,
+        lastTs: event.ts,
+        contentLengthTotal: 0,
+      };
+      this.pendingAggregates.set(key, agg);
+      if (this.pendingAggregates.size > RuntimeHookCollector.MAX_PENDING_AGGREGATES) {
+        // 内存有界：冲刷并丢弃最早插入的一条。
+        const oldest = this.pendingAggregates.keys().next();
+        if (!oldest.done) {
+          const stale = this.pendingAggregates.get(oldest.value);
+          this.pendingAggregates.delete(oldest.value);
+          if (stale) this.flushAggregate(stale);
+        }
+      }
+    }
+
+    agg.lastTs = event.ts;
+    if (opts.category === 'host_self_check') {
+      if (!agg.cmdline) agg.cmdline = parsed.command_line ?? undefined;
+    } else {
+      agg.contentLengthTotal +=
+        typeof parsed.content_length === 'number'
+          ? parsed.content_length
+          : typeof event.content_length === 'number'
+            ? event.content_length
+            : 0;
+      if (agg.bodySha256 === undefined && typeof parsed.body === 'string' && parsed.body.length > 0) {
+        agg.bodySha256 = sha256Hex(parsed.body);
+      }
+    }
+
+    if (agg.emittedInstances < opts.rate) {
+      agg.emittedInstances += 1;
+      return false;
+    }
+    agg.folded += 1;
+    this.stats.eventsFolded += 1;
+    this.stats.aggregatePatterns[opts.pattern] = (this.stats.aggregatePatterns[opts.pattern] || 0) + 1;
+    return true;
+  }
+
+  /** 把一条聚合记录冲刷成 `x_openclaw_self_traffic_aggregate` 事件落盘。 */
+  private flushAggregate(agg: PendingAggregate): void {
+    // 窗口内一条都没折叠 ⇒ 单个实例已完整讲述该窗口，无需计数事件。
+    if (agg.folded === 0) return;
+    const event: SecurityEvent = {
+      comm: 'openclaw',
+      event_id: generateUUID(),
+      event_type: 'x_openclaw_self_traffic_aggregate',
+      layer: 'system',
+      ts: Date.now(),
+      schema_version: 1,
+      pid: process.pid,
+      session_id: null,
+      run_id: null,
+      task_id: null,
+      turn_id: null,
+      agent_id: null,
+      host_id: this.environment.hostId,
+      container_id: this.environment.containerId,
+      pod_name: this.environment.podName,
+      namespace: this.environment.namespace,
+      source: 'openclaw.runtime-hooks.v1',
+      collection_method: 'runtime',
+      collector: {
+        hook_name: 'self_traffic_aggregate',
+        middleware_name: 'sst-security-control-openclaw',
+        collector_name: this.name,
+      },
+      blocked: false,
+      aggregate: {
+        category: agg.category,
+        pattern: agg.pattern,
+        source_event_type: agg.sourceEventType,
+        window_ms: agg.windowMs,
+        window_start: agg.windowStart,
+        count: agg.emittedInstances + agg.folded,
+        first_ts: agg.firstTs,
+        last_ts: agg.lastTs,
+        ...(agg.bodySha256 !== undefined ? { body_sha256: agg.bodySha256 } : {}),
+        ...(agg.category === 'llm_self_traffic'
+          ? { content_length_total: agg.contentLengthTotal }
+          : {}),
+      },
+      ...(agg.cmdline !== undefined ? { cmdline: agg.cmdline } : {}),
+    };
+    this.stats.aggregatesEmitted += 1;
+    this.dispatchEvent(event);
+  }
+
+  /** 冲刷所有窗口已结束的聚合记录（周期调用）。 */
+  private flushExpiredAggregates(now: number): void {
+    for (const [key, agg] of this.pendingAggregates) {
+      if (now >= agg.windowStart + agg.windowMs) {
+        this.pendingAggregates.delete(key);
+        this.flushAggregate(agg);
+      }
+    }
+  }
+
+  /** 冲刷全部聚合记录（关停路径）。 */
+  private flushAllAggregates(): void {
+    for (const [key, agg] of this.pendingAggregates) {
+      this.pendingAggregates.delete(key);
+      this.flushAggregate(agg);
+    }
   }
 
   /**
@@ -912,6 +1202,9 @@ export class RuntimeHookCollector implements ILayerCollector {
       body: parsed.body,
       request_url: parsed.request_url,
       domain_name: parsed.domain_name,
+      // network.js 现在产 risk_flags（internal_host / network_tool），
+      // 与 process_start 通道同口径回灌，否则标签在采集层被静默丢弃（死 flag）。
+      risk_flags: parsed.risk_flags,
       // Five-tuple per network.json.
       local_ip: localIp,
       local_port: localPort,
@@ -932,6 +1225,29 @@ export class RuntimeHookCollector implements ILayerCollector {
       parsed.response_body !== parsed.content
     ) {
       event.response_body = parsed.response_body;
+    }
+
+    // ⭐ 网关 LLM 自有流量的载荷降级 —— body/content 只留
+    // SHA-256 指纹（内容寻址去重/变化检测），原文不进事件流（采样显示
+    // 这一类体量占 network 事件的绝大头）。识别口径与采样闸门一致 ⇒
+    // blocked / 带 risk_flags 的事件识别阶段已绕行，保持全保真。
+    // 权衡：SPL 规则对这类流量的 body 内容匹配（data_leak 类）此后只见
+    // 哈希——网关发往**自家已配置模型 API** 的请求本就低风险（出网前经
+    // hook 脱敏 + host 阻断），且干预评估发生在哈希之前的事件对象上，
+    // 该通道的决策留痕不受影响。
+    if (this.llmSelfTrafficKey(parsed)) {
+      if (typeof event.body === 'string' && event.body.length > 0) {
+        event.body_sha256 = sha256Hex(event.body);
+        event.body = undefined;
+      }
+      if (typeof event.content === 'string' && event.content.length > 0) {
+        event.content_sha256 = sha256Hex(event.content);
+        event.content = undefined;
+      }
+      if (typeof event.response_body === 'string' && event.response_body.length > 0) {
+        event.response_body_sha256 = sha256Hex(event.response_body);
+        event.response_body = undefined;
+      }
     }
 
     if (blocked) {

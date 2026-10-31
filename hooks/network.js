@@ -521,6 +521,38 @@ function buildUrlString(options) {
   return { fullUrl: '', pathname: '', host: '', hostname: '', port: '', protocol: '' };
 }
 
+/**
+ * ⭐ 网络通道 risk_flags：此前 network.js 不产任何
+ * flag（internal_host / network_tool 在字典里却是死 flag）。最小 emitter：
+ *   - internal_host：请求目标是内网/环回/链路本地 IP（127./10./172.16-31./
+ *     192.168./169.254./0.0.0.0/::1/localhost）⇒ 留痕。注意回环默认放行
+ *     （移出 SSRF **阻断**黑名单）是阻断面的事，与 flag 留痕不冲突。
+ *   - network_tool：非 http/https 协议（http.request 的 protocol 维度，
+ *     如 gopher:/file:）⇒ 留痕。
+ */
+function isInternalHostName(hostname) {
+  if (!hostname) return false;
+  const h = String(hostname).toLowerCase().replace(/^\[|\]$/g, '');
+  return (
+    h === 'localhost' ||
+    h === '::1' ||
+    h === '0.0.0.0' ||
+    /^127\./.test(h) ||
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^169\.254\./.test(h) ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)
+  );
+}
+
+function computeNetworkRiskFlags(urlInfo) {
+  const flags = [];
+  if (isInternalHostName(urlInfo.hostname)) flags.push('internal_host');
+  const protocol = typeof urlInfo.protocol === 'string' ? urlInfo.protocol.toLowerCase() : '';
+  if (protocol && protocol !== 'http:' && protocol !== 'https:') flags.push('network_tool');
+  return flags;
+}
+
 function buildNetworkEvent(reqInfo, resInfo, startTime) {
   const ctx = getGlobalContext();
   const urlInfo = buildUrlString(reqInfo.options);
@@ -576,6 +608,9 @@ function buildNetworkEvent(reqInfo, resInfo, startTime) {
   // IP-based consumers (allowlists, geo checks) silently match nothing.
   if (urlInfo.hostname && net.isIP(urlInfo.hostname)) event.remote_ip = urlInfo.hostname;
   if (urlInfo.port) event.remote_port = parseInt(urlInfo.port, 10) || undefined;
+
+  const riskFlags = computeNetworkRiskFlags(urlInfo);
+  if (riskFlags.length > 0) event.risk_flags = riskFlags;
 
   return event;
 }
@@ -1601,6 +1636,9 @@ module.exports = {
   install,
   uninstall,
   buildNetworkEvent,
+  // ⭐ 网络通道 risk_flags 判定（测试可直接对拍）。
+  computeNetworkRiskFlags,
+  isInternalHostName,
   headersToRawString,
   redactSensitiveBody,
   buildUrlString,

@@ -31,16 +31,20 @@ const rules: PolicyRule[] = parseSPLPolicy(loadYaml(readFileSync(POLICY_PATH, 'u
 // 生产代码源码（drift-guard 静态比对用；不执行 runtime.js，避免其
 // require 即 install() 的副作用）。
 const RUNTIME_HOOK_SOURCE = readFileSync(resolve('hooks/runtime.js'), 'utf8');
+// network.js 现在也产 risk_flags（internal_host / network_tool），
+// drift-guard 同样扫描其字面 push。
+const NETWORK_HOOK_SOURCE = readFileSync(resolve('hooks/network.js'), 'utf8');
 const STORE_SOURCE = readFileSync(resolve('src/store.ts'), 'utf8');
 
 /**
- * 运行时风险标签注册表：与 hooks/runtime.js computeRiskFlags() 的产出严格
- * 一一对应—— 起纯正则 flag 改由构建产物 hooks/generated-patterns.json
- * 承载（动态 push），代码内只剩代码驱动 flag 的字面 push；下方 drift-guard
- * 用例因此改为「字面 push ∪ 生成产物 flag 键」比对本注册表。runtime-hook-collector 把 hook
- * 事件里的 risk_flags 原样回灌 process_start / network_http 评估上下文
- * （store.ts evaluateRuntimeEvent），因此这就是 riskFlagsAny/All 的全部
- * 合法取值来源。drift-guard 用例比对 runtime.js 源码，防止两侧漂移。
+ * 运行时风险标签注册表：与 hooks/runtime.js computeRiskFlags() +
+ * hooks/network.js 网络通道 flag 的产出严格一一对应—— 起纯正则 flag 改由
+ * 构建产物 hooks/generated-patterns.json 承载（动态 push），代码内只剩代码
+ * 驱动 flag 的字面 push；下方 drift-guard 用例因此改为「runtime.js 字面 push
+ * ∪ network.js 字面 push ∪ 生成产物 flag 键」比对本注册表。runtime-hook-
+ * collector 把 hook 事件里的 risk_flags 原样回灌 process_start / network_http
+ * 评估上下文（store.ts evaluateRuntimeEvent），因此这就是 riskFlagsAny/All
+ * 的全部合法取值来源。drift-guard 用例比对两 hook 源码，防止两侧漂移。
  */
 const RUNTIME_RISK_FLAGS: readonly string[] = [
   'background_execution',
@@ -52,17 +56,25 @@ const RUNTIME_RISK_FLAGS: readonly string[] = [
   'file_deletion',
   // ：env 被剥离但 hook 已补回去时打标（不是绕过，只是留痕）。
   'hook_env_reinjected',
+  // 网络通道回环/内网/链路本地目标留痕。
+  'internal_host',
   'mass_deletion',
   'network_tool',
   'pipe_to_shell',
   'privilege_escalation',
   'reverse_shell',
+  // /tmp|/var/tmp|/dev/shm 下解释器/脚本派生留痕。
+  'scratch_dir_spawn',
+  // 读类命令读取受保护策略/审计文件留痕。
+  'self_protection_behavior',
   // ：hook 传播被显式跳过（explicit_skip）或 env 剥离后重注入
   // （env_stripped）时打标，注册表同步收录。
   'self_protection_bypass',
   'sensitive_file_access',
   'shell_involved',
   'skill_binary_execution',
+  // npm install git+https / 直接 URL 形态留痕。
+  'supply_chain',
   'suspicious_encoding',
   'token_in_command',
 ];
@@ -76,10 +88,11 @@ const RUNTIME_RISK_FLAGS: readonly string[] = [
  * - agent_tool_result：afterToolCall → buildToolResultInterventionContext
  *   （事后评估，决策只写事件标注）
  *
- * injectsRiskFlags：该入口是否回灌 riskFlags。仅 runtime hook 事件路径携带
- * risk_flags（network.js 不产出标签，normalizeNetworkEvent 也不映射，故
- * network_http 恒为 undefined）；agent_* 入口的上下文构建回填
- * sessionRiskFlags 沉淀（recentRiskFlags），不属于 runtime 标签直灌。
+ * injectsRiskFlags：该入口是否回灌 riskFlags。runtime hook 事件路径携带
+ * risk_flags：process_start 由 runtime.js 产出；network_http 自网络通道起
+ * 由 network.js 产出（internal_host / network_tool），normalizeNetworkEvent
+ * 同口径映射，store.ts evaluateRuntimeEvent 统一回灌。agent_* 入口的上下文
+ * 构建回填 sessionRiskFlags 沉淀（recentRiskFlags），不属于 runtime 标签直灌。
  *
  * historyTool：该入口写入 ActionHistory 时 ActionRecord.tool 使用的名字
  * （chain 链节按此校验方向可达性）；agent_start / agent_message /
@@ -90,7 +103,7 @@ const RUNTIME_ENTRIES: Record<string, { injectsRiskFlags: boolean; historyTool?:
   agent_message: { injectsRiskFlags: false },
   agent_start: { injectsRiskFlags: false },
   process_start: { injectsRiskFlags: true, historyTool: 'process_start' },
-  network_http: { injectsRiskFlags: false, historyTool: 'network_http' },
+  network_http: { injectsRiskFlags: true, historyTool: 'network_http' },
   agent_tool_result: { injectsRiskFlags: false },
 };
 
@@ -271,14 +284,17 @@ export function testCaseReachabilityProblems(rule: PolicyRule, tc: PolicyRuleTes
 }
 
 describe('runtime reachability registry drift guards', () => {
-  it('risk flag registry matches hooks/runtime.js computeRiskFlags production', () => {
+  it('risk flag registry matches hooks/runtime.js + hooks/network.js production', () => {
     const literalPushes = [...RUNTIME_HOOK_SOURCE.matchAll(/flags\.push\('([^']+)'\)/g)].map(
+      (m) => m[1]
+    );
+    const networkPushes = [...NETWORK_HOOK_SOURCE.matchAll(/flags\.push\('([^']+)'\)/g)].map(
       (m) => m[1]
     );
     const generated = JSON.parse(readFileSync(resolve('hooks/generated-patterns.json'), 'utf8')) as {
       flags: Record<string, unknown>;
     };
-    const produced = new Set([...literalPushes, ...Object.keys(generated.flags)]);
+    const produced = new Set([...literalPushes, ...networkPushes, ...Object.keys(generated.flags)]);
     expect(new Set(RUNTIME_RISK_FLAGS)).toEqual(produced);
   });
 

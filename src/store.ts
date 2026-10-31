@@ -644,6 +644,16 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
   // 面板持久状态条；undefined 表示 bootstrap 未上报（legacy 加载路径）。
   private runtimeHookProbeLoaded?: boolean;
   private runtimeHooksUserEnabled?: boolean;
+  /**
+   * ⭐ **runtime enforce 生效状态**——
+   *   `configureRuntimeHookEnvironment` 的计算结果（
+   *   `intervention.enabled && mode==='enforce' && runtimeHooks.enabled`）。
+   *
+   * 此前的状态**零留痕**：进程层 runtime enforce 默认关（report-only），
+   *   从事件流 / 面板无法区分「report-only」与「enforce 生效」⇒ 初始化完成时
+   *   落一条 `x_openclaw_enforce_state` 状态事件，并把结果挂进 `getStatus()`。
+   */
+  private runtimeEnforceActive = false;
 
   constructor(config?: SecurityMonitorConfig) {
     this.config = config || normalizeConfig({});
@@ -899,6 +909,8 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     process.env.OPENCLAW_NETWORK_HOOK_ENABLED = networkEnabled ? 'true' : 'false';
 
     const enforceEnabled = intervention?.enabled && intervention?.mode === 'enforce' && runtimeHooks?.enabled;
+    // ⭐ 留作启动状态事件的权威值（5.3）—— pin 写入与 env 写入都以它为源。
+    this.runtimeEnforceActive = enforceEnabled === true;
 
     // ⭐ #469-A：模式级 Tier-1 阻断的开关（默认开启）。
     //
@@ -1022,6 +1034,14 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
         `failStrategy=${c.intervention?.failStrategy ?? 'n/a'} ` +
         `outputPath=${c.collector?.ndjsonPath ?? 'n/a'}`
     );
+
+    // ⭐ 执法生效状态留痕 —— initialize 收口时落一条
+    //   `x_openclaw_enforce_state`：report-only 与 enforce 生效此前**零留痕**
+    //   （事件流 / 面板都无从区分）。fire-and-forget（同 startSelfProtectionSelfCheck
+    //   口径）：留痕失败只打日志，绝不阻塞 / 不弄挂 initialize。
+    void this.emitEnforceStateEvent().catch((err) => {
+      console.error('[SecurityMonitorStore] failed to emit x_openclaw_enforce_state:', err);
+    });
 
     // 启动自保护自检：引擎规则空载 / 关键文件被删截断 → 留痕事件。
     this.startSelfProtectionSelfCheck();
@@ -1713,8 +1733,45 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     });
   }
 
+  /**
+   * ⭐ **执法生效状态留痕** —— `x_openclaw_enforce_state`。
+   *
+   * 内容口径：
+   *   - `runtime_hooks_enabled`：post-bootstrap 的配置值（bootstrap 探针
+   *     强制降级后的**实际生效值**，与操作员原始意图 `runtimeHooksUserEnabled`
+   *     区分）；
+   *   - `enforce_enabled`：`configureRuntimeHookEnvironment` 的计算结果
+   *     （report-only = false / enforce 生效 = true）；
+   *   - `intervention_mode`：audit / enforce；
+   *   - `hook_env_pinned`：OPENCLAW_RUNTIME_ENFORCE 是否已 pin（= enforce_enabled，
+   *     pin 只在 enforce 分支写 'true'）；
+   *   - `runtime_hook_loaded`：bootstrap NODE_OPTIONS 探针结果（null = 未上报）。
+   *
+   * 事件类型是平台**未登记**扩展名（与 process / policy / rule 系列同类）⇒
+   *   平台只校验公共字段、原文入库；状态细节全部走顶层 detail 字段，
+   *   不进任何已登记 per-type schema。
+   */
+  private async emitEnforceStateEvent(): Promise<void> {
+    const c = this.config;
+    const enforceEnabled = this.runtimeEnforceActive;
+    await this.emitSelfProtectionEvent('x_openclaw_enforce_state', {
+      severity: 'info',
+      risk_flags: [],
+      detail:
+        `runtime enforce state: mode=${c.intervention?.mode ?? 'n/a'} ` +
+        `runtimeHooks.enabled=${c.application?.runtimeHooks?.enabled === true} ` +
+        `enforceEnabled=${enforceEnabled} ` +
+        `hookEnvPinned=${enforceEnabled}`,
+      runtime_hooks_enabled: c.application?.runtimeHooks?.enabled === true,
+      enforce_enabled: enforceEnabled,
+      intervention_mode: c.intervention?.mode ?? null,
+      hook_env_pinned: enforceEnabled,
+      runtime_hook_loaded: this.runtimeHookProbeLoaded ?? null,
+    });
+  }
+
   private async emitSelfProtectionEvent(
-    eventType: 'x_openclaw_protection_degraded' | 'x_openclaw_tamper_detected' | 'x_openclaw_runtime_hook_unloaded' | PolicyAuditEvent['eventType'],
+    eventType: 'x_openclaw_protection_degraded' | 'x_openclaw_tamper_detected' | 'x_openclaw_runtime_hook_unloaded' | 'x_openclaw_enforce_state' | PolicyAuditEvent['eventType'],
     detail: Record<string, unknown>
   ): Promise<void> {
     const env = this.config.environment || {};
@@ -1759,7 +1816,20 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
     });
   }
 
-  getStatus(): { enabled: boolean; runtimeHookLoaded: boolean | null; runtimeHooksEnabled: boolean | null; runtimeHookPath: string; stats: Record<string, unknown> } {
+  getStatus(): {
+    enabled: boolean;
+    runtimeHookLoaded: boolean | null;
+    runtimeHooksEnabled: boolean | null;
+    runtimeHookPath: string;
+    /**
+     * ⭐ **runtime enforce 是否实际生效** —
+     *   `intervention.enabled && mode==='enforce' && runtimeHooks.enabled`
+     *   的计算结果。`false` = report-only（runtime hook 进程层**不拦**），
+     *   `true` = enforce 生效。启动时同步落 `x_openclaw_enforce_state` 事件。
+     */
+    enforceEnabled: boolean;
+    stats: Record<string, unknown>;
+  } {
     return {
       enabled: this.enabled,
       // 面板持久状态条数据源。runtimeHookLoaded 是 bootstrap 探测
@@ -1770,6 +1840,8 @@ export class SecurityMonitorStore implements OpenClawMiddleware {
       // NODE_OPTIONS 该指向哪条绝对路径。现读现算（纯环境派生），面板在
       // 提示条上直接把它印出来，用户不必去猜容器里的 home 是不是 /home/node。
       runtimeHookPath: resolvePreloadTarget(),
+      // ⭐ runtime enforce 生效状态 —— report-only vs enforce。
+      enforceEnabled: this.runtimeEnforceActive,
       stats: {
         collector: this.collector.getStats(),
         application: this.applicationCollector.getStats?.(),

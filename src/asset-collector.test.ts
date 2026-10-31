@@ -404,15 +404,6 @@ describe('AssetCollector', () => {
       fs.writeFileSync(lockFilePath(), typeof payload === 'string' ? payload : JSON.stringify(payload), 'utf8');
     }
 
-    async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        if (cond()) return true;
-        await new Promise((r) => setTimeout(r, 25));
-      }
-      return cond();
-    }
-
     /** A pid that is guaranteed dead: spawn a child, let it exit, reuse its pid. */
     async function deadPid(): Promise<number> {
       const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
@@ -452,20 +443,24 @@ describe('AssetCollector', () => {
       try {
         writeLock({ pid: holder.pid, acquiredAt: Date.now() });
 
-        const c = track(createCollector(fixture, reported, { scanIntervalMs: 100 }));
+        const c = track(createCollector(fixture, reported));
         await c.initialize();
 
-        // 存活持有者 + 新鲜锁：本进程不扫描。
+        // 存活持有者 + 新鲜锁：本进程不扫描（initialize 的首扫即 stand down）。
         expect(reported.some((e) => e.event_type === 'asset_add')).toBe(false);
 
-        // 持有者死亡后：下一次 tick 检出伪造签名（新鲜时间戳 + 死 pid），
+        // 持有者**真正退出后**（等 exit 事件 —— 事件驱动，不是 sleep）：
+        // 一个 leader 周期内检出伪造签名（新鲜时间戳 + 死 pid），
         // 发 x_openclaw_tamper_detected 并回收锁，扫描恢复。
-        holder.kill('SIGKILL');
-        const resumed = await waitFor(
-          () => reported.some((e) => e.event_type === 'asset_add'),
-          5000
-        );
-        expect(resumed).toBe(true);
+        // ⭐ 全程用 runLeaderCycle() 同步驱动（与 100ms 定时器同一码路径），
+        //   不断言任何 wall-clock 时序 ⇒ 整机负载下不再抖动。
+        await new Promise<void>((resolve) => {
+          holder.once('exit', () => resolve());
+          holder.kill('SIGKILL');
+        });
+        await c.runLeaderCycle();
+
+        expect(reported.some((e) => e.event_type === 'asset_add')).toBe(true);
         expect(reported.some((e) => e.event_type === 'x_openclaw_tamper_detected' && e.kind === 'forged_lock')).toBe(true);
       } finally {
         holder.kill('SIGKILL');
@@ -473,32 +468,33 @@ describe('AssetCollector', () => {
     });
 
     it('detects a lock replaced under a live holder (nonce mismatch) and re-asserts ownership', async () => {
-      const c = track(createCollector(fixture, reported, { scanIntervalMs: 100 }));
+      const c = track(createCollector(fixture, reported));
       await c.initialize();
 
-      // 等 timer tick 建立持有（initialize 首扫后会释放锁）。
-      const hasLock = await waitFor(() => fs.existsSync(lockFilePath()), 3000);
-      expect(hasLock).toBe(true);
+      // ① 第一个 leader 周期：initialize 首扫后已释放锁 ⇒ 本周期重新创建锁。
+      //   ⭐ 全程 runLeaderCycle() 同步驱动（与定时器同一码路径），
+      //     scanIntervalMs 默认 60s ⇒ 定时器全程不参与 ⇒ 零 wall-clock 依赖。
+      await c.runLeaderCycle();
+      expect(fs.existsSync(lockFilePath())).toBe(true);
 
-      // 同 UID 攻击者用我们的 pid 重写锁文件（nonce 不同）。
+      // ② 同 UID 攻击者用我们的 pid 重写锁文件（nonce 不同）。
       writeLock({ pid: process.pid, acquiredAt: Date.now(), nonce: 'forged-nonce' });
 
-      const detected = await waitFor(
-        () => reported.some((e) => e.event_type === 'x_openclaw_tamper_detected' && e.kind === 'lock_replaced'),
-        5000
-      );
-      expect(detected).toBe(true);
+      // ③ 第二个 leader 周期：检出 nonce 不匹配 ⇒ 留痕 lock_replaced，
+      //   并把锁**顶回自己的 nonce**（writeFile 已在周期内 await 完成）。
+      await c.runLeaderCycle();
 
-      // 攻击者的锁被顶掉：nonce 恢复为持有者自己的值。
-      const reclaimed = await waitFor(() => {
-        try {
-          const data = JSON.parse(fs.readFileSync(lockFilePath(), 'utf8'));
-          return data.nonce && data.nonce !== 'forged-nonce' && data.pid === process.pid;
-        } catch {
-          return false;
-        }
-      }, 3000);
-      expect(reclaimed).toBe(true);
+      const tamper = reported.find(
+        (e) => e.event_type === 'x_openclaw_tamper_detected' && e.kind === 'lock_replaced'
+      );
+      expect(tamper).toBeDefined();
+
+      // 攻击者的锁被顶掉：nonce 恢复为持有者自己的值（③ 已同步落盘 ⇒ 直接读，无需轮询）。
+      const data = JSON.parse(fs.readFileSync(lockFilePath(), 'utf8'));
+      expect(typeof data.nonce).toBe('string');
+      expect(data.nonce.length).toBeGreaterThan(0);
+      expect(data.nonce).not.toBe('forged-nonce');
+      expect(data.pid).toBe(process.pid);
       // 扫描一直在继续（未被抑制）。
       expect(reported.some((e) => e.event_type === 'asset_add')).toBe(true);
     });

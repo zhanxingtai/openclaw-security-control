@@ -83,6 +83,15 @@ const ALLOWED_EVENT_TYPES: ReadonlySet<string> = new Set([
   // self-protection + policy audit events
   'x_openclaw_protection_degraded',
   'x_openclaw_tamper_detected',
+  // ⭐ 执法生效状态留痕 —— 未登记扩展名（与 process / policy / rule 系列
+  //   同类）：只校验公共字段，原文入库 ⇒ 面板可读。
+  'x_openclaw_enforce_state',
+  // 自保护事件（store.ts emitSelfProtectionEvent 发射，此前漏登记）。
+  'x_openclaw_runtime_hook_unloaded',
+  // ⭐ 事件降噪聚合计数 —— 未登记扩展名：宿主自检 / 网关 LLM 自有流量的
+  //   窗口折叠计数（首个实例即时落盘，同窗口重复折叠进 count），载荷在顶层
+  //   `aggregate` 字段。
+  'x_openclaw_self_traffic_aggregate',
   'policy_missing',
   'policy_load_failed',
   'policy_empty',

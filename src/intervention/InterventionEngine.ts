@@ -24,6 +24,44 @@ import { DecisionComposer } from './DecisionComposer.js';
 import { GuidanceEngine } from './GuidanceEngine.js';
 import { canonicalizeContextActionType } from './splActionType.js';
 
+/**
+ * ⭐ 认证配置写豁免（2026-10-31 可用性红线）：与 hooks/runtime.js 的
+ * isCredentialConfigWrite 同语义。认证配置文件（~/.openclaw/openclaw.json，
+ * 含 gateway.auth.token 等认证轴）的改写在**任何模式、任何通路**下只告警
+ * 不阻断——误拦会导致客户系统无法登录，损害不可逆。
+ *
+ * 本函数约束的是引擎 fail_open_high_risk_only **错误回退**路径：该路径在
+ * 规则求值失败时仅凭 ctx.riskFlags ∩ highRiskFlags（含 token_in_command）
+ * 就 block ⇒ 认证配置写会被错误回退连带阻断 ⇒ 命中本形态时从回退的
+ * 高危判定中剔除 token_in_command。正常规则路径由 warn-credential-config-write
+ * 承接 warn 留痕，不经此回退。
+ */
+const CREDENTIAL_CONFIG_WRITE_TOOLS = new Set([
+  'gateway',
+  'Gateway',
+  'config_manager',
+  'plugin_manager',
+  'extension_manager',
+  'openclaw_gateway',
+  'core.gateway',
+  'plugin_uninstall',
+  'extension_uninstall',
+  'manage_plugin',
+]);
+const CREDENTIAL_CONFIG_WRITE_ACTION_RE = /^config\.(patch|set|update|put|write|delete|remove|unset|replace|merge|edit)$/i;
+const CREDENTIAL_CONFIG_WRITE_PATH_RE = /\.openclaw[/\\]openclaw\.json$|gateway\.auth\.|(?:^|\.)(?:token|secret|password|api[_-]?key)(?:\.|$)/i;
+
+function isCredentialConfigWriteContext(ctx: InterventionContext): boolean {
+  if (ctx.actionType !== 'agent_tool_call') return false;
+  const tool = typeof ctx.toolName === 'string' ? ctx.toolName : '';
+  if (!CREDENTIAL_CONFIG_WRITE_TOOLS.has(tool)) return false;
+  const params = ctx.params || {};
+  const action = typeof params.action === 'string' ? params.action : '';
+  if (!CREDENTIAL_CONFIG_WRITE_ACTION_RE.test(action)) return false;
+  const path = typeof params.path === 'string' ? params.path : '';
+  return CREDENTIAL_CONFIG_WRITE_PATH_RE.test(path);
+}
+
 export class InterventionEngineImpl {
   private options: InterventionEngineOptions;
   private loader: RuleLoader;
@@ -464,7 +502,13 @@ export class InterventionEngineImpl {
       } else if (!riskLevel) {
         // No explicit risk_level on matched rules: fall back to legacy high-risk flags.
         const flags = ctx.riskFlags || [];
-        isHighRisk = (this.options.highRiskFlags || []).some((f) => flags.includes(f));
+        // 认证配置写豁免（可用性红线）：命中形态时 token_in_command 不参与
+        // 回退高危判定——错误回退也不得阻断认证配置改写，其余 flag 照常。
+        const effectiveFlags =
+          flags.length > 0 && isCredentialConfigWriteContext(ctx)
+            ? flags.filter((f) => f !== 'token_in_command')
+            : flags;
+        isHighRisk = (this.options.highRiskFlags || []).some((f) => effectiveFlags.includes(f));
       }
       if (isHighRisk) {
         return {

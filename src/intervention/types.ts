@@ -232,6 +232,17 @@ export interface SecurityDecision {
   priority?: number;
   /** Risk level of the matched rule. */
   riskLevel?: 'low' | 'medium' | 'high' | 'critical' | 'extreme';
+
+  // 升级路径留痕 —— 语义升级状态机在**不改写原始决策对象**的前提下返回带这
+  // 两个字段的新对象；事件层据此区分「规则自身 block」与「升级后 block」。
+  // duck-type 写入口径：!== undefined 才写，缺省缺席。
+  /**
+   * 决策升级来源：非空 = 最终决策是**升级产物**而非单条规则的原始裁决。
+   * 取值如 'semantic_escalation'（语义升级状态机）。
+   */
+  upgradedBy?: string;
+  /** 升级前的原始决策（如语义升级前判的是 audit）。 */
+  originalDecision?: RuntimeDecisionType;
 }
 
 export interface InterventionContext {

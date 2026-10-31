@@ -44,6 +44,17 @@ const PATH_KEYS = new Set([
 /** 全文面锚点键（code-mode 程序原文）。 */
 export const CODE_CONTENT_KEY = 'code_content';
 
+/**
+ * 是否为「命令面」键 —— 命令形态规则在这类键上匹配
+ * （`command` / `cmd` / `script` … 与全文面锚点 `code_content`）。
+ *
+ * ⭐ 供申诉归因：code-mode 命中证据落在这些键上、且
+ *   命令面未被收窄成实参列表时，命中面 = 整段程序文本（非实参）。
+ */
+export function isCommandSurfaceKey(field: string): boolean {
+  return COMMAND_KEYS.has(field.toLowerCase()) || field === CODE_CONTENT_KEY;
+}
+
 /** 变量绑定解析深度上限（防互相引用导致的递归）。 */
 const MAX_RESOLVE_DEPTH = 4;
 

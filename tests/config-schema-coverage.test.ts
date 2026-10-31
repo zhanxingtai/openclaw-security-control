@@ -34,6 +34,14 @@ const JSON_ONLY_KEYS: Record<string, string> = {
   "application.runtimeHooks.excludeHostInternalProbeCommands": "宿主只读探针排除开关（开关会静默少采宿主自身探活事件，JSON-only）",
   "application.runtimeHooks.maxContentLength": "runtime 采集事件单字段长度上限（调优参数）",
   "application.runtimeHooks.blockPatternsEnabled": "runtime hook 模式级 Tier-1 阻断开关（关掉即少一档阻断能力，JSON-only）",
+  // ⭐ 事件降噪：折叠/采样通道开关——开着会静默少采事件，与上面
+  //    排除类开关同口径留 JSON-only。
+  "application.runtimeHooks.aggregateHostSelfChecks": "宿主自检命令分钟级聚合开关（关掉即逐条落盘自检噪音，JSON-only）",
+  "application.runtimeHooks.llmSelfTrafficHosts": "网关 LLM 自有流量识别名单（后缀匹配数组，误配漏采样）",
+  "application.runtimeHooks.llmSelfTrafficSampleRate": "LLM 自有流量采样比（每窗口每 host+method+path 即时落盘条数，调优参数）",
+  "application.runtimeHooks.llmSelfTrafficSampleWindowMs": "LLM 自有流量采样窗口长度（调优参数）",
+  // ── application：降噪折叠开关（同排除类口径，JSON-only）──
+  "application.foldIntermediateToolResults": "中间态工具结果折叠开关（关掉即逐条落 wait/轮询 result，JSON-only）",
   // ── network：整层未实现占位（network.enabled 不进 UI；其余子项亦为占位），
   //    网络拦截请走 Runtime Hooks ──
   "network.enabled": "网络层总开关未实现（占位，未来功能；手改 JSON 仍触发 dangerous 警告）",

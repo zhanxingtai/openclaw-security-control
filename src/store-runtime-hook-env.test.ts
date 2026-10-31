@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, copyFileSync } from 'fs';
+import { mkdtempSync, copyFileSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { SecurityMonitorStore } from './store.js';
@@ -306,6 +306,127 @@ describe('runtime hook 环境传播', () => {
       expect(
         runtimeHook.shouldBlock({ risk_flags: [] }, { command_line: SHADOW_CMD })
       ).toBeUndefined();
+    });
+  });
+
+  // ⭐ enforce 生效状态可观测。
+  //
+  // 现状缺口：runtime enforce 默认关（report-only），生效与否**零留痕** ——
+  // 事件流 / 面板无从区分「report-only」与「enforce 生效」。initialize 收口时
+  // 落一条 `x_openclaw_enforce_state` 状态事件（fire-and-forget + flush），
+  // 内容含 runtimeHooks.enabled / enforceEnabled / mode / hook env pin /
+  // runtime hook 探针结果；同时挂进 getStatus().enforceEnabled。
+  describe('enforce 生效状态留痕（x_openclaw_enforce_state）', () => {
+    /**
+     * 状态事件 fire-and-forget 落盘 ⇒ 短轮询等待；取**最后一条**匹配。
+     * `minCount`：复用同一 ndjsonPath 时，等到第 N 条再返回（防止读到上一次
+     * initialize 的存量事件）。
+     */
+    async function readEnforceEvent(minCount = 1): Promise<Record<string, unknown> | undefined> {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        if (existsSync(ndjsonPath)) {
+          const hits = readFileSync(ndjsonPath, 'utf8')
+            .split('\n')
+            .filter((l) => l.trim())
+            .map((l) => JSON.parse(l) as Record<string, unknown>)
+            .filter((e) => e.event_type === 'x_openclaw_enforce_state');
+          if (hits.length >= minCount) return hits[hits.length - 1];
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return undefined;
+    }
+
+    it('默认配置（runtimeHooks.enabled=false）：状态事件为 report-only', async () => {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          application: { enabled: true, runtimeHooks: { enabled: false } },
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+
+      const ev = await readEnforceEvent();
+      expect(ev).toBeDefined();
+      expect(ev!.enforce_enabled).toBe(false);
+      expect(ev!.runtime_hooks_enabled).toBe(false);
+      expect(ev!.intervention_mode).toBe('enforce');
+      expect(ev!.hook_env_pinned).toBe(false);
+      // 与 env 实际状态互证：report-only 下 enforce env 未置位。
+      expect(process.env.OPENCLAW_RUNTIME_ENFORCE).toBeUndefined();
+    });
+
+    it('enforce 配置（runtimeHooks.enabled=true + enforce 模式）：状态事件为 enforce', async () => {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+
+      const ev = await readEnforceEvent();
+      expect(ev).toBeDefined();
+      expect(ev!.enforce_enabled).toBe(true);
+      expect(ev!.runtime_hooks_enabled).toBe(true);
+      expect(ev!.hook_env_pinned).toBe(true);
+      expect(process.env.OPENCLAW_RUNTIME_ENFORCE).toBe('true');
+    });
+
+    it('audit 模式 + runtimeHooks.enabled=true：仍 report-only，mode 可见', async () => {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          intervention: { enabled: true, mode: 'audit', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+
+      const ev = await readEnforceEvent();
+      expect(ev).toBeDefined();
+      expect(ev!.enforce_enabled).toBe(false);
+      expect(ev!.intervention_mode).toBe('audit');
+      expect(process.env.OPENCLAW_RUNTIME_ENFORCE).toBeUndefined();
+    });
+
+    it('状态事件不带 SDK 私有字段（OSS 无 SDK 形态，通用字段以外一律不发射）', async () => {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+
+      const ev = await readEnforceEvent();
+      expect(ev).toBeDefined();
+      expect(ev!.runtime_hook_loaded).toBeNull();
+      for (const sdkField of ['engine', 'decision_source', 'sdk_loaded', 'sdk_load_state', 'sdk_version', 'semantic_active']) {
+        expect(ev![sdkField], `enforce_state 事件不得携带 SDK 私有字段 ${sdkField}`).toBeUndefined();
+      }
+    });
+
+    it('getStatus().enforceEnabled 与状态事件一致（report-only / enforce 两档）', async () => {
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          application: { enabled: true, runtimeHooks: { enabled: false } },
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+      expect(store.getStatus().enforceEnabled).toBe(false);
+      const reportOnlyEv = await readEnforceEvent();
+      expect(reportOnlyEv!.enforce_enabled).toBe(false);
+
+      await store.shutdown();
+      store = new SecurityMonitorStore();
+      await store.initialize(
+        baseConfig({
+          intervention: { enabled: true, mode: 'enforce', policyPath, reloadIntervalMs: 0 },
+        })
+      );
+      expect(store.getStatus().enforceEnabled).toBe(true);
+      // 同一 ndjsonPath 已有 phase-1 事件 ⇒ 等第 2 条状态事件落盘。
+      const enforceEv = await readEnforceEvent(2);
+      expect(enforceEv!.enforce_enabled).toBe(true);
     });
   });
 });

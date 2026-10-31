@@ -276,6 +276,9 @@ rules:
     severity: critical
     notes: |
       网关配置写指向插件禁用/移除。良性重启不在拦截面，重启的意图判别由 SelfProtection 层完成。
+      ⭐ 2026-10-31 可用性红线：path 轴的 openclaw.json 臂已移出（认证配置改写
+      只告警不阻断，见 warn-credential-config-write）；raw/value/content 轴的
+      openclaw.json × 插件 id 自伤锚定保留——禁用插件的改写仍 block。
     match:
       actionType:
         - agent_tool_call
@@ -306,7 +309,10 @@ rules:
           - plugins?\.entries\.openclaw[-_]?security[-_]?monitor
           - plugins?\.entries\.sst-security-control-openclaw
           - extensions?\.entries\.(?:openclaw[-_]?security[-_]?monitor|sst-security-control-openclaw)
-          - \.openclaw[/\\]openclaw\.json$
+          # ⭐ 2026-10-31 可用性红线：openclaw.json（认证配置）path 臂移出——改写
+          # gateway.auth.token 等会导致客户系统无法登录 ⇒ 任何通路只告警不阻断
+          # （warn-credential-config-write 承接）。本规则的 raw/value/content 轴
+          # 仍保留 openclaw.json × 插件 id 自伤锚定（禁用插件的改写仍 block）。
         raw:
           - openclaw[-_]?security[-_]?monitor.*\benabled\b\s*[:=]\s*false
           - openclaw[-_]?security[-_]?monitor.*\bdisabl
@@ -463,13 +469,17 @@ rules:
         expectedDecision: allow
 
   - id: self-protection-block-gateway-config-write
-    name: 阻止通过 gateway 写操作改写插件准入/自身配置路径
+    name: 阻止通过 gateway 写操作改写插件准入配置路径
     enabled: true
     priority: 1100
     category: self_protection
     severity: critical
     notes: |
-      config 写轴收敛到危险 path（plugins / extensions / openclaw.json），其余配置写放行。paramsRegex 是跨 key AND，需 target 轴的场景必须拆规则。
+      config 写轴收敛到危险 path（plugins / extensions），其余配置写放行。paramsRegex 是跨 key AND，需 target 轴的场景必须拆规则。
+      ⭐ 2026-10-31 可用性红线拆分：openclaw.json（认证配置）臂移出本规则——
+      改写 gateway.auth.token 等会导致客户系统无法登录，损害不可逆 ⇒ 任何通路
+      只告警不阻断，由 warn-credential-config-write 承接（warn 留痕）。本规则的
+      插件准入臂（plugins/extensions）block + 不可申诉保持不变（防卸载自保护）。
     match:
       actionType:
         - agent_tool_call
@@ -492,10 +502,9 @@ rules:
           - plugins?\.entries\.openclaw[-_]?security[-_]?monitor
           - plugins?\.entries\.sst-security-control-openclaw
           - extensions?\.entries\.(?:openclaw[-_]?security[-_]?monitor|sst-security-control-openclaw)
-          - \.openclaw[/\\]openclaw\.json$
     action:
       decision: block
-      blockReason: 通过 gateway 接口改写插件准入/自身配置路径被安全策略阻断
+      blockReason: 通过 gateway 接口改写插件准入配置路径被安全策略阻断
       blockCode: SELF_PROTECTION_GATEWAY_CONFIG_WRITE_001
       appealable: false
     testCases:
@@ -517,6 +526,12 @@ rules:
           toolName: config_manager
           params: { action: "config.unset", path: "plugins.entries.openclaw-security_monitor" }
         expectedDecision: block
+      - name: 认证配置写 openclaw.json 不再被本规则拦截（负向；可用性红线，改由 warn-credential-config-write 仅告警）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: ".openclaw/openclaw.json" }
+        expectedDecision: warn
       - name: 良性配置写 logging.level 不命中（目标路径不在危险集合）
         input:
           actionType: agent_tool_call
@@ -534,6 +549,77 @@ rules:
           actionType: agent_tool_call
           toolName: config_manager
           params: { action: "config.unset", path: "experimental.flag" }
+        expectedDecision: allow
+
+  - id: warn-credential-config-write
+    name: 认证配置文件改写仅告警不拦截（可用性红线）
+    enabled: true
+    priority: 1050
+    category: self_protection
+    severity: medium
+    notes: |
+      2026-10-31 可用性红线：认证配置文件（~/.openclaw/openclaw.json，含
+      gateway.auth.token 等认证轴）的改写只告警不阻断——误拦会导致客户系统
+      无法登录，损害不可逆。本规则从 self-protection-block-gateway-config-write
+      拆出（原 block+不可申诉臂），承接 openclaw.json 写轴与认证语义轴
+      （gateway\.auth\. / token / secret / password / api[_-]?key）的 warn 留痕。
+      插件准入臂（plugins/extensions）仍在原规则 block，与本规则互斥。
+    match:
+      actionType:
+        - agent_tool_call
+      toolName:
+        - gateway
+        - Gateway
+        - config_manager
+        - plugin_manager
+        - extension_manager
+        - openclaw_gateway
+        - core.gateway
+        - plugin_uninstall
+        - extension_uninstall
+        - manage_plugin
+      paramsRegex:
+        action:
+          - ^config\.(patch|set|update|put|write|delete|remove|unset|replace|merge|edit)$
+        path:
+          - \.openclaw[/\\]openclaw\.json$
+          - gateway\.auth\.
+          - (?:^|\.)(?:token|secret|password|api[_-]?key)(?:\.|$)
+    action:
+      decision: warn
+      warnReason: 认证配置文件改写按策略仅告警不拦截（保护客户登录可用性）
+      # decision=warn 不应配 blockCode——blockCode 仅对 decision=block 有意义。
+      appealable: true
+    testCases:
+      - name: config.set 写认证轴 gateway.auth.token 仅告警（可用性红线）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "gateway.auth.token", value: "new-token" }
+        expectedDecision: warn
+      - name: config.patch 写 openclaw.json 配置文件路径仅告警
+        input:
+          actionType: agent_tool_call
+          toolName: config_manager
+          params: { action: "config.patch", path: ".openclaw/openclaw.json" }
+        expectedDecision: warn
+      - name: config.set 写 token 语义轴仅告警
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "auth.api_key", value: "x" }
+        expectedDecision: warn
+      - name: config.patch 改插件准入仍由 block 规则拦截（本规则不重复告警遮蔽）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.patch", path: "plugins.allow" }
+        expectedDecision: block
+      - name: 良性配置写 logging.level 不命中（负向）
+        input:
+          actionType: agent_tool_call
+          toolName: gateway
+          params: { action: "config.set", path: "logging.level", value: "debug" }
         expectedDecision: allow
 
   - id: self-protection-block-uninstall-message
@@ -1027,6 +1113,8 @@ rules:
     severity: medium
     notes: |
       .env / 证书 / 包管理凭据属弱信号，只 warn；.env.example 等模板文件豁免。
+      openclaw.json 读取只 warn 不 block——operator/agent 读自己配置是正常行为，写才危险
+      （写形态由 SelfProtection 受保护路径覆盖）。
     match:
       actionType:
         - agent_tool_call
@@ -1045,6 +1133,8 @@ rules:
           - ^.*\.bash_history$
           - ^.*\.zsh_history$
           - ^.*\.(pem|key|crt|p12|pfx)$
+          # 凭据面覆盖：网关配置/凭据载体读取留痕（warn 级）
+          - ^.*\.openclaw[/\\]openclaw\.json$
       paramsNotRegex:
         path:
           # .env 示例/模板文件属正常业务，不告警
@@ -1072,6 +1162,12 @@ rules:
           toolName: read
           params: { path: "/app/.env.example" }
         expectedDecision: allow
+      - name: 读取 openclaw.json 触发告警（warn 级覆盖；读取不加 block；constrain-user-data-path@300 modify 遮蔽 warn 终裁，warn 规则仍命中留痕）
+        input:
+          actionType: agent_tool_call
+          toolName: read
+          params: { path: "/home/node/.openclaw/openclaw.json" }
+        expectedDecision: modify
   - id: block-exec-sensitive-file
     name: 阻断 exec 读取敏感系统文件
     enabled: true
@@ -2102,6 +2198,10 @@ rules:
             flags: 'i'
           - pattern: 'getent\s+(passwd|shadow|group)'
             flags: 'i'
+          # 凭据面覆盖：exec 通道读 openclaw.json 走 warn 留痕
+          # （读取不加 block——operator/agent 读自己配置是正常行为）。
+          - pattern: '(?:cat|head|tail|less|more|stat|file)\b[\s\S]{0,80}?\s+\S*\.openclaw/openclaw\.json\b'
+            flags: 'i'
     action:
       decision: warn
       warnReason: 子进程读取敏感系统文件已记录审计（FP 收敛）
@@ -2133,6 +2233,12 @@ rules:
           riskFlags: [sensitive_file_access]
           params: { command: "cat /root/.npmrc" }
         expectedDecision: allow
+      - name: 子进程读取 openclaw.json 留痕（warn 级覆盖；读取不加 block）
+        input:
+          actionType: process_start
+          riskFlags: [sensitive_file_access]
+          params: { command: "cat /home/node/.openclaw/openclaw.json" }
+        expectedDecision: warn
   - id: block-delete-sensitive-files
     name: 阻断删除敏感系统文件
     enabled: true
@@ -6414,7 +6520,15 @@ hookPatterns:
   network_tool:
     - '\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bnmap\b'
   pipe_to_shell:
-    - '\|[^|]*\bsh\b|\|[^|]*\bbash\b|\beval\b|\bbase64\b'
+    # FP 收敛（采样 6 条 FP）：管道臂要求管道目标**就是** sh/bash
+    # 命令本身（前导至少一个空白，允许路径前缀 / 命令自身 flags）——
+    # `| awk ... sh=s[n] ...`、awk 正则字面量 `/(bash|sh|zsh)$/` 里的 `|sh|`
+    # 不再命中；eval 臂要求 eval 后紧跟空白 + 引号/$/( /反斜杠才算解释执行
+    # （`openclaw eval` 子命令、`grep "eval"`、node -e 内 JS 串里的 eval 均不
+    # 命中）；base64 臂保持原口径（解码管真阳仍命中）。
+    - '\|\s+(?:\S*/)?(?:sh|bash)\b'
+    - '\beval[\s]+["''$/\\(]'
+    - '\bbase64\b'
   mass_deletion:
     - 'rm\s+-[a-zA-Z]*\s+/($|\s)'
     - 'rm\s+-[a-zA-Z]*\s+/\*'
@@ -6426,9 +6540,17 @@ hookPatterns:
     - 'dd\s+if=\S+\s+of=/dev/[sh]da'
     - 'mkfs\.\w+\s+/dev/[sh]da'
   file_deletion:
+    # 保持单纯 \brm\b：「rm 目标全部位于 /tmp|/var/tmp 且非递归 ⇒ 不打标」的
+    # 收窄判定在 hooks/runtime.js computeRiskFlags 层实现（变量解析、xargs
+    # 形态都需要代码判定，纯正则表达会漂移）。file_deletion 全仓库无 SPL
+    # 消费者，收窄只影响留痕噪音。
     - '\brm\b'
   sensitive_file_access:
     - '(?:^|\s|[\"''<>])(?:/etc/(?:passwd|shadow|gshadow|sudoers|hosts|ssh/\S*)|/root/\S*|/proc/self/environ|(?:.*/)?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|config))\b'
+    # 凭据面覆盖：~/.openclaw/openclaw.json 是网关配置/凭据载体，
+    # 补读取臂（(?:.*/)? 兜 $HOME/、~/ 与 /home/<user>/ 前缀）。写形态由
+    # SelfProtection 受保护路径（\.openclaw[/\\]openclaw\.json$）覆盖。
+    - '(?:^|\s|["''<>])(?:.*/)?\.openclaw/openclaw\.json\b'
     - '\bgetent\s+(passwd|shadow|group)\b'
   privilege_escalation:
     - 'sudo\s+.*chmod\s*[\w]*\+s'
@@ -6442,6 +6564,23 @@ hookPatterns:
     - pattern: 'Authorization\s*[:=]|Bearer\s+[A-Za-z0-9_\-\.~+\/=]{12,}|api[_-]?key\s*[:=]\s*\S+|access[_-]?token\s*[:=]\s*\S+|secret\s*[:=]\s*\S+|password\s*[:=]\s*\S+'
       flags: 'i'
       input: raw
+    # 凭据写形态：openclaw config set 写入含 token/secret/password/
+    # api_key 的轴（采样：openclaw config set gateway.auth.token --ref-source
+    # store ...）。
+    # ⭐ 2026-10-31 可用性红线：该臂打出的 token_in_command 在 hook 层对认证
+    # 配置写形态有显式豁免（hooks/runtime.js isCredentialConfigWrite）——flag
+    # 照打、事件照落，仅留痕不阻断；其他 token_in_command 场景（echo $TOKEN、
+    # curl 明文凭据等凭证外泄）仍同步阻断。引擎侧由 warn-credential-config-write
+    # 承接 warn 留痕（SPL 规则），self-protection-block-gateway-config-write 的
+    # openclaw.json block 臂已拆出。豁免是可用性红线，勿删。
+    - pattern: 'openclaw\s+config\s+set\s+\S*(?:token|secret|password|api[_-]?key)'
+      flags: 'i'
+      input: raw
+  # 供应链：npm 安装 git+https / git+ssh / 直接 http(s) URL 形态
+  # （非 registry 包名安装，采样口径）。registry 普通安装（npm install <pkg>）
+  # 不打，避免噪音。
+  supply_chain:
+    - '\bnpm\s+(?:install|i|add)\s+(?:-\S+\s+)*\S*(?:git\+(?:https?|ssh)?:|https?:\/\/)\S*'
   background_execution:
     - 'nohup\b|&\s*$|\bdetach\b'
   reverse_shell:

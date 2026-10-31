@@ -93,6 +93,21 @@ describe('normalizeConfig', () => {
     ]);
     expect(config.application?.runtimeHooks?.excludeCommandLines).toEqual([]);
     expect(config.application?.runtimeHooks?.excludeNetworkUrls).toEqual([]);
+
+    // ⭐ 事件降噪默认值：宿主自检聚合默认开；LLM 自有流量识别
+    // 名单 + 采样比（每 5 分钟每 host+method+path 落 1 条）。
+    expect(config.application?.runtimeHooks?.aggregateHostSelfChecks).toBe(true);
+    expect(config.application?.runtimeHooks?.llmSelfTrafficHosts).toEqual([
+      'minimaxi.com',
+      'anthropic.com',
+      'openai.com',
+      'deepseek.com',
+      'moonshot.cn',
+    ]);
+    expect(config.application?.runtimeHooks?.llmSelfTrafficSampleRate).toBe(1);
+    expect(config.application?.runtimeHooks?.llmSelfTrafficSampleWindowMs).toBe(300000);
+    // ⭐ 中间态工具结果折叠默认开。
+    expect(config.application?.foldIntermediateToolResults).toBe(true);
   });
 
   it('should override default values', () => {
