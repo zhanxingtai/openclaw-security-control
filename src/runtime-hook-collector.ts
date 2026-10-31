@@ -122,6 +122,19 @@ interface PendingAggregate {
   folded: number;
   firstTs: number;
   lastTs: number;
+  /**
+   * 墙钟毫秒：最后一次见到该窗口内事件的时刻。
+   *
+   * ⛔ 与 `windowStart`/`firstTs`/`lastTs`（**事件**时间轴）刻意分开：
+   * 过期判定只能用墙钟（采集器不知道"未来"还会不会有事件），但拿事件
+   * 时间轴的窗口起点去比墙钟，会在事件时间戳落在过去（日志回放、插件
+   * 加载前写入的历史事件、hook 与采集器时钟不同步）时把窗口判成
+   * "一出生就过期" ⇒ 同窗口重复命中被拆成多条即时落盘，降噪失效；
+   * 反之事件时间戳落在未来（时钟超前）时窗口永不过期，计数事件迟迟
+   * 不落盘。改为「最后一次见到事件后静默满一个 window 才过期」，两种
+   * 畸形时间戳下行为都稳定。
+   */
+  lastSeenWallMs: number;
   /** host_self_check：首个实例的命令行（审计代表）。 */
   cmdline?: string;
   /** llm_self_traffic：首个实例 body 的 SHA-256（去重参照）。 */
@@ -929,6 +942,7 @@ export class RuntimeHookCollector implements ILayerCollector {
         folded: 0,
         firstTs: event.ts,
         lastTs: event.ts,
+        lastSeenWallMs: Date.now(),
         contentLengthTotal: 0,
       };
       this.pendingAggregates.set(key, agg);
@@ -944,6 +958,8 @@ export class RuntimeHookCollector implements ILayerCollector {
     }
 
     agg.lastTs = event.ts;
+    // 每次见到窗口内事件都刷新"最后一次见到"的墙钟时刻——过期判定锚在这里。
+    agg.lastSeenWallMs = Date.now();
     if (opts.category === 'host_self_check') {
       if (!agg.cmdline) agg.cmdline = parsed.command_line ?? undefined;
     } else {
@@ -1017,10 +1033,18 @@ export class RuntimeHookCollector implements ILayerCollector {
     this.dispatchEvent(event);
   }
 
-  /** 冲刷所有窗口已结束的聚合记录（周期调用）。 */
+  /**
+   * 冲刷所有窗口已结束的聚合记录（周期调用）。
+   *
+   * 过期判据 = 「最后一次见到该窗口内事件后静默满一个 window」，锚点是
+   * `lastSeenWallMs`（墙钟），**不是**事件时间轴的 `windowStart`。理由见
+   * `PendingAggregate.lastSeenWallMs`：拿事件时间轴的窗口起点比墙钟，会在
+   * 事件时间戳落在过去时把窗口判成一出生就过期（降噪失效、计数事件提前
+   * 落盘），落在未来时让窗口永不过期（计数事件迟迟不落盘）。
+   */
   private flushExpiredAggregates(now: number): void {
     for (const [key, agg] of this.pendingAggregates) {
-      if (now >= agg.windowStart + agg.windowMs) {
+      if (now >= agg.lastSeenWallMs + agg.windowMs) {
         this.pendingAggregates.delete(key);
         this.flushAggregate(agg);
       }

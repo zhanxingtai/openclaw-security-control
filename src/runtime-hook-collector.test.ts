@@ -1264,6 +1264,32 @@ describe('RuntimeHookCollector 降噪聚合', () => {
     expect(aggregate.blocked).toBe(false);
   });
 
+  it('4.1 事件时间戳落在过去时窗口不被墙钟提前判过期：计数事件只在关停时落盘', async () => {
+    // 回归锁：WINDOW_BASE 是**过去**的时刻（事件时间轴），窗口分组照它算，
+    // 但过期判定只能锚在「最后一次见到事件」的墙钟上。若拿事件时间轴的窗口
+    // 起点比墙钟，这个窗口一出生就是"已过期"⇒ 周期冲刷（100ms 轮询）会在
+    // 事件处理后立刻把计数事件落盘，"此刻只应看到首实例"的语义被打破。
+    runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
+    await runtimeCollector.initialize();
+
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 133 })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 134, ts: WINDOW_BASE + 1000 })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(selfCheckEvent({ pid: 135, ts: WINDOW_BASE + 2000 })) + '\n', 'utf8');
+
+    // 跨过多个轮询周期：窗口仍应是打开的——只有首实例即时落盘。
+    await wait(400);
+    expect(reported).toHaveLength(1);
+    expect(reported[0].event_type).toBe('process_start');
+
+    // 关停冲刷聚合计数。
+    await runtimeCollector.shutdown();
+    await waitForReported(reported, 2);
+
+    expect(reported).toHaveLength(2);
+    expect(reported[1].event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(reported[1].aggregate?.count).toBe(3);
+  });
+
   it('4.1 跨分钟命中不折叠：各自即时落盘且不产聚合计数事件', async () => {
     runtimeCollector = new RuntimeHookCollector(collector, { enabled: true, logPath: logFile });
     await runtimeCollector.initialize();
@@ -1395,6 +1421,35 @@ describe('RuntimeHookCollector 降噪聚合', () => {
     expect(aggregate.aggregate?.window_ms).toBe(300000);
     expect(aggregate.aggregate?.body_sha256).toBe(first.body_sha256);
     expect(aggregate.aggregate?.content_length_total).toBe(42);
+  });
+
+  it('4.2 窗口在最后一次命中后静默满一个 window 才过期：周期冲刷落盘计数事件', async () => {
+    // 锁「整日志安静时聚合计数不迟迟不落盘」这条路径：窗口过期由周期冲刷
+    // 触发（不必等关停）。与上一条用例互补——上一条锁的是「过期锚点不是
+    // 事件时间轴的窗口起点」，本条锁的是「过期后计数事件确实会落盘」。
+    // 这里用 1s 窗口（llmSelfTrafficSampleWindowMs 下限）把语义跑快。
+    runtimeCollector = new RuntimeHookCollector(collector, {
+      enabled: true,
+      logPath: logFile,
+      llmSelfTrafficHosts: ['minimaxi.com'],
+      llmSelfTrafficSampleWindowMs: 1000,
+    });
+    await runtimeCollector.initialize();
+
+    const now = Date.now();
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: now, body: 'body-1' })) + '\n', 'utf8');
+    fs.appendFileSync(logFile, JSON.stringify(llmEvent({ ts: now, body: 'body-2' })) + '\n', 'utf8');
+
+    // 首个实例即时落盘，第二个折叠进计数。
+    await waitForReported(reported, 1);
+    expect(reported).toHaveLength(1);
+
+    // 静默满一个 window 后由周期冲刷落盘计数事件——不必等关停。
+    await waitForReported(reported, 2, 5000);
+    expect(reported).toHaveLength(2);
+    expect(reported[1].event_type).toBe('x_openclaw_self_traffic_aggregate');
+    expect(reported[1].aggregate?.count).toBe(2);
+    expect(reported[1].aggregate?.window_ms).toBe(1000);
   });
 
   it('4.2 blocked / 带 risk_flags 的 LLM 自流量不采样、不降级', async () => {
